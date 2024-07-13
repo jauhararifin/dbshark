@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.86"
+crc64 = "2.0.0"
+parking_lot = "0.12.3"
+tempfile = "3.10.1"
