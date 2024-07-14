@@ -818,18 +818,32 @@ fn record_mutation(
     Ok(())
 }
 
+pub(crate) trait BTreePage<'a> {
+    type Cell: BTreeCell;
+    fn count(&'a self) -> usize;
+    fn get(&'a self, index: usize) -> Self::Cell;
+}
+
 pub(crate) struct InteriorPageRead<'a>(PageRead<'a>);
 
-impl<'a> InteriorPageRead<'a> {
-    fn id(&self) -> PageId {
-        self.0.meta.id
-    }
+impl<'a, 'b> BTreePage<'b> for InteriorPageRead<'a> {
+    type Cell = InteriorCell<'b>;
 
-    fn count(&self) -> usize {
+    fn count(&'b self) -> usize {
         let PageKind::Interior { count, .. } = self.0.meta.kind else {
             unreachable!();
         };
         count
+    }
+
+    fn get(&'b self, index: usize) -> Self::Cell {
+        get_interior_cell(self.0.buffer, index)
+    }
+}
+
+impl<'a> InteriorPageRead<'a> {
+    fn id(&self) -> PageId {
+        self.0.meta.id
     }
 
     fn last(&self) -> PageId {
@@ -837,10 +851,6 @@ impl<'a> InteriorPageRead<'a> {
             unreachable!();
         };
         last
-    }
-
-    fn get(&self, index: usize) -> InteriorCell<'_> {
-        get_interior_cell(self.0.buffer, index)
     }
 
     pub(crate) fn might_split(&self) -> bool {
@@ -905,6 +915,21 @@ impl InteriorCell<'_> {
 }
 
 pub(crate) struct InteriorPageWrite<'a>(PageWrite<'a>);
+
+impl<'a, 'b> BTreePage<'b> for InteriorPageWrite<'a> {
+    type Cell = InteriorCell<'b>;
+
+    fn count(&'b self) -> usize {
+        let PageKind::Interior { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        count
+    }
+
+    fn get(&'b self, index: usize) -> Self::Cell {
+        get_interior_cell(self.0.buffer, index)
+    }
+}
 
 impl<'a> InteriorPageWrite<'a> {
     pub(crate) fn id(&self) -> PageId {
@@ -1110,6 +1135,20 @@ impl<'a> InteriorPageWrite<'a> {
 }
 
 pub(crate) struct LeafPageWrite<'a>(PageWrite<'a>);
+
+impl<'a, 'b> BTreePage<'b> for LeafPageWrite<'a> {
+    type Cell = LeafCell<'b>;
+    fn count(&'b self) -> usize {
+        let PageKind::Leaf { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        count
+    }
+
+    fn get(&'b self, index: usize) -> Self::Cell {
+        get_leaf_cell(self.0.buffer, index)
+    }
+}
 
 impl<'a> LeafPageWrite<'a> {
     pub(crate) fn id(&self) -> PageId {

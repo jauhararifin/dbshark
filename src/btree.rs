@@ -2,7 +2,8 @@ use std::fs::remove_dir_all;
 
 use crate::content::{Bytes, Content};
 use crate::pager::{
-    BTreeCell, InteriorCell, InteriorPageWrite, LeafPageWrite, OverflowPageRead, PageId, Pager,
+    BTreeCell, BTreePage, InteriorCell, InteriorPageWrite, LeafPageWrite, OverflowPageRead, PageId,
+    Pager,
 };
 use crate::wal::TxId;
 use anyhow::anyhow;
@@ -73,7 +74,7 @@ impl<'a> BTree<'a> {
             }
             let node = current.into_interior().unwrap();
 
-            let (i, found) = self.search_interior(&node, key)?;
+            let (i, found) = self.search_key_in_node(&node, key)?;
             let next_pgid = if i == node.count() {
                 node.last()
             } else {
@@ -102,7 +103,7 @@ impl<'a> BTree<'a> {
             ));
         };
 
-        let (i, found) = self.search_leaf(&node, key)?;
+        let (i, found) = self.search_key_in_node(&node, key)?;
         Ok(LookupForUpdateResult {
             interiors: hops,
             leaf: LookupHop {
@@ -113,9 +114,9 @@ impl<'a> BTree<'a> {
         })
     }
 
-    fn search_interior(
+    fn search_key_in_node<'b>(
         &self,
-        node: &InteriorPageWrite,
+        node: &'b impl BTreePage<'b>,
         key: &[u8],
     ) -> anyhow::Result<(usize, bool)> {
         // TODO: use binary search instead
@@ -129,26 +130,6 @@ impl<'a> BTree<'a> {
             let ord = a.compare(b)?;
             found = ord.is_eq();
             if ord.is_lt() {
-                break;
-            }
-            i += 1;
-        }
-
-        Ok((i, found))
-    }
-
-    fn search_leaf(&self, node: &LeafPageWrite, key: &[u8]) -> anyhow::Result<(usize, bool)> {
-        // TODO: use binary search instead
-        let mut i = 0;
-        let mut found = false;
-
-        while i < node.count() {
-            let cell = node.get(i);
-            let mut a = Bytes::new(key);
-            let mut b = BtreeContent::new(self.txid, self.pager, &cell);
-            let ord = a.compare(b)?;
-            found = ord.is_eq();
-            if ord.is_le() {
                 break;
             }
             i += 1;
