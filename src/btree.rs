@@ -2,8 +2,8 @@ use std::fs::remove_dir_all;
 
 use crate::content::{Bytes, Content};
 use crate::pager::{
-    BTreeCell, BTreePage, InteriorCell, InteriorPageWrite, LeafPageWrite, OverflowPageRead, PageId,
-    Pager,
+    BTreeCell, BTreePage, InteriorCell, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite,
+    OverflowPageRead, PageId, Pager,
 };
 use crate::wal::TxId;
 use anyhow::anyhow;
@@ -141,10 +141,10 @@ impl<'a> BTree<'a> {
         while i < node.count() {
             let cell = node.get(i);
             let mut a = Bytes::new(key);
-            let mut b = BtreeContent::new(self.txid, self.pager, &cell);
+            let mut b = BTreeContent::new(self.pager, &cell);
             let ord = a.compare(b)?;
             found = ord.is_eq();
-            if ord.is_lt() {
+            if ord.is_le() {
                 break;
             }
             i += 1;
@@ -170,6 +170,104 @@ impl<'a> BTree<'a> {
         }
 
         todo!("insert the remaining content to overflow pages");
+    }
+
+    pub(crate) fn seek(&self, key: &[u8]) -> anyhow::Result<LookupResult> {
+        let mut current = self.pager.read(self.root)?;
+        let page = loop {
+            if !current.is_interior() {
+                break current;
+            }
+            let node = current.into_interior().unwrap();
+
+            let (i, _) = self.search_key_in_node(&node, key)?;
+            let next_pgid = if i == node.count() {
+                node.last()
+            } else {
+                node.get(i).ptr()
+            };
+            let next = self.pager.read(next_pgid)?;
+
+            current = next;
+        };
+
+        let leaf = page.into_leaf().expect("not a leaf page");
+        let (i, found) = self.search_key_in_node(&leaf, key)?;
+        let is_finished = i >= leaf.count();
+        Ok(LookupResult {
+            cursor: Cursor {
+                pager: self.pager,
+                page: leaf,
+                index: i,
+                finished: is_finished,
+            },
+            found,
+        })
+    }
+}
+
+pub(crate) struct LookupResult<'a> {
+    pub(crate) cursor: Cursor<'a>,
+    pub(crate) found: bool,
+}
+
+pub(crate) struct Cursor<'a> {
+    pager: &'a Pager,
+    page: LeafPageRead<'a>,
+    index: usize,
+    finished: bool,
+}
+
+pub(crate) struct KVItem {
+    content: Box<[u8]>,
+    key_size: usize,
+}
+
+impl KVItem {
+    pub(crate) fn key(&self) -> &[u8] {
+        self.content[..self.key_size].as_ref()
+    }
+
+    pub(crate) fn value(&self) -> &[u8] {
+        self.content[self.key_size..].as_ref()
+    }
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn next(&mut self) -> anyhow::Result<Option<KVItem>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let item = if self.index < self.page.count() {
+            let cell = self.page.get(self.index);
+            let total_size = cell.key_size() + cell.val_size();
+            let mut raw = vec![0u8; total_size];
+            let mut content = BTreeContent::from_leaf_content(self.pager, &cell);
+            content.put(&mut raw)?;
+
+            self.index += 1;
+            Some(KVItem {
+                content: raw.into_boxed_slice(),
+                key_size: cell.key_size(),
+            })
+        } else {
+            None
+        };
+
+        if self.index >= self.page.count() {
+            if let Some(next_pgid) = self.page.next() {
+                let Some(page) = self.pager.read(next_pgid)?.into_leaf() else {
+                    return Err(anyhow!("expected a leaf page"));
+                };
+                self.page = page;
+                self.index = 0;
+            } else {
+                self.finished = true;
+            }
+        }
+
+        Ok(item)
     }
 }
 
@@ -208,8 +306,7 @@ impl Content for KeyValContent<'_> {
     }
 }
 
-struct BtreeContent<'a> {
-    txid: TxId,
+struct BTreeContent<'a> {
     pager: &'a Pager,
     raw: &'a [u8],
     overflow: Option<PageId>,
@@ -219,10 +316,9 @@ struct BtreeContent<'a> {
     offset: usize,
 }
 
-impl<'a> BtreeContent<'a> {
-    fn new(txid: TxId, pager: &'a Pager, cell: &'a impl BTreeCell) -> Self {
-        BtreeContent {
-            txid,
+impl<'a> BTreeContent<'a> {
+    fn new(pager: &'a Pager, cell: &'a impl BTreeCell) -> Self {
+        BTreeContent {
             pager,
             raw: cell.raw(),
             overflow: cell.overflow(),
@@ -232,9 +328,21 @@ impl<'a> BtreeContent<'a> {
             offset: 0,
         }
     }
+
+    fn from_leaf_content(pager: &'a Pager, cell: &'a LeafCell) -> Self {
+        BTreeContent {
+            pager,
+            raw: cell.raw(),
+            overflow: cell.overflow(),
+            remaining: cell.key_size() + cell.val_size(),
+
+            overflow_page: None,
+            offset: 0,
+        }
+    }
 }
 
-impl<'a> Content for BtreeContent<'a> {
+impl<'a> Content for BTreeContent<'a> {
     fn remaining(&self) -> usize {
         self.remaining
     }
@@ -258,7 +366,7 @@ impl<'a> Content for BtreeContent<'a> {
                 }
 
                 if let Some(pgid) = overflow_page.next() {
-                    let Some(page) = self.pager.read(self.txid, pgid)?.into_overflow() else {
+                    let Some(page) = self.pager.read(pgid)?.into_overflow() else {
                         return Err(anyhow!("expected overflow page"));
                     };
                     self.overflow_page = Some(page);

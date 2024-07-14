@@ -198,6 +198,20 @@ impl<'db> Tx<'db> {
         }
     }
 
+    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(root_pgid) = self.db.root else {
+            return Ok(None);
+        };
+
+        let mut btree = BTree::new(self.id, &self.db.pager, root_pgid, self.db.freelist);
+        let mut result = btree.seek(key)?;
+        if !result.found {
+            return Ok(None);
+        }
+
+        Ok(result.cursor.next()?.map(|item| item.value().to_vec()))
+    }
+
     pub fn commit(mut self) {
         self.closed = true;
         // TODO: impl

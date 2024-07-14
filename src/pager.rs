@@ -180,9 +180,9 @@ impl Pager {
     // doesn't need to mutate the buffer pool if the page is already in the pool.
     // We only need to fallback to write lock when the a page need to be evicted or
     // fetched. We can use atomic integer to increase and decrease reference count.
-    pub(crate) fn read(&self, txid: TxId, pgid: PageId) -> anyhow::Result<PageRead> {
+    pub(crate) fn read(&self, pgid: PageId) -> anyhow::Result<PageRead> {
         let internal = self.internal.write();
-        let (frame_id, meta, buffer) = self.acquire(internal, txid, pgid, true)?;
+        let (frame_id, meta, buffer) = self.acquire(internal, pgid, true)?;
 
         let meta = meta.read();
         // SAFETY: it's guaranteed that buffer has only one mutable reference or multiple
@@ -192,7 +192,6 @@ impl Pager {
         Ok(PageRead {
             pager: self,
             frame_id,
-            txid,
             meta,
             buffer,
         })
@@ -200,7 +199,7 @@ impl Pager {
 
     pub(crate) fn write(&self, txid: TxId, pgid: PageId) -> anyhow::Result<PageWrite> {
         let internal = self.internal.write();
-        let (frame_id, meta, buffer) = self.acquire(internal, txid, pgid, true)?;
+        let (frame_id, meta, buffer) = self.acquire(internal, pgid, true)?;
         let meta = meta.write();
         // SAFETY: it's guaranteed that buffer has only one mutable reference or multiple
         // shared reference since it's protected by page meta's lock.
@@ -221,7 +220,7 @@ impl Pager {
             PageId::new((internal.file_page_count - 1) as u64).unwrap()
         };
 
-        let (frame_id, meta, buffer) = self.acquire(internal, txid, pgid, false)?;
+        let (frame_id, meta, buffer) = self.acquire(internal, pgid, false)?;
         let meta = meta.write();
         // SAFETY: it's guaranteed that buffer has only one mutable reference or multiple
         // shared reference since it's protected by page meta's lock.
@@ -238,7 +237,6 @@ impl Pager {
     fn acquire(
         &self,
         mut internal: RwLockWriteGuard<PagerInternal>,
-        txid: TxId,
         pgid: PageId,
         is_existing_page: bool,
     ) -> anyhow::Result<(usize, &RwLock<PageMeta>, *mut u8)> {
@@ -675,7 +673,6 @@ enum PageKind {
 pub(crate) struct PageRead<'a> {
     pager: &'a Pager,
     frame_id: usize,
-    txid: TxId,
     meta: RwLockReadGuard<'a, PageMeta>,
     buffer: &'a [u8],
 }
@@ -698,6 +695,14 @@ impl<'a> PageRead<'a> {
     pub(crate) fn into_interior(self) -> Option<InteriorPageRead<'a>> {
         if let PageKind::Interior { .. } = &self.meta.kind {
             Some(InteriorPageRead(self))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn into_leaf(self) -> Option<LeafPageRead<'a>> {
+        if let PageKind::Leaf { .. } = &self.meta.kind {
+            Some(LeafPageRead(self))
         } else {
             None
         }
@@ -846,7 +851,7 @@ impl<'a> InteriorPageRead<'a> {
         self.0.meta.id
     }
 
-    fn last(&self) -> PageId {
+    pub(crate) fn last(&self) -> PageId {
         let PageKind::Interior { last, .. } = self.0.meta.kind else {
             unreachable!();
         };
@@ -1131,6 +1136,46 @@ impl<'a> InteriorPageWrite<'a> {
             unreachable!();
         };
         interior_might_split(self.0.pager.page_size, remaining)
+    }
+}
+
+pub(crate) struct LeafPageRead<'a>(PageRead<'a>);
+
+impl<'a, 'b> BTreePage<'b> for LeafPageRead<'a> {
+    type Cell = LeafCell<'b>;
+    fn count(&'b self) -> usize {
+        let PageKind::Leaf { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        count
+    }
+
+    fn get(&'b self, index: usize) -> Self::Cell {
+        get_leaf_cell(self.0.buffer, index)
+    }
+}
+
+impl<'a> LeafPageRead<'a> {
+    pub(crate) fn id(&self) -> PageId {
+        self.0.meta.id
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        let PageKind::Leaf { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        count
+    }
+
+    pub(crate) fn get(&self, index: usize) -> LeafCell {
+        get_leaf_cell(self.0.buffer, index)
+    }
+
+    pub(crate) fn next(&self) -> Option<PageId> {
+        let PageKind::Leaf { next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        next
     }
 }
 
