@@ -61,6 +61,21 @@ impl<'a> BTree<'a> {
 
     fn put_slow(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         let mut result = self.lookup_for_insert(key)?;
+
+        if result.leaf.found {
+            todo!("delete the existing cell");
+        }
+
+        let keyval = KeyValContent::new(key, value);
+        if self.insert_content_to_leaf(
+            &mut result.leaf.node,
+            result.leaf.index,
+            keyval,
+            key.len(),
+        )? {
+            return Ok(());
+        }
+
         todo!();
     }
 
@@ -136,6 +151,60 @@ impl<'a> BTree<'a> {
         }
 
         Ok((i, found))
+    }
+
+    fn insert_content_to_leaf<'b>(
+        &self,
+        node: &mut LeafPageWrite,
+        index: usize,
+        mut content: impl Content,
+        key_size: usize,
+    ) -> anyhow::Result<bool> {
+        let ok = node.insert_content(index, &mut content, key_size)?;
+        if !ok {
+            return Ok(false);
+        }
+
+        if content.is_finished() {
+            return Ok(true);
+        }
+
+        todo!("insert the remaining content to overflow pages");
+    }
+}
+
+struct KeyValContent<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+impl<'a> KeyValContent<'a> {
+    fn new(key: &'a [u8], value: &'a [u8]) -> Self {
+        Self { key, value }
+    }
+}
+
+impl Content for KeyValContent<'_> {
+    fn remaining(&self) -> usize {
+        self.key.len() + self.value.len()
+    }
+
+    fn put(&mut self, mut target: &mut [u8]) -> anyhow::Result<()> {
+        if !self.key.is_empty() {
+            let s = std::cmp::min(self.key.len(), target.len());
+            target[..s].copy_from_slice(&self.key[..s]);
+            self.key = &self.key[s..];
+            target = &mut target[s..];
+        }
+
+        if !target.is_empty() {
+            let s = std::cmp::min(self.value.len(), target.len());
+            target[..s].copy_from_slice(&self.value[..s]);
+            self.value = &self.value[s..];
+            target = &mut target[s..];
+        }
+
+        Ok(())
     }
 }
 

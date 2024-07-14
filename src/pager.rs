@@ -1172,6 +1172,128 @@ impl<'a> LeafPageWrite<'a> {
         };
         next
     }
+
+    pub(crate) fn insert_content(
+        &mut self,
+        i: usize,
+        content: &mut impl Content,
+        key_size: usize,
+    ) -> anyhow::Result<bool> {
+        // TODO: record mutation
+
+        let total_size = content.remaining();
+        let payload_size =
+            self.0.buffer.len() - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+        let max_before_overflow = payload_size / 4 - LEAF_PAGE_CELL_SIZE;
+        let min_content_not_overflow = max_before_overflow / 2;
+        let PageKind::Leaf { remaining, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        if remaining < LEAF_PAGE_CELL_SIZE {
+            return Ok(false);
+        }
+        let remaining = remaining - LEAF_PAGE_CELL_SIZE;
+        if remaining < min_content_not_overflow && remaining < total_size {
+            return Ok(false);
+        }
+
+        let raw_size = std::cmp::min(max_before_overflow, total_size);
+        let raw_size = std::cmp::min(raw_size, remaining);
+
+        let content_offset = self.insert_cell(i, None, key_size, total_size - key_size, raw_size);
+        content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
+        let pgid = self.id();
+        record_mutation(
+            self.0.txid,
+            self.0.pager,
+            &mut *self.0.meta,
+            WalRecord::LeafInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                overflow: None,
+                key_size,
+                total_size,
+            },
+        )?;
+
+        Ok(true)
+    }
+
+    fn insert_cell(
+        &mut self,
+        index: usize,
+        overflow: Option<PageId>,
+        key_size: usize,
+        val_size: usize,
+        raw_size: usize,
+    ) -> usize {
+        let added = LEAF_PAGE_CELL_SIZE + raw_size;
+        let PageKind::Leaf { offset, count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        let current_cell_size =
+            PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * count;
+        if current_cell_size + added > offset {
+            self.rearrange();
+        }
+
+        let PageKind::Leaf {
+            ref mut offset,
+            ref mut remaining,
+            ref mut count,
+            ..
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+        assert!(current_cell_size + added <= *offset);
+
+        let shifted = *count - index;
+        for i in 0..shifted {
+            let x = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * (*count - i);
+            let (a, b) = self.0.buffer.split_at_mut(x);
+            b[..LEAF_PAGE_CELL_SIZE].copy_from_slice(&a[a.len() - LEAF_PAGE_CELL_SIZE..]);
+        }
+
+        let cell_offset = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * index;
+        let cell = &mut self.0.buffer[cell_offset..cell_offset + LEAF_PAGE_CELL_SIZE];
+
+        *offset -= raw_size;
+        *remaining -= added;
+        *count += 1;
+
+        cell[0..8].copy_from_slice(&overflow.map(|p| p.0.get()).unwrap_or(0).to_be_bytes());
+        cell[8..12].copy_from_slice(&(key_size as u32).to_be_bytes());
+        cell[12..16].copy_from_slice(&(val_size as u32).to_be_bytes());
+        cell[16..18].copy_from_slice(&(*offset as u16).to_be_bytes());
+        cell[18..20].copy_from_slice(&(raw_size as u16).to_be_bytes());
+
+        *offset
+    }
+
+    fn rearrange(&mut self) {
+        // TODO: try not to copy
+        let copied = self.0.buffer.to_vec();
+
+        let mut new_offset = self.0.pager.page_size - PAGE_FOOTER_SIZE;
+        for i in 0..self.count() {
+            let copied_cell = get_leaf_cell(&copied, i);
+            let copied_content = copied_cell.raw();
+            new_offset -= copied_content.len();
+            self.0.buffer[new_offset..new_offset + copied_content.len()]
+                .copy_from_slice(copied_content);
+
+            let cell_offset = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * i;
+            let cell = &mut self.0.buffer[cell_offset..cell_offset + LEAF_PAGE_CELL_SIZE];
+            cell[16..18].copy_from_slice(&(new_offset as u16).to_be_bytes());
+        }
+
+        let PageKind::Leaf { ref mut offset, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        *offset = new_offset;
+    }
 }
 
 fn get_leaf_cell(buff: &[u8], index: usize) -> LeafCell<'_> {

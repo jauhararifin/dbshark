@@ -1,3 +1,4 @@
+use crate::btree::BTree;
 use crate::pager::{PageId, PageIdExt, Pager};
 use crate::wal::{TxId, TxIdExt, Wal, WalRecord};
 use anyhow::anyhow;
@@ -103,6 +104,7 @@ impl Db {
         Ok(Tx {
             id: txid,
             db: internal,
+            closed: false,
         })
     }
 }
@@ -154,12 +156,15 @@ impl Header {
 pub struct Tx<'db> {
     id: TxId,
     db: RwLockWriteGuard<'db, DbInternal>,
+
+    closed: bool,
 }
 
 impl<'db> Drop for Tx<'db> {
     fn drop(&mut self) {
-        // if the rollback failed, we should panic.
-        todo!("should rollback the transaction here");
+        if !self.closed {
+            todo!("should we panic here?");
+        }
     }
 }
 
@@ -168,7 +173,10 @@ impl<'db> Tx<'db> {
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         let root_pgid = self.init_root()?;
 
-        todo!();
+        let mut btree = BTree::new(self.id, &self.db.pager, root_pgid, self.db.freelist);
+        btree.put(key, value)?;
+
+        Ok(())
     }
 
     fn init_root(&mut self) -> anyhow::Result<PageId> {
@@ -190,11 +198,13 @@ impl<'db> Tx<'db> {
         }
     }
 
-    pub fn commit(self) {
-        todo!();
+    pub fn commit(mut self) {
+        self.closed = true;
+        // TODO: impl
     }
 
-    pub fn rollback(self) {
-        todo!();
+    pub fn rollback(mut self) {
+        self.closed = true;
+        // TODO: impl
     }
 }

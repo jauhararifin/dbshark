@@ -200,6 +200,14 @@ pub(crate) enum WalRecord<'a> {
     LeafInit {
         pgid: PageId,
     },
+    LeafInsert {
+        pgid: PageId,
+        index: usize,
+        raw: &'a [u8],
+        overflow: Option<PageId>,
+        key_size: usize,
+        total_size: usize,
+    },
 }
 
 impl<'a> WalRecord<'a> {
@@ -217,6 +225,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::InteriorDelete { .. } => 22,
 
             WalRecord::LeafInit { .. } => 30,
+            WalRecord::LeafInsert { .. } => 31,
         }
     }
 
@@ -227,10 +236,11 @@ impl<'a> WalRecord<'a> {
             WalRecord::HeaderSet { .. } => 16,
 
             WalRecord::InteriorInit { .. } => 16,
-            WalRecord::InteriorInsert { .. } => 32,
-            WalRecord::InteriorDelete { .. } => 32,
+            WalRecord::InteriorInsert { raw, .. } => 32 + raw.len(),
+            WalRecord::InteriorDelete { old_raw, .. } => 32 + old_raw.len(),
 
             WalRecord::LeafInit { .. } => 8,
+            WalRecord::LeafInsert { raw, .. } => 28 + raw.len(),
         }
     }
 
@@ -285,6 +295,29 @@ impl<'a> WalRecord<'a> {
             }
             WalRecord::LeafInit { pgid } => {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+            }
+            WalRecord::LeafInsert {
+                pgid,
+                index,
+                raw,
+                overflow,
+                key_size,
+                total_size,
+            } => {
+                assert!(raw.len() <= u16::MAX as usize);
+                assert!(*index <= u16::MAX as usize);
+                assert!(*key_size <= u32::MAX as usize);
+                assert!(*total_size <= u32::MAX as usize);
+
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
+                buff[10..12].copy_from_slice(&(raw.len() as u16).to_be_bytes());
+                buff[12..16].copy_from_slice(&(*key_size as u32).to_be_bytes());
+                buff[16..24].copy_from_slice(&overflow.to_be_bytes());
+                buff[24..28].copy_from_slice(&(*total_size as u32).to_be_bytes());
+                buff[28..].copy_from_slice(raw);
             }
         }
     }
