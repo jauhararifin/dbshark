@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PageId(NonZeroU64);
@@ -49,7 +50,7 @@ pub(crate) struct Pager {
     page_size: usize,
     n: usize,
 
-    wal: Wal,
+    wal: Arc<Wal>,
 
     internal: RwLock<PagerInternal>,
 }
@@ -93,7 +94,7 @@ impl Drop for Pager {
 }
 
 impl Pager {
-    pub(crate) fn new(f: File, wal: Wal, page_size: usize, n: usize) -> anyhow::Result<Self> {
+    pub(crate) fn new(f: File, wal: Arc<Wal>, page_size: usize, n: usize) -> anyhow::Result<Self> {
         Self::check_page_size(page_size)?;
 
         if n < 10 {
@@ -169,6 +170,10 @@ impl Pager {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn page_count(&self) -> usize {
+        self.internal.read().file_page_count
     }
 
     // TODO: consider using read lock for fast path. Most of the time, acquiring a page
@@ -1076,7 +1081,7 @@ mod tests {
 
         let wal_path = dir.path().join("test.wal");
         let mut wal_file = File::create(wal_path).unwrap();
-        let wal = Wal::new(wal_file, page_size);
+        let wal = Arc::new(Wal::new(wal_file, page_size));
 
         let pager = Pager::new(file, wal, page_size, 10).unwrap();
         let txid = TxId::new(1).unwrap();

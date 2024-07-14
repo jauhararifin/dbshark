@@ -23,6 +23,10 @@ impl TxId {
     pub(crate) fn from_be_bytes(lsn: [u8; 8]) -> Option<Self> {
         Self::new(u64::from_be_bytes(lsn))
     }
+
+    pub(crate) fn next(&self) -> TxId {
+        Self(self.0.checked_add(1).unwrap())
+    }
 }
 
 pub(crate) trait TxIdExt {
@@ -167,6 +171,11 @@ pub(crate) enum WalRecord<'a> {
     Rollback,
     End,
 
+    HeaderSet {
+        root: Option<PageId>,
+        freelist: Option<PageId>,
+    },
+
     InteriorInit {
         pgid: PageId,
         last: PageId,
@@ -197,15 +206,18 @@ impl<'a> WalRecord<'a> {
             WalRecord::Rollback => 3,
             WalRecord::End => 4,
 
-            WalRecord::InteriorInit { .. } => 10,
-            WalRecord::InteriorInsert { .. } => 11,
-            WalRecord::InteriorDelete { .. } => 12,
+            WalRecord::HeaderSet { .. } => 10,
+
+            WalRecord::InteriorInit { .. } => 20,
+            WalRecord::InteriorInsert { .. } => 21,
+            WalRecord::InteriorDelete { .. } => 22,
         }
     }
 
     fn size(&self) -> usize {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => 0,
+            WalRecord::HeaderSet { .. } => 16,
             WalRecord::InteriorInit { .. } => 16,
             WalRecord::InteriorInsert { .. } => 32,
             WalRecord::InteriorDelete { .. } => 32,
@@ -215,6 +227,10 @@ impl<'a> WalRecord<'a> {
     fn encode(&self, buff: &mut [u8]) {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
+            WalRecord::HeaderSet { root, freelist } => {
+                buff[0..8].copy_from_slice(&root.to_be_bytes());
+                buff[8..16].copy_from_slice(&freelist.to_be_bytes());
+            }
             WalRecord::InteriorInit { pgid, last } => {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
                 buff[8..16].copy_from_slice(&last.get().to_be_bytes());
