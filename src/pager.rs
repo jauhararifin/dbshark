@@ -702,6 +702,14 @@ impl<'a> PageRead<'a> {
             None
         }
     }
+
+    pub(crate) fn into_overflow(self) -> Option<OverflowPageRead<'a>> {
+        if let PageKind::Overflow { .. } = &self.meta.kind {
+            Some(OverflowPageRead(self))
+        } else {
+            None
+        }
+    }
 }
 
 pub(crate) struct PageWrite<'a> {
@@ -725,14 +733,6 @@ impl<'a> PageWrite<'a> {
 
     pub(crate) fn is_interior(&self) -> bool {
         matches!(&self.meta.kind, PageKind::Interior { .. })
-    }
-
-    pub(crate) fn into_interior(self) -> Option<InteriorPageWrite<'a>> {
-        if let PageKind::Interior { .. } = &self.meta.kind {
-            Some(InteriorPageWrite(self))
-        } else {
-            None
-        }
     }
 
     pub(crate) fn init_interior(
@@ -760,6 +760,46 @@ impl<'a> PageWrite<'a> {
         }
 
         Ok(self.into_interior())
+    }
+
+    pub(crate) fn into_interior(self) -> Option<InteriorPageWrite<'a>> {
+        if let PageKind::Interior { .. } = &self.meta.kind {
+            Some(InteriorPageWrite(self))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn init_leaf(mut self) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
+        if let PageKind::None = self.meta.kind {
+            let pgid = self.id();
+            record_mutation(
+                self.txid,
+                self.pager,
+                &mut self.meta,
+                WalRecord::LeafInit { pgid },
+            );
+
+            self.meta.kind = PageKind::Leaf {
+                count: 0,
+                offset: self.pager.page_size - PAGE_FOOTER_SIZE,
+                remaining: self.pager.page_size
+                    - PAGE_HEADER_SIZE
+                    - PAGE_FOOTER_SIZE
+                    - LEAF_PAGE_HEADER_SIZE,
+                next: None,
+            };
+        }
+
+        Ok(self.into_leaf())
+    }
+
+    pub(crate) fn into_leaf(self) -> Option<LeafPageWrite<'a>> {
+        if let PageKind::Leaf { .. } = &self.meta.kind {
+            Some(LeafPageWrite(self))
+        } else {
+            None
+        }
     }
 }
 
@@ -802,6 +842,13 @@ impl<'a> InteriorPageRead<'a> {
     fn get(&self, index: usize) -> InteriorCell<'_> {
         get_interior_cell(self.0.buffer, index)
     }
+
+    pub(crate) fn might_split(&self) -> bool {
+        let PageKind::Interior { remaining, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        interior_might_split(self.0.pager.page_size, remaining)
+    }
 }
 
 fn get_interior_cell(buff: &[u8], index: usize) -> InteriorCell<'_> {
@@ -814,24 +861,44 @@ fn get_interior_cell(buff: &[u8], index: usize) -> InteriorCell<'_> {
     InteriorCell { cell, raw }
 }
 
+fn interior_might_split(page_size: usize, remaining: usize) -> bool {
+    let payload_size = page_size - PAGE_HEADER_SIZE - INTERIOR_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+    let max_before_overflow = payload_size / 4 - INTERIOR_PAGE_CELL_SIZE;
+    let min_content_not_overflow = max_before_overflow / 2;
+    let remaining = if remaining < INTERIOR_PAGE_CELL_SIZE {
+        0
+    } else {
+        remaining - INTERIOR_PAGE_CELL_SIZE
+    };
+    remaining < min_content_not_overflow
+}
+
 pub(crate) struct InteriorCell<'a> {
     cell: &'a [u8],
     raw: &'a [u8],
 }
 
-impl InteriorCell<'_> {
-    pub(crate) fn raw(&self) -> &[u8] {
+pub(crate) trait BTreeCell {
+    fn raw(&self) -> &[u8];
+    fn key_size(&self) -> usize;
+    fn overflow(&self) -> Option<PageId>;
+}
+
+impl BTreeCell for InteriorCell<'_> {
+    fn raw(&self) -> &[u8] {
         self.raw
     }
 
-    pub(crate) fn key_size(&self) -> usize {
+    fn key_size(&self) -> usize {
         u32::from_be_bytes(self.cell[16..20].try_into().unwrap()) as usize
     }
 
-    pub(crate) fn overflow(&self) -> Option<PageId> {
+    fn overflow(&self) -> Option<PageId> {
         PageId::from_be_bytes(self.cell[8..16].try_into().unwrap())
     }
+}
 
+impl InteriorCell<'_> {
     pub(crate) fn ptr(&self) -> PageId {
         PageId::from_be_bytes(self.cell[0..8].try_into().unwrap()).unwrap()
     }
@@ -1033,6 +1100,39 @@ impl<'a> InteriorPageWrite<'a> {
 
         Ok(())
     }
+
+    pub(crate) fn might_split(&self) -> bool {
+        let PageKind::Interior { remaining, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        interior_might_split(self.0.pager.page_size, remaining)
+    }
+}
+
+pub(crate) struct LeafPageWrite<'a>(PageWrite<'a>);
+
+impl<'a> LeafPageWrite<'a> {
+    pub(crate) fn id(&self) -> PageId {
+        self.0.meta.id
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        let PageKind::Leaf { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        count
+    }
+
+    pub(crate) fn get(&self, index: usize) -> LeafCell {
+        get_leaf_cell(self.0.buffer, index)
+    }
+
+    pub(crate) fn next(&self) -> Option<PageId> {
+        let PageKind::Leaf { next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        next
+    }
 }
 
 fn get_leaf_cell(buff: &[u8], index: usize) -> LeafCell<'_> {
@@ -1049,22 +1149,51 @@ pub(crate) struct LeafCell<'a> {
     raw: &'a [u8],
 }
 
-impl<'a> LeafCell<'a> {
-    pub(crate) fn raw(&self) -> &'a [u8] {
+impl<'a> BTreeCell for LeafCell<'a> {
+    fn raw(&self) -> &'a [u8] {
         self.raw
     }
 
-    pub(crate) fn key_size(&self) -> usize {
+    fn key_size(&self) -> usize {
         u32::from_be_bytes(self.cell[8..12].try_into().unwrap()) as usize
     }
 
+    fn overflow(&self) -> Option<PageId> {
+        PageId::from_be_bytes(self.cell[0..8].try_into().unwrap())
+    }
+}
+
+impl<'a> LeafCell<'a> {
     pub(crate) fn val_size(&self) -> usize {
         u32::from_be_bytes(self.cell[12..16].try_into().unwrap()) as usize
     }
+}
 
-    pub(crate) fn overflow(&self) -> Option<PageId> {
-        PageId::from_be_bytes(self.cell[0..8].try_into().unwrap())
+pub(crate) struct OverflowPageRead<'a>(PageRead<'a>);
+
+impl<'a> OverflowPageRead<'a> {
+    pub(crate) fn id(&self) -> PageId {
+        self.0.meta.id
     }
+
+    pub(crate) fn next(&self) -> Option<PageId> {
+        let PageKind::Overflow { next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        next
+    }
+
+    pub(crate) fn content(&self) -> &[u8] {
+        let PageKind::Overflow { size, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        get_overflow_content(self.0.buffer, size)
+    }
+}
+
+fn get_overflow_content(buff: &[u8], size: usize) -> &[u8] {
+    let offset = PAGE_HEADER_SIZE + OVERFLOW_PAGE_HEADER_SIZE;
+    &buff[offset..offset + size]
 }
 
 #[cfg(test)]

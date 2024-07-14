@@ -196,6 +196,10 @@ pub(crate) enum WalRecord<'a> {
         old_overflow: Option<PageId>,
         old_key_size: usize,
     },
+
+    LeafInit {
+        pgid: PageId,
+    },
 }
 
 impl<'a> WalRecord<'a> {
@@ -211,16 +215,22 @@ impl<'a> WalRecord<'a> {
             WalRecord::InteriorInit { .. } => 20,
             WalRecord::InteriorInsert { .. } => 21,
             WalRecord::InteriorDelete { .. } => 22,
+
+            WalRecord::LeafInit { .. } => 30,
         }
     }
 
     fn size(&self) -> usize {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => 0,
+
             WalRecord::HeaderSet { .. } => 16,
+
             WalRecord::InteriorInit { .. } => 16,
             WalRecord::InteriorInsert { .. } => 32,
             WalRecord::InteriorDelete { .. } => 32,
+
+            WalRecord::LeafInit { .. } => 8,
         }
     }
 
@@ -272,6 +282,9 @@ impl<'a> WalRecord<'a> {
                 buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[16..24].copy_from_slice(&old_ptr.to_be_bytes());
                 buff[24..32].copy_from_slice(&old_overflow.to_be_bytes());
+            }
+            WalRecord::LeafInit { pgid } => {
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
             }
         }
     }

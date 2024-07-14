@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+mod btree;
 mod content;
 mod db;
 mod pager;
