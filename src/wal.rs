@@ -1,4 +1,4 @@
-use crate::pager::PageId;
+use crate::pager::{PageId, PageIdExt};
 use parking_lot::Mutex;
 use std::fs::File;
 use std::io::Write;
@@ -22,19 +22,43 @@ impl TxId {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Lsn(u64);
+pub(crate) struct Lsn(NonZeroU64);
 
 impl Lsn {
-    pub(crate) fn new(lsn: u64) -> Self {
-        Self(lsn)
+    pub(crate) fn new(lsn: u64) -> Option<Self> {
+        NonZeroU64::new(lsn).map(Self)
     }
 
     pub(crate) fn get(&self) -> u64 {
-        self.0
+        self.0.get()
     }
 
     pub(crate) fn add(&self, offset: usize) -> Self {
-        Self(self.0 + offset as u64)
+        let v = self.0.get() + offset as u64;
+        Self::new(v).expect("should not overflow")
+    }
+
+    pub(crate) fn from_be_bytes(lsn: [u8; 8]) -> Option<Self> {
+        Self::new(u64::from_be_bytes(lsn))
+    }
+}
+
+pub(crate) trait LsnExt {
+    fn to_be_bytes(&self) -> [u8; 8];
+}
+
+impl LsnExt for Lsn {
+    fn to_be_bytes(&self) -> [u8; 8] {
+        self.0.get().to_be_bytes()
+    }
+}
+impl LsnExt for Option<Lsn> {
+    fn to_be_bytes(&self) -> [u8; 8] {
+        if let Some(pgid) = self {
+            pgid.to_be_bytes()
+        } else {
+            0u64.to_be_bytes()
+        }
     }
 }
 
@@ -65,7 +89,10 @@ impl Wal {
                 buffer: vec![0u8; buff_size],
                 offset_end: 0,
                 // TODO: this should be read from the file
-                next_lsn: Lsn::new(0),
+                // the WAL file header should encodes these information:
+                // - last flushed lsn
+                // - lsn of last checkpoint
+                next_lsn: Lsn::new(8).unwrap(),
             }),
         }
     }
@@ -76,7 +103,7 @@ impl Wal {
 
         let mut internal = self.internal.lock();
         if internal.offset_end + size > internal.buffer.len() {
-            self.flush(&mut *internal)?;
+            Self::flush(&mut *self.f.lock(), &mut *internal)?;
         }
 
         let offset_end = internal.offset_end;
@@ -90,28 +117,56 @@ impl Wal {
 
     pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
         let mut internal = self.internal.lock();
-        self.flush(&mut *internal)
+        Self::flush(&mut *self.f.lock(), &mut *internal)
     }
 
-    fn flush(&self, internal: &mut WalInternal) -> anyhow::Result<()> {
-        let mut f = self.f.lock();
+    fn flush(f: &mut File, internal: &mut WalInternal) -> anyhow::Result<()> {
         f.write_all(&internal.buffer[..internal.offset_end])?;
         f.sync_all()?;
         internal.offset_end = 0;
         Ok(())
     }
+
+    pub(crate) fn shutdown(self) -> anyhow::Result<()> {
+        let internal = self.internal.into_inner();
+
+        let mut f = self.f.into_inner();
+        f.write_all(&internal.buffer[..internal.offset_end])?;
+        f.sync_all()?;
+
+        Ok(())
+    }
 }
 
-pub(crate) enum WalRecord {
+pub(crate) enum WalRecord<'a> {
     Begin,
     Commit,
     Rollback,
     End,
 
-    InteriorInit { pgid: PageId, last: PageId },
+    InteriorInit {
+        pgid: PageId,
+        last: PageId,
+    },
+    InteriorInsert {
+        pgid: PageId,
+        index: usize,
+        raw: &'a [u8],
+        ptr: PageId,
+        overflow: Option<PageId>,
+        key_size: usize,
+    },
+    InteriorDelete {
+        pgid: PageId,
+        index: usize,
+        old_raw: &'a [u8],
+        old_ptr: PageId,
+        old_overflow: Option<PageId>,
+        old_key_size: usize,
+    },
 }
 
-impl WalRecord {
+impl<'a> WalRecord<'a> {
     fn kind(&self) -> u8 {
         match self {
             WalRecord::Begin => 1,
@@ -120,13 +175,17 @@ impl WalRecord {
             WalRecord::End => 4,
 
             WalRecord::InteriorInit { .. } => 10,
+            WalRecord::InteriorInsert { .. } => 11,
+            WalRecord::InteriorDelete { .. } => 12,
         }
     }
 
     fn size(&self) -> usize {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => 0,
-            WalRecord::InteriorInit { pgid, last } => 16,
+            WalRecord::InteriorInit { .. } => 16,
+            WalRecord::InteriorInsert { .. } => 32,
+            WalRecord::InteriorDelete { .. } => 32,
         }
     }
 
@@ -137,17 +196,55 @@ impl WalRecord {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
                 buff[8..16].copy_from_slice(&last.get().to_be_bytes());
             }
+            WalRecord::InteriorInsert {
+                pgid,
+                index,
+                raw,
+                ptr,
+                overflow,
+                key_size,
+            } => {
+                assert!(raw.len() <= u16::MAX as usize);
+                assert!(*key_size <= u32::MAX as usize);
+                assert!(*index <= u16::MAX as usize);
+
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..12].copy_from_slice(&(*key_size as u32).to_be_bytes());
+                buff[12..14].copy_from_slice(&(raw.len() as u16).to_be_bytes());
+                buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
+                buff[16..24].copy_from_slice(&ptr.to_be_bytes());
+                buff[24..32].copy_from_slice(&overflow.to_be_bytes());
+            }
+            WalRecord::InteriorDelete {
+                pgid,
+                index,
+                old_raw,
+                old_ptr,
+                old_overflow,
+                old_key_size,
+            } => {
+                assert!(old_raw.len() <= u16::MAX as usize);
+                assert!(*old_key_size <= u32::MAX as usize);
+                assert!(*index <= u16::MAX as usize);
+
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..12].copy_from_slice(&(*old_key_size as u32).to_be_bytes());
+                buff[12..14].copy_from_slice(&(old_raw.len() as u16).to_be_bytes());
+                buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
+                buff[16..24].copy_from_slice(&old_ptr.to_be_bytes());
+                buff[24..32].copy_from_slice(&old_overflow.to_be_bytes());
+            }
         }
     }
 }
 
-struct WalByteEntry {
+struct WalByteEntry<'a> {
     txid: TxId,
-    record: WalRecord,
+    record: WalRecord<'a>,
 }
 
-impl WalByteEntry {
-    fn new(txid: TxId, record: WalRecord) -> Self {
+impl<'a> WalByteEntry<'a> {
+    fn new(txid: TxId, record: WalRecord<'a>) -> Self {
         Self { txid, record }
     }
 
@@ -244,7 +341,7 @@ mod tests {
         let lsn = wal
             .append(TxId::new(1).unwrap(), WalRecord::Begin {})
             .unwrap();
-        assert_eq!(0, lsn.get());
+        assert_eq!(8, lsn.get());
 
         let lsn = wal
             .append(
@@ -255,7 +352,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(24, lsn.get());
+        assert_eq!(32, lsn.get());
 
         dir.close().unwrap();
     }
