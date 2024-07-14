@@ -688,6 +688,10 @@ impl<'a> PageRead<'a> {
         self.meta.id
     }
 
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(&self.meta.kind, PageKind::None)
+    }
+
     pub(crate) fn is_interior(&self) -> bool {
         matches!(&self.meta.kind, PageKind::Interior { .. })
     }

@@ -191,15 +191,25 @@ impl<'a> BTree<'a> {
             current = next;
         };
 
+        if page.is_none() {
+            return Ok(LookupResult {
+                cursor: Cursor {
+                    pager: self.pager,
+                    page: None,
+                    index: 0,
+                },
+                found: false,
+            });
+        }
+
         let leaf = page.into_leaf().expect("not a leaf page");
         let (i, found) = self.search_key_in_node(&leaf, key)?;
         let is_finished = i >= leaf.count();
         Ok(LookupResult {
             cursor: Cursor {
                 pager: self.pager,
-                page: leaf,
+                page: if is_finished { None } else { Some(leaf) },
                 index: i,
-                finished: is_finished,
             },
             found,
         })
@@ -213,9 +223,8 @@ pub(crate) struct LookupResult<'a> {
 
 pub(crate) struct Cursor<'a> {
     pager: &'a Pager,
-    page: LeafPageRead<'a>,
+    page: Option<LeafPageRead<'a>>,
     index: usize,
-    finished: bool,
 }
 
 pub(crate) struct KVItem {
@@ -235,12 +244,12 @@ impl KVItem {
 
 impl<'a> Cursor<'a> {
     pub(crate) fn next(&mut self) -> anyhow::Result<Option<KVItem>> {
-        if self.finished {
+        let Some(ref leaf_page) = self.page else {
             return Ok(None);
-        }
+        };
 
-        let item = if self.index < self.page.count() {
-            let cell = self.page.get(self.index);
+        let item = if self.index < leaf_page.count() {
+            let cell = leaf_page.get(self.index);
             let total_size = cell.key_size() + cell.val_size();
             let mut raw = vec![0u8; total_size];
             let mut content = BTreeContent::from_leaf_content(self.pager, &cell);
@@ -255,15 +264,15 @@ impl<'a> Cursor<'a> {
             None
         };
 
-        if self.index >= self.page.count() {
-            if let Some(next_pgid) = self.page.next() {
+        if self.index >= leaf_page.count() {
+            if let Some(next_pgid) = leaf_page.next() {
                 let Some(page) = self.pager.read(next_pgid)?.into_leaf() else {
                     return Err(anyhow!("expected a leaf page"));
                 };
-                self.page = page;
+                self.page = Some(page);
                 self.index = 0;
             } else {
-                self.finished = true;
+                self.page = None;
             }
         }
 

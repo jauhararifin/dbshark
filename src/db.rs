@@ -1,6 +1,6 @@
 use crate::btree::BTree;
 use crate::pager::{PageId, PageIdExt, Pager};
-use crate::wal::{TxId, TxIdExt, Wal, WalRecord};
+use crate::wal::{self, TxId, TxIdExt, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::io::{Read, Write};
@@ -169,14 +169,36 @@ impl<'db> Drop for Tx<'db> {
 }
 
 impl<'db> Tx<'db> {
-    // TODO: remove this. By right we should be able to create a bunch of buckets
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+    pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
         let mut btree = BTree::new(self.id, &self.db.pager, root_pgid, self.db.freelist);
-        btree.put(key, value)?;
+        let mut result = btree.seek(name.as_bytes())?;
+        let bucket_pgid = if !result.found {
+            drop(result);
+            let bucket_root = self.db.pager.alloc(self.id)?;
+            let bucket_root_id = bucket_root.id();
+            drop(bucket_root);
 
-        Ok(())
+            let b = bucket_root_id.to_be_bytes();
+
+            btree.put(name.as_bytes(), &b)?;
+            bucket_root_id
+        } else {
+            let item = result.cursor.next()?.unwrap();
+            let pgid_buff = item.value();
+            let Ok(pgid) = pgid_buff.try_into() else {
+                return Err(anyhow!("invalid bucket root pgid"));
+            };
+            let Some(pgid) = PageId::from_be_bytes(pgid) else {
+                return Err(anyhow!("invalid bucket root pgid"));
+            };
+            pgid
+        };
+
+        Ok(Bucket {
+            btree: BTree::new(self.id, &self.db.pager, bucket_pgid, self.db.freelist),
+        })
     }
 
     fn init_root(&mut self) -> anyhow::Result<PageId> {
@@ -198,20 +220,6 @@ impl<'db> Tx<'db> {
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        let Some(root_pgid) = self.db.root else {
-            return Ok(None);
-        };
-
-        let mut btree = BTree::new(self.id, &self.db.pager, root_pgid, self.db.freelist);
-        let mut result = btree.seek(key)?;
-        if !result.found {
-            return Ok(None);
-        }
-
-        Ok(result.cursor.next()?.map(|item| item.value().to_vec()))
-    }
-
     pub fn commit(mut self) {
         self.closed = true;
         // TODO: impl
@@ -220,5 +228,25 @@ impl<'db> Tx<'db> {
     pub fn rollback(mut self) {
         self.closed = true;
         // TODO: impl
+    }
+}
+
+pub struct Bucket<'a> {
+    btree: BTree<'a>,
+}
+
+impl<'a> Bucket<'a> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        self.btree.put(key, value)?;
+        Ok(())
+    }
+
+    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut result = self.btree.seek(key)?;
+        if !result.found {
+            return Ok(None);
+        }
+        let value = result.cursor.next()?.map(|item| item.value().to_vec());
+        Ok(value)
     }
 }
