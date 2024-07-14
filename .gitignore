@@ -1,2 +1,5 @@
 /target
 tarpaulin-report.html
+
+test.db
+test.wal

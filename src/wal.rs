@@ -19,6 +19,29 @@ impl TxId {
     pub(crate) fn get(&self) -> u64 {
         self.0.get()
     }
+
+    pub(crate) fn from_be_bytes(lsn: [u8; 8]) -> Option<Self> {
+        Self::new(u64::from_be_bytes(lsn))
+    }
+}
+
+pub(crate) trait TxIdExt {
+    fn to_be_bytes(&self) -> [u8; 8];
+}
+
+impl TxIdExt for TxId {
+    fn to_be_bytes(&self) -> [u8; 8] {
+        self.0.get().to_be_bytes()
+    }
+}
+impl TxIdExt for Option<TxId> {
+    fn to_be_bytes(&self) -> [u8; 8] {
+        if let Some(pgid) = self {
+            pgid.to_be_bytes()
+        } else {
+            0u64.to_be_bytes()
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
