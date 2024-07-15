@@ -107,6 +107,7 @@ impl Pager {
         wal: Arc<Wal>,
         page_size: usize,
         n: usize,
+        error_handler: Option<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
     ) -> anyhow::Result<Arc<Self>> {
         Self::check_page_size(page_size)?;
 
@@ -166,7 +167,7 @@ impl Pager {
         pager
             .flush_thread
             .set(std::thread::spawn(move || {
-                Self::flush_thread_handler(pager_clone, recv);
+                Self::flush_thread_handler(pager_clone, recv, error_handler);
             }))
             .expect("able to set flush thread");
 
@@ -393,13 +394,19 @@ impl Pager {
         }
     }
 
-    fn flush_thread_handler(pager: Arc<Pager>, recv: Receiver<()>) {
+    fn flush_thread_handler(
+        pager: Arc<Pager>,
+        recv: Receiver<()>,
+        error_handler: Option<impl Fn(anyhow::Error) + Send + Sync>,
+    ) {
         loop {
             if recv.recv_timeout(Duration::from_secs(60 * 5)).is_ok() {
                 break;
             }
             if let Err(err) = pager.flush_dirty_pages() {
-                todo!();
+                if let Some(ref error_handler) = error_handler {
+                    error_handler(err);
+                }
             }
         }
     }
@@ -1531,7 +1538,7 @@ mod tests {
         let mut wal_file = File::create(wal_path).unwrap();
         let wal = Arc::new(Wal::new(wal_file, page_size));
 
-        let pager = Pager::new(file, wal, page_size, 10).unwrap();
+        let pager = Pager::new(file, wal, page_size, 10, None).unwrap();
         let txid = TxId::new(1).unwrap();
 
         let mut page1 = pager.alloc(txid).unwrap();

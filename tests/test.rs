@@ -1,4 +1,4 @@
-use dbest::Db;
+use dbest::{Db, Setting};
 use std::path::Path;
 
 #[test]
@@ -6,7 +6,7 @@ fn test_db_happy_path() {
     _ = std::fs::remove_file("test.db");
     _ = std::fs::remove_file("test.wal");
 
-    let db = Db::open(Path::new("test.db")).unwrap();
+    let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
 
     let mut bucket = tx.bucket("table1").unwrap();
@@ -17,6 +17,6 @@ fn test_db_happy_path() {
     tx.commit().expect("commit must succeed");
     drop(db);
 
-    let db = Db::open(Path::new("test.db")).unwrap();
+    let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
     drop(db);
 }

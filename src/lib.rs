@@ -6,4 +6,4 @@ mod db;
 mod pager;
 mod wal;
 
-pub use db::Db;
+pub use db::{Db, Setting};

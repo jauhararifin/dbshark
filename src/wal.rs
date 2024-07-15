@@ -334,32 +334,36 @@ impl<'a> WalByteEntry<'a> {
     }
 
     fn size(&self) -> usize {
-        // (8 bytes for txid+kind) + (2 byte for entry size) + (2 byte for entry size) (entry) + (padding) (8 checksum)
-        8 + pad8(2 + 2 + self.record.size()) + 8
+        // (8 bytes for txid+kind) +
+        // (2 bytes for entry size) +
+        // (entry) +
+        // (padding) +
+        // (8 bytes checksum) +
+        // (2 bytes for the whole record size. this is for backward iteration)
+        8 + pad8(2 + self.record.size()) + 8 + 8
     }
 
     fn encode(&self, buff: &mut [u8]) {
         buff[0..8].copy_from_slice(&self.txid.get().to_be_bytes());
         buff[0] = self.record.kind();
 
-        let size = self.size();
-        assert!(size < 1 << 16);
         let record_size = self.record.size();
         assert!(record_size < 1 << 16);
 
-        buff[8..10].copy_from_slice(&(size as u16).to_be_bytes());
-        buff[10..12].copy_from_slice(&(record_size as u16).to_be_bytes());
+        buff[8..10].copy_from_slice(&(record_size as u16).to_be_bytes());
         self.record.encode(&mut buff[10..10 + record_size]);
 
         let next = pad8(10 + record_size);
         buff[10 + record_size..next].fill(0);
 
-        // TODO: we may want to add the entry size as the footer to help
-        // us traverse the log file in reverse order. This can be useful
-        // for rollback purposes.
-
         let checksum = crc64::crc64(0, &buff[0..next]);
         buff[next..next + 8].copy_from_slice(&checksum.to_be_bytes());
+
+        let next = next + 8;
+        let size = self.size();
+        assert!(size < 1 << 16);
+        assert_eq!(size, next + 8);
+        buff[next..next + 8].copy_from_slice(&(size as u64).to_be_bytes());
     }
 }
 
@@ -403,11 +407,11 @@ mod tests {
         assert_eq!(
             &[
                 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // kind=1, txid=1
-                0x00, 0x18, // record size
                 0x00, 0x00, // entry size
                 // the entry is zero bytes
-                0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
-                0x7f, 0x4f, 0x12, 0xf4, 0xb5, 0x4b, 0x09, 0xff,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
+                0xc6, 0xad, 0x9c, 0xb3, 0xa7, 0xbb, 0x57, 0x88, // checksum
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, // size
             ],
             buff.as_slice()
         );
@@ -437,7 +441,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(32, lsn.get());
+        assert_eq!(40, lsn.get());
 
         dir.close().unwrap();
     }

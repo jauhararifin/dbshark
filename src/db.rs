@@ -25,8 +25,13 @@ struct DbInternal {
     last_unclosed_txn: Option<TxId>,
 }
 
+#[derive(Default)]
+pub struct Setting {
+    error_handler: Option<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
+}
+
 impl Db {
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
         let wal_path = path.with_extension("wal");
 
         let mut db_file = File::create(path)?;
@@ -40,7 +45,7 @@ impl Db {
         let wal_file = File::create(wal_path)?;
         let wal = Arc::new(Wal::new(wal_file, page_size));
 
-        let pager = Pager::new(db_file, wal.clone(), page_size, 1000)?;
+        let pager = Pager::new(db_file, wal.clone(), page_size, 1000, setting.error_handler)?;
 
         let next_txid = if let Some(txid) = header.last_txid {
             txid.next()
