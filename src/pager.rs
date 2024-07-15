@@ -7,7 +7,12 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{self, AtomicBool};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PageId(NonZeroU64);
@@ -53,6 +58,9 @@ pub(crate) struct Pager {
     wal: Arc<Wal>,
 
     internal: RwLock<PagerInternal>,
+
+    shutdown_chan: SyncSender<()>,
+    flush_thread: OnceLock<JoinHandle<()>>,
 }
 
 pub(crate) struct PagerInternal {
@@ -76,12 +84,12 @@ const LEAF_PAGE_CELL_SIZE: usize = 24;
 const OVERFLOW_PAGE_HEADER_SIZE: usize = 16;
 const FREELIST_PAGE_HEADER_SIZE: usize = 16;
 
-unsafe impl Send for Pager {}
-unsafe impl Sync for Pager {}
+unsafe impl Send for PagerInternal {}
+unsafe impl Sync for PagerInternal {}
 
 impl Drop for Pager {
     fn drop(&mut self) {
-        let internal = self.internal.get_mut();
+        let internal = self.internal.write();
         unsafe {
             let v = Vec::from_raw_parts(
                 internal.buffer,
@@ -94,7 +102,12 @@ impl Drop for Pager {
 }
 
 impl Pager {
-    pub(crate) fn new(f: File, wal: Arc<Wal>, page_size: usize, n: usize) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        f: File,
+        wal: Arc<Wal>,
+        page_size: usize,
+        n: usize,
+    ) -> anyhow::Result<Arc<Self>> {
         Self::check_page_size(page_size)?;
 
         if n < 10 {
@@ -114,9 +127,7 @@ impl Pager {
                 RwLock::new(PageMeta {
                     id: dummy_pgid,
                     kind: PageKind::None,
-                    is_mutated: false,
-                    rec_lsn: None,
-                    page_lsn: None,
+                    wal: None,
                 })
             })
             .collect::<Vec<_>>()
@@ -128,7 +139,8 @@ impl Pager {
             file_page_count = 1;
         }
 
-        Ok(Self {
+        let (send, recv) = sync_channel(0);
+        let pager = Arc::new(Self {
             f: Mutex::new(f),
             page_size,
             n,
@@ -145,7 +157,20 @@ impl Pager {
                 dirty_frames: HashSet::default(),
                 free_and_clean: HashSet::default(),
             }),
-        })
+
+            shutdown_chan: send,
+            flush_thread: OnceLock::default(),
+        });
+
+        let pager_clone = pager.clone();
+        pager
+            .flush_thread
+            .set(std::thread::spawn(move || {
+                Self::flush_thread_handler(pager_clone, recv);
+            }))
+            .expect("able to set flush thread");
+
+        Ok(pager)
     }
 
     fn check_page_size(page_size: usize) -> anyhow::Result<()> {
@@ -290,9 +315,7 @@ impl Pager {
                 *meta_locked = PageMeta {
                     id: pgid,
                     kind: PageKind::None,
-                    is_mutated: false,
-                    rec_lsn: None,
-                    page_lsn: None,
+                    wal: None,
                 };
             }
             drop(meta_locked);
@@ -348,9 +371,7 @@ impl Pager {
                 *meta_locked = PageMeta {
                     id: pgid,
                     kind: PageKind::None,
-                    is_mutated: false,
-                    rec_lsn: None,
-                    page_lsn: None,
+                    wal: None,
                 };
             }
             drop(meta_locked);
@@ -370,6 +391,59 @@ impl Pager {
             // TODO: consider sleep and retry this process
             Err(anyhow!("all pages are pinned"))
         }
+    }
+
+    fn flush_thread_handler(pager: Arc<Pager>, recv: Receiver<()>) {
+        loop {
+            if recv.recv_timeout(Duration::from_secs(60 * 5)).is_ok() {
+                break;
+            }
+            if let Err(err) = pager.flush_dirty_pages() {
+                todo!();
+            }
+        }
+    }
+
+    fn flush_dirty_pages(&self) -> anyhow::Result<()> {
+        for frame_id in 0..self.n {
+            let (meta, buffer) = {
+                let mut internal = self.internal.write();
+
+                // SAFETY:
+                // - it's guaranteed that the address pointed by metas + frame_id is valid
+                // - it's guaranteed that there are only shared reference to the meta since we
+                //   never make a mutable reference of it, except when dropping the pager
+                let meta = unsafe { &*internal.metas.add(frame_id) };
+
+                let offset = frame_id * self.page_size;
+                // SAFETY: it's guaranteed that the buffer + offset is pointed to valid address.
+                let buffer_offset = unsafe { internal.buffer.add(offset) };
+                // SAFETY: it's guaranteed that buffer has only one mutable reference or multiple
+                // shared reference since it's protected by page meta's lock.
+                let buffer =
+                    unsafe { std::slice::from_raw_parts_mut(buffer_offset, self.page_size) };
+
+                (meta, buffer)
+            };
+
+            // TODO: maybe acquire read lock first and skip it if it's already clean.
+            // only when it's dirty, we acquire write lock and flush it.
+            let mut frame = meta.write();
+            if let Some(ref wal_info) = frame.wal {
+                self.wal.sync(wal_info.page)?;
+
+                Self::encode(&frame, buffer)?;
+                let mut f = self.f.lock();
+                // TODO: try to seek and write using a single syscall
+                f.seek(SeekFrom::Start(frame.id.get() * self.page_size as u64))?;
+                f.write_all(buffer)?;
+                f.sync_all()?;
+
+                frame.wal = None;
+            }
+        }
+
+        Ok(())
     }
 
     fn decode(&self, pgid: PageId, meta: &mut PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
@@ -422,8 +496,21 @@ impl Pager {
         };
         meta.id = pgid;
         meta.kind = kind;
-        meta.rec_lsn = rec_lsn;
-        meta.page_lsn = page_lsn;
+
+        if let Some(rec_lsn) = rec_lsn {
+            let Some(page_lsn) = page_lsn else {
+                return Err(anyhow!("page {} has rec_lsn but no page_lsn", pgid.get()));
+            };
+            meta.wal = Some(PageWalInfo {
+                rec: rec_lsn,
+                page: page_lsn,
+            });
+        } else {
+            if page_lsn.is_some() {
+                return Err(anyhow!("page {} has page_lsn but no rec_lsn", pgid.get()));
+            }
+            meta.wal = None;
+        }
 
         Ok(())
     }
@@ -536,8 +623,15 @@ impl Pager {
         };
         header[2] = kind;
         header[3..8].copy_from_slice(&[0, 0, 0, 0, 0]);
-        header[8..16].copy_from_slice(&meta.rec_lsn.to_be_bytes());
-        header[16..24].copy_from_slice(&meta.page_lsn.to_be_bytes());
+
+        let (rec_lsn, page_lsn) = if let Some(ref wal_info) = meta.wal {
+            (Some(wal_info.rec), Some(wal_info.page))
+        } else {
+            (None, None)
+        };
+
+        header[8..16].copy_from_slice(&rec_lsn.to_be_bytes());
+        header[16..24].copy_from_slice(&page_lsn.to_be_bytes());
 
         let payload_buff = &mut buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
         match &meta.kind {
@@ -586,16 +680,18 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn shutdown(mut self) -> anyhow::Result<()> {
-        let internal = self.internal.get_mut();
-        let page_to_frame = &internal.page_to_frame;
-        let metas = &internal.metas;
-        let buffers = &mut internal.buffer;
+    pub(crate) fn shutdown(self: Arc<Self>) -> anyhow::Result<()> {
+        if let Err(err) = self.shutdown_chan.send(()) {
+            todo!();
+        }
+
+        let mut internal = self.internal.write();
         let mut f = self.f.lock();
 
-        for (pgid, frame_id) in page_to_frame {
-            let meta = unsafe { &*metas.add(*frame_id) }.read();
+        for (pgid, frame_id) in internal.page_to_frame.iter() {
+            let meta = unsafe { &*internal.metas.add(*frame_id) }.read();
             let offset = *frame_id * self.page_size;
+            // SAFETY: we own the pager, of course this is safe
             let buffer = unsafe {
                 std::slice::from_raw_parts_mut(internal.buffer.add(offset), self.page_size)
             };
@@ -641,9 +737,19 @@ struct PageMeta {
     id: PageId,
     kind: PageKind,
 
-    is_mutated: bool,
-    rec_lsn: Option<Lsn>,
-    page_lsn: Option<Lsn>,
+    // TODO: maybe we don't need to `is_mutated` field. We can
+    // infer it from the `rec_lsn` and `page_lsn` fields. If
+    // they are None, then it's a clean page, otherwise it's
+    // a dirty page.
+    // is_mutated: bool,
+    // rec_lsn: Option<Lsn>,
+    // page_lsn: Option<Lsn>,
+    wal: Option<PageWalInfo>,
+}
+
+struct PageWalInfo {
+    rec: Lsn,
+    page: Lsn,
 }
 
 enum PageKind {
@@ -731,7 +837,7 @@ pub(crate) struct PageWrite<'a> {
 
 impl<'a> Drop for PageWrite<'a> {
     fn drop(&mut self) {
-        self.pager.release(self.frame_id, self.meta.is_mutated);
+        self.pager.release(self.frame_id, self.meta.wal.is_some());
     }
 }
 
@@ -819,11 +925,14 @@ fn record_mutation(
     entry: WalRecord,
 ) -> anyhow::Result<()> {
     let lsn = pager.wal.append(txid, entry)?;
-    if !meta.is_mutated {
-        meta.rec_lsn = Some(lsn);
+    if let Some(ref mut wal_info) = meta.wal {
+        wal_info.page = lsn;
+    } else {
+        meta.wal = Some(PageWalInfo {
+            rec: lsn,
+            page: lsn,
+        });
     }
-    meta.page_lsn = Some(lsn);
-    meta.is_mutated = true;
     Ok(())
 }
 
@@ -996,7 +1105,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             self.0.pager,
-            &mut *self.0.meta,
+            &mut self.0.meta,
             WalRecord::InteriorInsert {
                 pgid,
                 index: i,
@@ -1091,7 +1200,7 @@ impl<'a> InteriorPageWrite<'a> {
     pub(crate) fn delete(&mut self, index: usize) -> anyhow::Result<()> {
         let id = self.0.meta.id;
 
-        let cell = get_interior_cell(&self.0.buffer, index);
+        let cell = get_interior_cell(self.0.buffer, index);
         let content_offset = u16::from_be_bytes(cell.cell[20..22].try_into().unwrap()) as usize;
         let content_size = u16::from_be_bytes(cell.cell[22..24].try_into().unwrap()) as usize;
 
@@ -1099,7 +1208,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             self.0.pager,
-            &mut *self.0.meta,
+            &mut self.0.meta,
             WalRecord::InteriorInsert {
                 pgid,
                 index,
@@ -1255,7 +1364,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             self.0.pager,
-            &mut *self.0.meta,
+            &mut self.0.meta,
             WalRecord::LeafInsert {
                 pgid,
                 index: i,

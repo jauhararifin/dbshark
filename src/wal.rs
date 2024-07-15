@@ -130,7 +130,7 @@ impl Wal {
 
         let mut internal = self.internal.lock();
         if internal.offset_end + size > internal.buffer.len() {
-            Self::flush(&mut *self.f.lock(), &mut *internal)?;
+            Self::flush(&mut self.f.lock(), &mut internal)?;
         }
 
         let offset_end = internal.offset_end;
@@ -144,7 +144,7 @@ impl Wal {
 
     pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
         let mut internal = self.internal.lock();
-        Self::flush(&mut *self.f.lock(), &mut *internal)
+        Self::flush(&mut self.f.lock(), &mut internal)
     }
 
     fn flush(f: &mut File, internal: &mut WalInternal) -> anyhow::Result<()> {

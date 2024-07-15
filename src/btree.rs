@@ -153,7 +153,7 @@ impl<'a> BTree<'a> {
         Ok((i, found))
     }
 
-    fn insert_content_to_leaf<'b>(
+    fn insert_content_to_leaf(
         &self,
         node: &mut LeafPageWrite,
         index: usize,

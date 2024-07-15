@@ -14,8 +14,7 @@ fn test_db_happy_path() {
     let result = bucket.get(b"key00001").unwrap();
     assert_eq!(Some(b"val00001".to_vec()), result);
 
-    drop(bucket);
-    tx.commit();
+    tx.commit().expect("commit must succeed");
     drop(db);
 
     let db = Db::open(Path::new("test.db")).unwrap();

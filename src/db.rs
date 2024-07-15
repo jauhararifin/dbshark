@@ -13,11 +13,16 @@ pub struct Db {
 }
 
 struct DbInternal {
-    pager: Pager,
+    pager: Arc<Pager>,
     wal: Arc<Wal>,
     next_txid: TxId,
     root: Option<PageId>,
     freelist: Option<PageId>,
+
+    // if the last txn is not committed or rollback, the next time
+    // a new transaction begins, we should rollback the last txn
+    // first.
+    last_unclosed_txn: Option<TxId>,
 }
 
 impl Db {
@@ -50,6 +55,7 @@ impl Db {
                 next_txid,
                 root: None,
                 freelist: None,
+                last_unclosed_txn: None,
             }),
         })
     }
@@ -98,8 +104,14 @@ impl Db {
 
     pub fn update(&self) -> anyhow::Result<Tx> {
         let mut internal = self.internal.write();
+
+        if let Some(txid) = internal.last_unclosed_txn {
+            todo!("rollback the last unclosed txn first");
+        }
+
         let txid = internal.next_txid;
         internal.next_txid = internal.next_txid.next();
+        internal.last_unclosed_txn = Some(txid);
 
         Ok(Tx {
             id: txid,
@@ -220,14 +232,25 @@ impl<'db> Tx<'db> {
         }
     }
 
-    pub fn commit(mut self) {
+    pub fn commit(mut self) -> anyhow::Result<()> {
+        let commit_lsn = self.db.wal.append(self.id, WalRecord::Commit)?;
+        self.db.wal.append(self.id, WalRecord::End)?;
+        self.db.wal.sync(commit_lsn)?;
+
         self.closed = true;
-        // TODO: impl
+        self.db.last_unclosed_txn = None;
+        Ok(())
     }
 
-    pub fn rollback(mut self) {
+    pub fn rollback(mut self) -> anyhow::Result<()> {
+        self.db.wal.append(self.id, WalRecord::Rollback)?;
+        // TODO: undo all the changes made in this transaction.
+        // iterate the wal backwards and perform compensation mutation.
+        self.db.wal.append(self.id, WalRecord::End)?;
+
         self.closed = true;
-        // TODO: impl
+        self.db.last_unclosed_txn = None;
+        Ok(())
     }
 }
 
