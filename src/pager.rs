@@ -1536,7 +1536,7 @@ mod tests {
 
         let wal_path = dir.path().join("test.wal");
         let mut wal_file = File::create(wal_path).unwrap();
-        let wal = Arc::new(Wal::new(wal_file, page_size));
+        let wal = Arc::new(Wal::new(wal_file, page_size).unwrap());
 
         let pager = Pager::new(file, wal, page_size, 10, None).unwrap();
         let txid = TxId::new(1).unwrap();

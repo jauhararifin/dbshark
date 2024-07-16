@@ -43,7 +43,7 @@ impl Db {
         let page_size = header.page_size as usize;
 
         let wal_file = File::create(wal_path)?;
-        let wal = Arc::new(Wal::new(wal_file, page_size));
+        let wal = Arc::new(Wal::new(wal_file, page_size)?);
 
         let pager = Pager::new(db_file, wal.clone(), page_size, 1000, setting.error_handler)?;
 
