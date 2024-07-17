@@ -288,6 +288,9 @@ impl WalIterator<'_> {
                     self.end_offset = len;
 
                     let mut f = self.f.lock();
+                    if self.f_offset >= f.metadata()?.size() {
+                        return Ok(None);
+                    }
                     f.seek(SeekFrom::Start(self.f_offset))?;
                     let n = f.read(&mut self.buffer[self.end_offset..])?;
                     self.f_offset += n as u64;

@@ -176,7 +176,11 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn set_wal(&self, wal: Arc<Wal>) {}
+    pub(crate) fn set_wal(&self, wal: Arc<Wal>) {
+        if self.wal.set(wal).is_err() {
+            panic!("can't set wal twice")
+        }
+    }
 
     pub(crate) fn page_count(&self) -> usize {
         self.internal.read().file_page_count
@@ -921,12 +925,6 @@ fn record_mutation(
     meta: &mut PageMeta,
     entry: WalRecord,
 ) -> anyhow::Result<()> {
-    assert!(
-        (lsn.is_some() && pager.wal.get().is_none())
-            || (lsn.is_none() && pager.wal.get().is_some()),
-        "the lsn should comes in either of two ways: from appending a wal or passed during redo phase on recovery"
-    );
-
     let lsn = if let Some(wal) = pager.wal.get() {
         assert!(
             lsn.is_none(),
