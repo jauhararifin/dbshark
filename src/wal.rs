@@ -123,64 +123,20 @@ struct WalInternal {
 }
 
 impl Wal {
-    pub(crate) fn new(mut f: File, page_size: usize) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        mut f: File,
+        relative_lsn_offset: u64,
+        next_lsn: Lsn,
+        page_size: usize,
+    ) -> anyhow::Result<Self> {
         let buff_size = page_size * 100;
 
-        let wal_header = if f.metadata()?.size() < 2 * WAL_HEADER_SIZE as u64 {
-            let header = WalHeader {
-                version: 0,
-                relative_lsn_offset: 0,
-                checkpoint: None,
-            };
-
-            f.seek(SeekFrom::Start(0))?;
-            let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
-            header.encode(&mut header_buff[..WAL_HEADER_SIZE]);
-            header.encode(&mut header_buff[WAL_HEADER_SIZE..]);
-            f.write_all(&header_buff)?;
-
-            header
-        } else {
-            f.seek(SeekFrom::Start(0))?;
-            let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
-            f.read_exact(&mut header_buff)?;
-            if header_buff[0..6].cmp(b"db_wal").is_ne() {
-                return Err(anyhow!("the file is not a wal file"));
-            }
-
-            let wal_header = WalHeader::decode(&header_buff[..WAL_HEADER_SIZE])
-                .or_else(|| WalHeader::decode(&header_buff[WAL_HEADER_SIZE..]))
-                .ok_or_else(|| anyhow!("corrupted wal file"))?;
-
-            if wal_header.version != 0 {
-                return Err(anyhow!("unsupported WAL version: {}", wal_header.version));
-            }
-
-            wal_header
-        };
-
         let f = Mutex::new(f);
-
-        // TODO: perform aries recovery here, and get the `next_lsn`.
-        let analyze_start = wal_header
-            .checkpoint
-            .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
-        let mut iter = iterate_wal_forward(
-            &f,
-            wal_header.relative_lsn_offset as usize,
-            page_size,
-            analyze_start,
-        );
-        let mut next_lsn = wal_header.checkpoint;
-        while let Some((lsn, entry)) = iter.next()? {
-            next_lsn = Some(lsn);
-        }
-        let next_lsn = next_lsn.unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
 
         Ok(Wal {
             f,
 
-            relative_lsn_offset: wal_header.relative_lsn_offset,
+            relative_lsn_offset,
 
             internal: Mutex::new(WalInternal {
                 buffer: vec![0u8; buff_size],
@@ -233,111 +189,6 @@ impl Wal {
         f.sync_all()?;
 
         Ok(())
-    }
-}
-
-fn iterate_wal_forward(
-    f: &Mutex<File>,
-    relative_lsn_offset: usize,
-    page_size: usize,
-    lsn: Lsn,
-) -> WalIterator {
-    WalIterator {
-        f,
-        f_offset: lsn.add(relative_lsn_offset).get(),
-
-        lsn,
-
-        buffer: vec![0u8; 4 * page_size],
-        start_offset: 0,
-        end_offset: 0,
-    }
-}
-
-struct WalIterator<'a> {
-    f: &'a Mutex<File>,
-    f_offset: u64,
-
-    lsn: Lsn,
-
-    buffer: Vec<u8>,
-    start_offset: usize,
-    end_offset: usize,
-}
-
-impl WalIterator<'_> {
-    pub(crate) fn next(&mut self) -> anyhow::Result<Option<(Lsn, WalEntry)>> {
-        loop {
-            let buff = &self.buffer[self.start_offset..self.end_offset];
-            // TODO: check whether this is safe.
-            let buff = unsafe { std::mem::transmute::<&[u8], &[u8]>(buff) };
-
-            let entry = WalEntry::decode(buff);
-            match entry {
-                WalDecodeResult::Ok(entry) => {
-                    self.start_offset += entry.size();
-                    self.lsn = self.lsn.add(entry.size());
-                    return Ok(Some((self.lsn, entry)));
-                }
-                WalDecodeResult::NeedMoreBytes => {
-                    let len = self.end_offset - self.start_offset;
-                    for i in 0..len {
-                        self.buffer[i] = self.buffer[self.start_offset + i];
-                    }
-                    self.start_offset = 0;
-                    self.end_offset = len;
-
-                    let mut f = self.f.lock();
-                    if self.f_offset >= f.metadata()?.size() {
-                        return Ok(None);
-                    }
-                    f.seek(SeekFrom::Start(self.f_offset))?;
-                    let n = f.read(&mut self.buffer[self.end_offset..])?;
-                    self.f_offset += n as u64;
-                    self.end_offset += n;
-                }
-                WalDecodeResult::Incomplete => {
-                    return Ok(None);
-                }
-                WalDecodeResult::Err(err) => return Err(err),
-            }
-        }
-    }
-}
-
-const WAL_HEADER_SIZE: usize = 32;
-
-struct WalHeader {
-    version: u16,
-    checkpoint: Option<Lsn>,
-    relative_lsn_offset: u64,
-}
-
-impl WalHeader {
-    fn decode(buff: &[u8]) -> Option<Self> {
-        let version = u16::from_be_bytes(buff[6..8].try_into().unwrap());
-        let relative_lsn_offset = u64::from_be_bytes(buff[8..16].try_into().unwrap());
-        let checkpoint = Lsn::from_be_bytes(buff[16..24].try_into().unwrap());
-
-        let stored_checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
-        let calculated_checksum = crc64::crc64(0, &buff[0..24]);
-        if stored_checksum != calculated_checksum {
-            return None;
-        }
-
-        Some(WalHeader {
-            version,
-            checkpoint,
-            relative_lsn_offset,
-        })
-    }
-
-    fn encode(&self, buff: &mut [u8]) {
-        buff[0..6].copy_from_slice(b"db_wal");
-        buff[6..8].copy_from_slice(&self.version.to_be_bytes());
-        buff[8..16].copy_from_slice(&self.relative_lsn_offset.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..16]);
-        buff[16..24].copy_from_slice(&checksum.to_be_bytes());
     }
 }
 
@@ -844,7 +695,7 @@ mod tests {
         let mut file = File::create(file_path).unwrap();
 
         let page_size = 256;
-        let wal = Wal::new(file, page_size).unwrap();
+        let wal = Wal::new(file, 0, Lsn::new(64).unwrap(), page_size).unwrap();
 
         let lsn = wal
             .append(TxId::new(1).unwrap(), WalRecord::Begin {})

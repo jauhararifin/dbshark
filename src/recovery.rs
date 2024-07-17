@@ -16,7 +16,12 @@ pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::R
     let redo_result = redo(&mut f, pager, &wal_header, &analyze_result, page_size)?;
     undo(&analyze_result)?;
 
-    Wal::new(f, page_size)
+    Wal::new(
+        f,
+        wal_header.relative_lsn_offset,
+        analyze_result.next_lsn,
+        page_size,
+    )
 }
 
 fn get_wal_header(f: &mut File, page_size: usize) -> anyhow::Result<WalHeader> {
@@ -149,6 +154,9 @@ impl WalIterator<'_> {
                     self.start_offset = 0;
                     self.end_offset = len;
 
+                    if self.f_offset >= self.f.metadata()?.size() {
+                        return Ok(None);
+                    }
                     self.f.seek(SeekFrom::Start(self.f_offset))?;
                     let n = self.f.read(&mut self.buffer[self.end_offset..])?;
                     self.f_offset += n as u64;
@@ -189,6 +197,7 @@ fn analyze(
 
     let mut next_lsn = wal_header.checkpoint;
     let mut tx_state = TxState::None;
+    let mut checkpoint_begin_found = false;
     let mut checkpoint_end_found = false;
     let mut last_txn: Option<TxId> = None;
     let mut dirty_pages = HashMap::default();
@@ -203,6 +212,7 @@ fn analyze(
                     "when a transaction begin, there should be no active tx previously"
                 );
                 assert!(last_txn.map(TxId::get).unwrap_or(0) < entry.txid.get());
+                checkpoint_begin_found = true;
                 tx_state = TxState::Active(entry.txid);
                 last_txn = Some(entry.txid);
             }
@@ -264,8 +274,10 @@ fn analyze(
         next_lsn = Some(lsn);
     }
 
-    if !checkpoint_end_found {
-        return Err(anyhow!("wal file is corrupted, checkpoint end not found"));
+    if checkpoint_begin_found && !checkpoint_end_found {
+        return Err(anyhow!(
+            "wal file is corrupted, checkpoint begin found but checkpoint end not found"
+        ));
     }
 
     let mut min_rec_lsn = next_lsn;
