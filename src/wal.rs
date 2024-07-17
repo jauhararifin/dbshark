@@ -18,7 +18,7 @@ impl TxId {
         }
     }
 
-    pub(crate) fn get(&self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0.get()
     }
 
@@ -127,11 +127,19 @@ impl Wal {
         let buff_size = page_size * 100;
 
         let wal_header = if f.metadata()?.size() < 2 * WAL_HEADER_SIZE as u64 {
-            WalHeader {
+            let header = WalHeader {
                 version: 0,
                 relative_lsn_offset: 0,
                 checkpoint: None,
-            }
+            };
+
+            f.seek(SeekFrom::Start(0))?;
+            let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
+            header.encode(&mut header_buff[..WAL_HEADER_SIZE]);
+            header.encode(&mut header_buff[WAL_HEADER_SIZE..]);
+            f.write_all(&header_buff)?;
+
+            header
         } else {
             f.seek(SeekFrom::Start(0))?;
             let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
@@ -151,11 +159,26 @@ impl Wal {
             wal_header
         };
 
+        let f = Mutex::new(f);
+
         // TODO: perform aries recovery here, and get the `next_lsn`.
-        let next_lsn = wal_header.checkpoint.add(WAL_HEADER_SIZE * 2);
+        let analyze_start = wal_header
+            .checkpoint
+            .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
+        let mut iter = iterate_wal_forward(
+            &f,
+            wal_header.relative_lsn_offset as usize,
+            page_size,
+            analyze_start,
+        );
+        let mut next_lsn = wal_header.checkpoint;
+        while let Some((lsn, entry)) = iter.next()? {
+            next_lsn = Some(lsn);
+        }
+        let next_lsn = next_lsn.unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
 
         Ok(Wal {
-            f: Mutex::new(f),
+            f,
 
             relative_lsn_offset: wal_header.relative_lsn_offset,
 
@@ -172,7 +195,7 @@ impl Wal {
     }
 
     pub(crate) fn append(&self, txid: TxId, record: WalRecord) -> anyhow::Result<Lsn> {
-        let entry = WalByteEntry { txid, record };
+        let entry = WalEntry { txid, record };
         let size = entry.size();
 
         let mut internal = self.internal.lock();
@@ -202,13 +225,6 @@ impl Wal {
         Ok(())
     }
 
-    // get_log_before: returns one log record before lsn.
-    // TODO: this might not be the best way to iterate the WAL backwards since it
-    // requires seek and read for every record, we might be able to buffer it.
-    fn get_log_before(&self, lsn: Lsn) {
-        todo!();
-    }
-
     pub(crate) fn shutdown(self) -> anyhow::Result<()> {
         let internal = self.internal.into_inner();
 
@@ -217,6 +233,72 @@ impl Wal {
         f.sync_all()?;
 
         Ok(())
+    }
+}
+
+fn iterate_wal_forward(
+    f: &Mutex<File>,
+    relative_lsn_offset: usize,
+    page_size: usize,
+    lsn: Lsn,
+) -> WalIterator {
+    WalIterator {
+        f,
+        f_offset: lsn.add(relative_lsn_offset).get(),
+
+        lsn,
+
+        buffer: vec![0u8; 4 * page_size],
+        start_offset: 0,
+        end_offset: 0,
+    }
+}
+
+struct WalIterator<'a> {
+    f: &'a Mutex<File>,
+    f_offset: u64,
+
+    lsn: Lsn,
+
+    buffer: Vec<u8>,
+    start_offset: usize,
+    end_offset: usize,
+}
+
+impl WalIterator<'_> {
+    pub(crate) fn next(&mut self) -> anyhow::Result<Option<(Lsn, WalEntry)>> {
+        loop {
+            let buff = &self.buffer[self.start_offset..self.end_offset];
+            // TODO: check whether this is safe.
+            let buff = unsafe { std::mem::transmute::<&[u8], &[u8]>(buff) };
+
+            let entry = WalEntry::decode(buff);
+            match entry {
+                WalDecodeResult::Ok(entry) => {
+                    self.start_offset += entry.size();
+                    self.lsn = self.lsn.add(entry.size());
+                    return Ok(Some((self.lsn, entry)));
+                }
+                WalDecodeResult::NeedMoreBytes => {
+                    let len = self.end_offset - self.start_offset;
+                    for i in 0..len {
+                        self.buffer[i] = self.buffer[self.start_offset + i];
+                    }
+                    self.start_offset = 0;
+                    self.end_offset = len;
+
+                    let mut f = self.f.lock();
+                    f.seek(SeekFrom::Start(self.f_offset))?;
+                    let n = f.read(&mut self.buffer[self.end_offset..])?;
+                    self.f_offset += n as u64;
+                    self.end_offset += n;
+                }
+                WalDecodeResult::Incomplete => {
+                    return Ok(None);
+                }
+                WalDecodeResult::Err(err) => return Err(err),
+            }
+        }
     }
 }
 
@@ -276,7 +358,6 @@ pub(crate) enum WalRecord<'a> {
         index: usize,
         raw: &'a [u8],
         ptr: PageId,
-        overflow: Option<PageId>,
         key_size: usize,
     },
     InteriorDelete {
@@ -297,26 +378,66 @@ pub(crate) enum WalRecord<'a> {
         raw: &'a [u8],
         overflow: Option<PageId>,
         key_size: usize,
-        total_size: usize,
+        value_size: usize,
+    },
+
+    CheckpointBegin,
+    CheckpointEnd {
+        dirty_pages: Vec<DirtyPage>,
+        active_tx: TxState,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirtyPage {
+    pub(crate) id: PageId,
+    pub(crate) rec_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxState {
+    None,
+    Active(TxId),
+    Committing(TxId),
+    Aborting(TxId),
+}
+
+const WAL_RECORD_BEGIN_KIND: u8 = 1;
+const WAL_RECORD_COMMIT_KIND: u8 = 2;
+const WAL_RECORD_ROLLBACK_KIND: u8 = 3;
+const WAL_RECORD_END_KIND: u8 = 4;
+
+const WAL_RECORD_HEADER_SET_KIND: u8 = 10;
+
+const WAL_RECORD_INTERIOR_INIT_KIND: u8 = 20;
+const WAL_RECORD_INTERIOR_INSERT_KIND: u8 = 21;
+const WAL_RECORD_INTERIOR_DELETE_KIND: u8 = 22;
+
+const WAL_RECORD_LEAF_INIT_KIND: u8 = 30;
+const WAL_RECORD_LEAF_INSERT_KIND: u8 = 31;
+
+const WAL_RECORD_CHECKPOINT_BEGIN_KIND: u8 = 100;
+const WAL_RECORD_CHECKPOINT_END_KIND: u8 = 101;
 
 impl<'a> WalRecord<'a> {
     fn kind(&self) -> u8 {
         match self {
-            WalRecord::Begin => 1,
-            WalRecord::Commit => 2,
-            WalRecord::Rollback => 3,
-            WalRecord::End => 4,
+            WalRecord::Begin => WAL_RECORD_BEGIN_KIND,
+            WalRecord::Commit => WAL_RECORD_COMMIT_KIND,
+            WalRecord::Rollback => WAL_RECORD_ROLLBACK_KIND,
+            WalRecord::End => WAL_RECORD_END_KIND,
 
-            WalRecord::HeaderSet { .. } => 10,
+            WalRecord::HeaderSet { .. } => WAL_RECORD_HEADER_SET_KIND,
 
-            WalRecord::InteriorInit { .. } => 20,
-            WalRecord::InteriorInsert { .. } => 21,
-            WalRecord::InteriorDelete { .. } => 22,
+            WalRecord::InteriorInit { .. } => WAL_RECORD_INTERIOR_INIT_KIND,
+            WalRecord::InteriorInsert { .. } => WAL_RECORD_INTERIOR_INSERT_KIND,
+            WalRecord::InteriorDelete { .. } => WAL_RECORD_INTERIOR_DELETE_KIND,
 
-            WalRecord::LeafInit { .. } => 30,
-            WalRecord::LeafInsert { .. } => 31,
+            WalRecord::LeafInit { .. } => WAL_RECORD_LEAF_INIT_KIND,
+            WalRecord::LeafInsert { .. } => WAL_RECORD_LEAF_INSERT_KIND,
+
+            WalRecord::CheckpointBegin { .. } => WAL_RECORD_CHECKPOINT_BEGIN_KIND,
+            WalRecord::CheckpointEnd { .. } => WAL_RECORD_CHECKPOINT_END_KIND,
         }
     }
 
@@ -327,15 +448,18 @@ impl<'a> WalRecord<'a> {
             WalRecord::HeaderSet { .. } => 16,
 
             WalRecord::InteriorInit { .. } => 16,
-            WalRecord::InteriorInsert { raw, .. } => 32 + raw.len(),
+            WalRecord::InteriorInsert { raw, .. } => 24 + raw.len(),
             WalRecord::InteriorDelete { old_raw, .. } => 32 + old_raw.len(),
 
             WalRecord::LeafInit { .. } => 8,
             WalRecord::LeafInsert { raw, .. } => 28 + raw.len(),
+
+            WalRecord::CheckpointBegin => 0,
+            WalRecord::CheckpointEnd { dirty_pages, .. } => 8 + 16 * dirty_pages.len() + 8,
         }
     }
 
-    fn encode(&self, buff: &mut [u8]) {
+    fn encode(&self, mut buff: &mut [u8]) {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
             WalRecord::HeaderSet { root, freelist } => {
@@ -351,7 +475,6 @@ impl<'a> WalRecord<'a> {
                 index,
                 raw,
                 ptr,
-                overflow,
                 key_size,
             } => {
                 assert!(raw.len() <= u16::MAX as usize);
@@ -363,7 +486,7 @@ impl<'a> WalRecord<'a> {
                 buff[12..14].copy_from_slice(&(raw.len() as u16).to_be_bytes());
                 buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[16..24].copy_from_slice(&ptr.to_be_bytes());
-                buff[24..32].copy_from_slice(&overflow.to_be_bytes());
+                buff[24..24 + raw.len()].copy_from_slice(raw);
             }
             WalRecord::InteriorDelete {
                 pgid,
@@ -393,45 +516,204 @@ impl<'a> WalRecord<'a> {
                 raw,
                 overflow,
                 key_size,
-                total_size,
+                value_size,
             } => {
                 assert!(raw.len() <= u16::MAX as usize);
                 assert!(*index <= u16::MAX as usize);
                 assert!(*key_size <= u32::MAX as usize);
-                assert!(*total_size <= u32::MAX as usize);
-
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                assert!(*value_size <= u32::MAX as usize);
 
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
                 buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[10..12].copy_from_slice(&(raw.len() as u16).to_be_bytes());
                 buff[12..16].copy_from_slice(&(*key_size as u32).to_be_bytes());
                 buff[16..24].copy_from_slice(&overflow.to_be_bytes());
-                buff[24..28].copy_from_slice(&(*total_size as u32).to_be_bytes());
+                buff[24..28].copy_from_slice(&(*value_size as u32).to_be_bytes());
                 buff[28..].copy_from_slice(raw);
             }
+            WalRecord::CheckpointBegin => (),
+            WalRecord::CheckpointEnd {
+                dirty_pages,
+                active_tx,
+            } => {
+                // WalRecord::CheckpointEnd { dirty_pages, .. } => 8 + 8 * dirty_pages.len() + 8,
+
+                buff[0..8].copy_from_slice(&(dirty_pages.len() as u64).to_be_bytes());
+
+                buff = &mut buff[8..];
+                for (i, pgid) in dirty_pages.iter().enumerate() {
+                    buff[0..8].copy_from_slice(&pgid.id.get().to_be_bytes());
+                    buff[8..16].copy_from_slice(&pgid.rec_lsn.get().to_be_bytes());
+                    buff = &mut buff[16..];
+                }
+
+                match active_tx {
+                    TxState::None => buff[0..8].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]),
+                    TxState::Active(txid) => {
+                        buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                        buff[0] = 1;
+                    }
+                    TxState::Committing(txid) => {
+                        buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                        buff[0] = 2;
+                    }
+                    TxState::Aborting(txid) => {
+                        buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                        buff[0] = 3;
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode(mut buff: &'a [u8], kind: u8) -> anyhow::Result<Self> {
+        match kind {
+            WAL_RECORD_BEGIN_KIND => Ok(Self::Begin),
+            WAL_RECORD_COMMIT_KIND => Ok(Self::Commit),
+            WAL_RECORD_ROLLBACK_KIND => Ok(Self::Rollback),
+            WAL_RECORD_END_KIND => Ok(Self::End),
+
+            WAL_RECORD_HEADER_SET_KIND => {
+                let root = PageId::from_be_bytes(buff[0..8].try_into().unwrap());
+                let freelist = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                Ok(Self::HeaderSet { root, freelist })
+            }
+
+            WAL_RECORD_INTERIOR_INIT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let Some(last) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
+                    return Err(anyhow!("zero last pointer in interior node"));
+                };
+                Ok(Self::InteriorInit { pgid, last })
+            }
+            WAL_RECORD_INTERIOR_INSERT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let key_size = u32::from_be_bytes(buff[8..12].try_into().unwrap());
+                let raw_size = u16::from_be_bytes(buff[12..14].try_into().unwrap());
+                let index = u16::from_be_bytes(buff[14..16].try_into().unwrap());
+                let Some(ptr) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
+                    return Err(anyhow!("zero pointer in interior cell"));
+                };
+                Ok(Self::InteriorInsert {
+                    pgid,
+                    index: index as usize,
+                    raw: &buff[24..24 + raw_size as usize],
+                    ptr,
+                    key_size: key_size as usize,
+                })
+            }
+            WAL_RECORD_INTERIOR_DELETE_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let key_size = u32::from_be_bytes(buff[8..12].try_into().unwrap());
+                let raw_size = u16::from_be_bytes(buff[12..14].try_into().unwrap());
+                let index = u16::from_be_bytes(buff[14..16].try_into().unwrap());
+                let Some(old_ptr) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
+                    return Err(anyhow!("zero pointer in interior cell"));
+                };
+                let old_overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
+                Ok(Self::InteriorDelete {
+                    pgid,
+                    index: index as usize,
+                    old_raw: &buff[24..24 + raw_size as usize],
+                    old_ptr,
+                    old_overflow,
+                    old_key_size: key_size as usize,
+                })
+            }
+
+            WAL_RECORD_LEAF_INIT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                Ok(Self::LeafInit { pgid })
+            }
+            WAL_RECORD_LEAF_INSERT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
+                let raw_size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
+                let key_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
+                let overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
+                let value_size = u32::from_be_bytes(buff[24..28].try_into().unwrap());
+                Ok(Self::LeafInsert {
+                    pgid,
+                    index: index as usize,
+                    raw: &buff[28..28 + raw_size as usize],
+                    overflow,
+                    key_size: key_size as usize,
+                    value_size: value_size as usize,
+                })
+            }
+
+            WAL_RECORD_CHECKPOINT_BEGIN_KIND => Ok(Self::CheckpointBegin),
+            WAL_RECORD_CHECKPOINT_END_KIND => {
+                let dirty_pages_len = u64::from_be_bytes(buff[0..8].try_into().unwrap());
+                let mut dirty_pages = Vec::with_capacity(dirty_pages_len as usize);
+
+                buff = &buff[8..];
+                for i in 0..dirty_pages_len {
+                    let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                        return Err(anyhow!("zero page id"));
+                    };
+                    let Some(rec_lsn) = Lsn::from_be_bytes(buff[8..16].try_into().unwrap()) else {
+                        return Err(anyhow!("zero lsn"));
+                    };
+                    buff = &buff[16..];
+                    dirty_pages.push(DirtyPage { id: pgid, rec_lsn });
+                }
+
+                let mut txid_buff: [u8; 8] = buff[0..8].try_into().unwrap();
+                txid_buff[0] = 0;
+                let txid = TxId::from_be_bytes(txid_buff).ok_or(anyhow!("zero txn id"));
+
+                let active_tx = match buff[0] {
+                    0 => TxState::None,
+                    1 => TxState::Active(txid?),
+                    2 => TxState::Committing(txid?),
+                    3 => TxState::Aborting(txid?),
+                    _ => return Err(anyhow!("invalid checkpoint end active txn")),
+                };
+
+                Ok(Self::CheckpointEnd {
+                    dirty_pages,
+                    active_tx,
+                })
+            }
+
+            _ => return Err(anyhow!("invalid wal record kind {kind}")),
         }
     }
 }
 
-struct WalByteEntry<'a> {
-    txid: TxId,
-    record: WalRecord<'a>,
+pub(crate) struct WalEntry<'a> {
+    pub(crate) txid: TxId,
+    pub(crate) record: WalRecord<'a>,
 }
 
-impl<'a> WalByteEntry<'a> {
+impl<'a> WalEntry<'a> {
     fn new(txid: TxId, record: WalRecord<'a>) -> Self {
         Self { txid, record }
     }
 
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
+        Self::size_by_record_size(self.record.size())
+    }
+
+    fn size_by_record_size(record_size: usize) -> usize {
         // (8 bytes for txid+kind) +
         // (2 bytes for entry size) +
         // (entry) +
         // (padding) +
         // (8 bytes checksum) +
         // (2 bytes for the whole record size. this is for backward iteration)
-        8 + pad8(2 + self.record.size()) + 8 + 8
+        8 + pad8(2 + record_size) + 8 + 8
     }
 
     fn encode(&self, buff: &mut [u8]) {
@@ -456,6 +738,49 @@ impl<'a> WalByteEntry<'a> {
         assert_eq!(size, next + 8);
         buff[next..next + 8].copy_from_slice(&(size as u64).to_be_bytes());
     }
+
+    pub(crate) fn decode(buff: &[u8]) -> WalDecodeResult<'_> {
+        if buff.len() < 32 {
+            return WalDecodeResult::NeedMoreBytes;
+        }
+
+        let kind = buff[0];
+
+        let mut txid_buff: [u8; 8] = buff[0..8].try_into().unwrap();
+        txid_buff[0] = 0;
+        let Some(txid) = TxId::from_be_bytes(txid_buff) else {
+            return WalDecodeResult::Err(anyhow!("wal record is corrupted"));
+        };
+
+        let record_size = u16::from_be_bytes(buff[8..10].try_into().unwrap()) as usize;
+        let total_length = Self::size_by_record_size(record_size);
+        if buff.len() < total_length {
+            return WalDecodeResult::NeedMoreBytes;
+        }
+
+        let record = match WalRecord::decode(&buff[10..10 + record_size], kind) {
+            Ok(record) => record,
+            Err(e) => return WalDecodeResult::Err(e),
+        };
+        let next = pad8(10 + record_size);
+
+        let calculated_checksum = crc64::crc64(0, &buff[0..next]);
+        let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
+        if calculated_checksum != stored_checksum {
+            // TODO: if there is an incomplete record, followed by complete record, it means
+            // something is wrong and we should warn the user
+            return WalDecodeResult::Incomplete;
+        }
+
+        WalDecodeResult::Ok(WalEntry { txid, record })
+    }
+}
+
+pub(crate) enum WalDecodeResult<'a> {
+    Ok(WalEntry<'a>),
+    NeedMoreBytes,
+    Incomplete,
+    Err(anyhow::Error),
 }
 
 fn pad8(size: usize) -> usize {
@@ -489,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_encode() {
-        let entry = WalByteEntry {
+        let entry = WalEntry {
             txid: TxId::new(1).unwrap(),
             record: WalRecord::Begin,
         };

@@ -1,5 +1,6 @@
 use crate::btree::BTree;
 use crate::pager::{PageId, PageIdExt, Pager};
+use crate::recovery::recover;
 use crate::wal::{self, TxId, TxIdExt, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockWriteGuard};
@@ -13,7 +14,7 @@ pub struct Db {
 }
 
 struct DbInternal {
-    pager: Arc<Pager>,
+    pager: Pager,
     wal: Arc<Wal>,
     next_txid: TxId,
     root: Option<PageId>,
@@ -26,9 +27,7 @@ struct DbInternal {
 }
 
 #[derive(Default)]
-pub struct Setting {
-    error_handler: Option<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
-}
+pub struct Setting {}
 
 impl Db {
     pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
@@ -41,17 +40,23 @@ impl Db {
             return Err(anyhow!("unsupported database version"));
         }
         let page_size = header.page_size as usize;
+        let pager = Pager::new(db_file, page_size, 1000)?;
 
         let wal_file = File::create(wal_path)?;
-        let wal = Arc::new(Wal::new(wal_file, page_size)?);
+        let wal = recover(wal_file, &pager, page_size)?;
+        let wal = Arc::new(wal);
 
-        let pager = Pager::new(db_file, wal.clone(), page_size, 1000, setting.error_handler)?;
+        pager.set_wal(wal.clone());
 
         let next_txid = if let Some(txid) = header.last_txid {
             txid.next()
         } else {
             TxId::new(1).unwrap()
         };
+
+        // TODO: start a background thread for periodically flush dirty pages
+        // TODO: start a background thread for periodically checkpoint.
+        // Maybe the checkpoint can happen right after the dirty pages are flushed.
 
         Ok(Self {
             internal: RwLock::new(DbInternal {

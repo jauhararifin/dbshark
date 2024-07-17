@@ -55,12 +55,9 @@ pub(crate) struct Pager {
     page_size: usize,
     n: usize,
 
-    wal: Arc<Wal>,
+    wal: OnceLock<Arc<Wal>>,
 
     internal: RwLock<PagerInternal>,
-
-    shutdown_chan: SyncSender<()>,
-    flush_thread: OnceLock<JoinHandle<()>>,
 }
 
 pub(crate) struct PagerInternal {
@@ -102,13 +99,7 @@ impl Drop for Pager {
 }
 
 impl Pager {
-    pub(crate) fn new(
-        f: File,
-        wal: Arc<Wal>,
-        page_size: usize,
-        n: usize,
-        error_handler: Option<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
-    ) -> anyhow::Result<Arc<Self>> {
+    pub(crate) fn new(f: File, page_size: usize, n: usize) -> anyhow::Result<Self> {
         Self::check_page_size(page_size)?;
 
         if n < 10 {
@@ -140,12 +131,12 @@ impl Pager {
             file_page_count = 1;
         }
 
-        let (send, recv) = sync_channel(0);
-        let pager = Arc::new(Self {
+        Ok(Self {
             f: Mutex::new(f),
             page_size,
             n,
-            wal,
+
+            wal: OnceLock::default(),
 
             internal: RwLock::new(PagerInternal {
                 allocated: 0,
@@ -158,20 +149,7 @@ impl Pager {
                 dirty_frames: HashSet::default(),
                 free_and_clean: HashSet::default(),
             }),
-
-            shutdown_chan: send,
-            flush_thread: OnceLock::default(),
-        });
-
-        let pager_clone = pager.clone();
-        pager
-            .flush_thread
-            .set(std::thread::spawn(move || {
-                Self::flush_thread_handler(pager_clone, recv, error_handler);
-            }))
-            .expect("able to set flush thread");
-
-        Ok(pager)
+        })
     }
 
     fn check_page_size(page_size: usize) -> anyhow::Result<()> {
@@ -197,6 +175,8 @@ impl Pager {
 
         Ok(())
     }
+
+    pub(crate) fn set_wal(&self, wal: Arc<Wal>) {}
 
     pub(crate) fn page_count(&self) -> usize {
         self.internal.read().file_page_count
@@ -437,7 +417,9 @@ impl Pager {
             // only when it's dirty, we acquire write lock and flush it.
             let mut frame = meta.write();
             if let Some(ref wal_info) = frame.wal {
-                self.wal.sync(wal_info.page)?;
+                if let Some(wal) = self.wal.get() {
+                    wal.sync(wal_info.page)?;
+                }
 
                 Self::encode(&frame, buffer)?;
                 let mut f = self.f.lock();
@@ -687,12 +669,8 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn shutdown(self: Arc<Self>) -> anyhow::Result<()> {
-        if let Err(err) = self.shutdown_chan.send(()) {
-            todo!();
-        }
-
-        let mut internal = self.internal.write();
+    pub(crate) fn shutdown(mut self) -> anyhow::Result<()> {
+        let mut internal = self.internal.get_mut();
         let mut f = self.f.lock();
 
         for (pgid, frame_id) in internal.page_to_frame.iter() {
@@ -857,6 +835,10 @@ impl<'a> PageWrite<'a> {
         matches!(&self.meta.kind, PageKind::Interior { .. })
     }
 
+    pub(crate) fn page_lsn(&self) -> Option<Lsn> {
+        self.meta.wal.as_ref().map(|wal| wal.page)
+    }
+
     pub(crate) fn init_interior(
         mut self,
         last: PageId,
@@ -925,13 +907,18 @@ impl<'a> PageWrite<'a> {
     }
 }
 
+// TODO: during recovery, we need to pass the LSN of the log to upadte this page's rec_lsn and page_lsn.
 fn record_mutation(
     txid: TxId,
     pager: &Pager,
     meta: &mut PageMeta,
     entry: WalRecord,
 ) -> anyhow::Result<()> {
-    let lsn = pager.wal.append(txid, entry)?;
+    let Some(wal) = pager.wal.get() else {
+        return Ok(());
+    };
+
+    let lsn = wal.append(txid, entry)?;
     if let Some(ref mut wal_info) = meta.wal {
         wal_info.page = lsn;
     } else {
@@ -1083,10 +1070,9 @@ impl<'a> InteriorPageWrite<'a> {
         &mut self,
         i: usize,
         content: &mut impl Content,
+        key_size: usize,
         ptr: PageId,
     ) -> anyhow::Result<bool> {
-        // TODO: record mutation
-
         let total_size = content.remaining();
         let payload_size =
             self.0.buffer.len() - PAGE_HEADER_SIZE - INTERIOR_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
@@ -1106,7 +1092,7 @@ impl<'a> InteriorPageWrite<'a> {
         let raw_size = std::cmp::min(max_before_overflow, total_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let content_offset = self.insert_cell(i, ptr, None, total_size, raw_size);
+        let content_offset = self.insert_cell(i, ptr, None, key_size, raw_size);
         content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
         let pgid = self.id();
         record_mutation(
@@ -1118,8 +1104,7 @@ impl<'a> InteriorPageWrite<'a> {
                 index: i,
                 raw: &self.0.buffer[content_offset..content_offset + raw_size],
                 ptr,
-                overflow: None,
-                key_size: total_size,
+                key_size,
             },
         )?;
 
@@ -1216,13 +1201,13 @@ impl<'a> InteriorPageWrite<'a> {
             self.0.txid,
             self.0.pager,
             &mut self.0.meta,
-            WalRecord::InteriorInsert {
+            WalRecord::InteriorDelete {
                 pgid,
                 index,
-                raw: &self.0.buffer[content_offset..content_offset + content_size],
-                ptr: cell.ptr(),
-                overflow: cell.overflow(),
-                key_size: cell.key_size(),
+                old_raw: &self.0.buffer[content_offset..content_offset + content_size],
+                old_ptr: cell.ptr(),
+                old_overflow: cell.overflow(),
+                old_key_size: cell.key_size(),
             },
         )?;
 
@@ -1343,10 +1328,11 @@ impl<'a> LeafPageWrite<'a> {
         i: usize,
         content: &mut impl Content,
         key_size: usize,
+        value_size: usize,
     ) -> anyhow::Result<bool> {
         // TODO: record mutation
 
-        let total_size = content.remaining();
+        let content_size = content.remaining();
         let payload_size =
             self.0.buffer.len() - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
         let max_before_overflow = payload_size / 4 - LEAF_PAGE_CELL_SIZE;
@@ -1358,14 +1344,14 @@ impl<'a> LeafPageWrite<'a> {
             return Ok(false);
         }
         let remaining = remaining - LEAF_PAGE_CELL_SIZE;
-        if remaining < min_content_not_overflow && remaining < total_size {
+        if remaining < min_content_not_overflow && remaining < content_size {
             return Ok(false);
         }
 
-        let raw_size = std::cmp::min(max_before_overflow, total_size);
+        let raw_size = std::cmp::min(max_before_overflow, content_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let content_offset = self.insert_cell(i, None, key_size, total_size - key_size, raw_size);
+        let content_offset = self.insert_cell(i, None, key_size, value_size, raw_size);
         content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
         let pgid = self.id();
         record_mutation(
@@ -1378,7 +1364,7 @@ impl<'a> LeafPageWrite<'a> {
                 raw: &self.0.buffer[content_offset..content_offset + raw_size],
                 overflow: None,
                 key_size,
-                total_size,
+                value_size,
             },
         )?;
 
@@ -1538,7 +1524,8 @@ mod tests {
         let mut wal_file = File::create(wal_path).unwrap();
         let wal = Arc::new(Wal::new(wal_file, page_size).unwrap());
 
-        let pager = Pager::new(file, wal, page_size, 10, None).unwrap();
+        let pager = Pager::new(file, page_size, 10).unwrap();
+        pager.set_wal(wal);
         let txid = TxId::new(1).unwrap();
 
         let mut page1 = pager.alloc(txid).unwrap();
@@ -1547,7 +1534,12 @@ mod tests {
         let pgid_ptr = PageId::new(8).unwrap();
         for i in 0..4 {
             let ok = page1
-                .insert_content(i, &mut Bytes::new(format!("{i:028}").as_bytes()), pgid_ptr)
+                .insert_content(
+                    i,
+                    &mut Bytes::new(format!("{i:028}").as_bytes()),
+                    28,
+                    pgid_ptr,
+                )
                 .unwrap();
             assert!(ok);
         }
@@ -1567,6 +1559,7 @@ mod tests {
             .insert_content(
                 2,
                 &mut Bytes::new(b"0000000000000000000000000002"),
+                28,
                 pgid_ptr,
             )
             .unwrap();
