@@ -1,6 +1,6 @@
 use crate::content::Bytes;
 use crate::pager::{PageId, PageIdExt, PageWrite, Pager};
-use crate::wal::{Lsn, TxId, TxState, Wal, WalDecodeResult, WalEntry, WalRecord};
+use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalDecodeResult, WalEntry, WalRecord};
 use anyhow::anyhow;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt;
+use std::slice::SliceIndex;
 
 pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::Result<Wal> {
     let wal_header = get_wal_header(&mut f, page_size)?;
@@ -98,8 +99,9 @@ impl WalHeader {
         buff[0..6].copy_from_slice(b"db_wal");
         buff[6..8].copy_from_slice(&self.version.to_be_bytes());
         buff[8..16].copy_from_slice(&self.relative_lsn_offset.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..16]);
-        buff[16..24].copy_from_slice(&checksum.to_be_bytes());
+        buff[16..24].copy_from_slice(&self.checkpoint.to_be_bytes());
+        let checksum = crc64::crc64(0, &buff[0..24]);
+        buff[24..32].copy_from_slice(&checksum.to_be_bytes());
     }
 }
 
@@ -108,25 +110,27 @@ fn iterate_wal_forward(
     relative_lsn_offset: usize,
     page_size: usize,
     lsn: Lsn,
-) -> WalIterator {
-    WalIterator {
+) -> anyhow::Result<WalIterator> {
+    let file_len = f.metadata()?.len();
+    let f_offset = lsn.add(relative_lsn_offset).get();
+    if f_offset >= file_len {
+        f.seek(SeekFrom::Start(file_len))?;
+    } else {
+        f.seek(SeekFrom::Start(f_offset))?;
+    }
+
+    Ok(WalIterator {
         f,
-        f_offset: lsn.add(relative_lsn_offset).get(),
-
         lsn,
-
         buffer: vec![0u8; 4 * page_size],
         start_offset: 0,
         end_offset: 0,
-    }
+    })
 }
 
 struct WalIterator<'a> {
     f: &'a mut File,
-    f_offset: u64,
-
     lsn: Lsn,
-
     buffer: Vec<u8>,
     start_offset: usize,
     end_offset: usize,
@@ -154,12 +158,10 @@ impl WalIterator<'_> {
                     self.start_offset = 0;
                     self.end_offset = len;
 
-                    if self.f_offset >= self.f.metadata()?.size() {
+                    let n = self.f.read(&mut self.buffer[self.end_offset..])?;
+                    if n == 0 {
                         return Ok(None);
                     }
-                    self.f.seek(SeekFrom::Start(self.f_offset))?;
-                    let n = self.f.read(&mut self.buffer[self.end_offset..])?;
-                    self.f_offset += n as u64;
                     self.end_offset += n;
                 }
                 WalDecodeResult::Incomplete => {
@@ -193,7 +195,7 @@ fn analyze(
         wal_header.relative_lsn_offset as usize,
         page_size,
         analyze_start,
-    );
+    )?;
 
     let mut next_lsn = wal_header.checkpoint;
     let mut tx_state = TxState::None;
@@ -212,7 +214,6 @@ fn analyze(
                     "when a transaction begin, there should be no active tx previously"
                 );
                 assert!(last_txn.map(TxId::get).unwrap_or(0) < entry.txid.get());
-                checkpoint_begin_found = true;
                 tx_state = TxState::Active(entry.txid);
                 last_txn = Some(entry.txid);
             }
@@ -233,7 +234,9 @@ fn analyze(
                 tx_state = TxState::None;
             }
 
-            WalRecord::CheckpointBegin => (),
+            WalRecord::CheckpointBegin => {
+                checkpoint_begin_found = true;
+            }
             WalRecord::CheckpointEnd {
                 active_tx,
                 dirty_pages: dp,
@@ -320,7 +323,7 @@ fn redo(
         wal_header.relative_lsn_offset as usize,
         page_size,
         analyze_result.lsn_to_redo,
-    );
+    )?;
 
     let mut result = RedoResult { db_state: None };
 

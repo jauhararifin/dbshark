@@ -248,10 +248,10 @@ impl Pager {
         &self,
         mut internal: RwLockWriteGuard<PagerInternal>,
         pgid: PageId,
-        is_existing_page: bool,
+        mut is_existing_page: bool,
     ) -> anyhow::Result<(usize, &RwLock<PageMeta>, *mut u8)> {
         if pgid.get() as usize >= internal.file_page_count {
-            return Err(anyhow!("page id out of bound"));
+            is_existing_page = false;
         }
 
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {

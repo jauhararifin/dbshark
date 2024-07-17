@@ -4,6 +4,7 @@ use crate::recovery::recover;
 use crate::wal::{self, TxId, TxIdExt, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockWriteGuard};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
@@ -33,7 +34,11 @@ impl Db {
     pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
         let wal_path = path.with_extension("wal");
 
-        let mut db_file = File::create(path)?;
+        let mut db_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
         let header = Self::load_db_header(&mut db_file)?;
 
         if header.version != 0 {
@@ -42,7 +47,11 @@ impl Db {
         let page_size = header.page_size as usize;
         let pager = Pager::new(db_file, page_size, 1000)?;
 
-        let wal_file = File::create(wal_path)?;
+        let wal_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(wal_path)?;
         let wal = recover(wal_file, &pager, page_size)?;
         let wal = Arc::new(wal);
 
@@ -74,7 +83,7 @@ impl Db {
         let meta = f.metadata()?;
         let size = meta.size();
 
-        if size == 0 {
+        if size < 2 * DB_HEADER_SIZE as u64 {
             return Self::init_db(f);
         }
 
@@ -123,11 +132,7 @@ impl Db {
         internal.next_txid = internal.next_txid.next();
         internal.last_unclosed_txn = Some(txid);
 
-        Ok(Tx {
-            id: txid,
-            db: internal,
-            closed: false,
-        })
+        Tx::new(txid, internal)
     }
 }
 
@@ -154,8 +159,8 @@ impl Header {
     }
 
     fn decode(buff: &[u8]) -> Option<Self> {
-        let calculated_checksum = crc64::crc64(0, &buff[0..24]);
-        let checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
+        let calculated_checksum = crc64::crc64(0, &buff[0..32]);
+        let checksum = u64::from_be_bytes(buff[32..40].try_into().unwrap());
 
         if calculated_checksum != checksum {
             return None;
@@ -191,6 +196,16 @@ impl<'db> Drop for Tx<'db> {
 }
 
 impl<'db> Tx<'db> {
+    fn new(id: TxId, db: RwLockWriteGuard<'db, DbInternal>) -> anyhow::Result<Self> {
+        let tx = Self {
+            id,
+            db,
+            closed: false,
+        };
+        tx.db.wal.append(tx.id, WalRecord::Begin)?;
+        Ok(tx)
+    }
+
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 

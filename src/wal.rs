@@ -192,6 +192,7 @@ impl Wal {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum WalRecord<'a> {
     Begin,
     Commit,
@@ -546,6 +547,7 @@ impl<'a> WalRecord<'a> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct WalEntry<'a> {
     pub(crate) txid: TxId,
     pub(crate) record: WalRecord<'a>,
