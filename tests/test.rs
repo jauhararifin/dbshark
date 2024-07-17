@@ -3,6 +3,8 @@ use std::path::Path;
 
 #[test]
 fn test_db_happy_path() {
+    env_logger::init();
+
     _ = std::fs::remove_file("test.db");
     _ = std::fs::remove_file("test.wal");
 

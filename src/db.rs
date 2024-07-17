@@ -38,6 +38,7 @@ impl Db {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         let header = Self::load_db_header(&mut db_file)?;
 
@@ -51,6 +52,7 @@ impl Db {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(wal_path)?;
         let wal = recover(wal_file, &pager, page_size)?;
         let wal = Arc::new(wal);

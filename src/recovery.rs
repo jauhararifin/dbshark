@@ -70,6 +70,7 @@ fn load_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
 
 const WAL_HEADER_SIZE: usize = 32;
 
+#[derive(Debug)]
 struct WalHeader {
     version: u16,
     checkpoint: Option<Lsn>,
@@ -204,8 +205,11 @@ fn analyze(
     let mut last_txn: Option<TxId> = None;
     let mut dirty_pages = HashMap::default();
 
+    log::debug!("aries analysis started wal_header={wal_header:?}");
+
     // TODO: change assert into return error
     while let Some((lsn, entry)) = iter.next()? {
+        log::debug!("recovery item lsn={lsn:?} entry={entry:?}");
         match entry.record {
             WalRecord::Begin => {
                 assert_eq!(
@@ -277,6 +281,8 @@ fn analyze(
         next_lsn = Some(lsn);
     }
 
+    log::debug!("aries analysis finished next_lsn={next_lsn:?} dirty_pages={dirty_pages:?} tx_state={tx_state:?}");
+
     if checkpoint_begin_found && !checkpoint_end_found {
         return Err(anyhow!(
             "wal file is corrupted, checkpoint begin found but checkpoint end not found"
@@ -327,7 +333,10 @@ fn redo(
 
     let mut result = RedoResult { db_state: None };
 
+    log::debug!("aries redo started");
+
     while let Some((lsn, entry)) = iter.next()? {
+        log::debug!("aries redo item lsn={lsn:?} entry={entry:?}");
         match entry.record {
             WalRecord::Begin
             | WalRecord::Commit
@@ -349,6 +358,8 @@ fn redo(
             }
         };
     }
+
+    log::debug!("aries redo finished");
 
     Ok(result)
 }
