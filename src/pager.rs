@@ -841,12 +841,14 @@ impl<'a> PageWrite<'a> {
 
     pub(crate) fn init_interior(
         mut self,
+        lsn: Option<Lsn>,
         last: PageId,
     ) -> anyhow::Result<Option<InteriorPageWrite<'a>>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             record_mutation(
                 self.txid,
+                lsn,
                 self.pager,
                 &mut self.meta,
                 WalRecord::InteriorInit { pgid, last },
@@ -874,11 +876,15 @@ impl<'a> PageWrite<'a> {
         }
     }
 
-    pub(crate) fn init_leaf(mut self) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
+    pub(crate) fn init_leaf(
+        mut self,
+        lsn: Option<Lsn>,
+    ) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             record_mutation(
                 self.txid,
+                lsn,
                 self.pager,
                 &mut self.meta,
                 WalRecord::LeafInit { pgid },
@@ -910,15 +916,32 @@ impl<'a> PageWrite<'a> {
 // TODO: during recovery, we need to pass the LSN of the log to upadte this page's rec_lsn and page_lsn.
 fn record_mutation(
     txid: TxId,
+    lsn: Option<Lsn>,
     pager: &Pager,
     meta: &mut PageMeta,
     entry: WalRecord,
 ) -> anyhow::Result<()> {
-    let Some(wal) = pager.wal.get() else {
-        return Ok(());
+    assert!(
+        (lsn.is_some() && pager.wal.get().is_none())
+            || (lsn.is_none() && pager.wal.get().is_some()),
+        "the lsn should comes in either of two ways: from appending a wal or passed during redo phase on recovery"
+    );
+
+    let lsn = if let Some(wal) = pager.wal.get() {
+        assert!(
+            lsn.is_none(),
+            "when the wal is set, the LSN is not necessary. LSN is only needed in redo phase"
+        );
+        wal.append(txid, entry)?
+    } else {
+        let Some(lsn) = lsn else {
+            panic!(
+                "when WAL is not present, it means we are in redo phase, so we need to pass LSN"
+            );
+        };
+        lsn
     };
 
-    let lsn = wal.append(txid, entry)?;
     if let Some(ref mut wal_info) = meta.wal {
         wal_info.page = lsn;
     } else {
@@ -1068,6 +1091,7 @@ impl<'a> InteriorPageWrite<'a> {
 
     pub(crate) fn insert_content(
         &mut self,
+        lsn: Option<Lsn>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,
@@ -1097,6 +1121,7 @@ impl<'a> InteriorPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
+            lsn,
             self.0.pager,
             &mut self.0.meta,
             WalRecord::InteriorInsert {
@@ -1189,7 +1214,7 @@ impl<'a> InteriorPageWrite<'a> {
         *offset = new_offset;
     }
 
-    pub(crate) fn delete(&mut self, index: usize) -> anyhow::Result<()> {
+    pub(crate) fn delete(&mut self, lsn: Option<Lsn>, index: usize) -> anyhow::Result<()> {
         let id = self.0.meta.id;
 
         let cell = get_interior_cell(self.0.buffer, index);
@@ -1199,6 +1224,7 @@ impl<'a> InteriorPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
+            lsn,
             self.0.pager,
             &mut self.0.meta,
             WalRecord::InteriorDelete {
@@ -1325,6 +1351,7 @@ impl<'a> LeafPageWrite<'a> {
 
     pub(crate) fn insert_content(
         &mut self,
+        lsn: Option<Lsn>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,
@@ -1356,6 +1383,7 @@ impl<'a> LeafPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
+            lsn,
             self.0.pager,
             &mut self.0.meta,
             WalRecord::LeafInsert {
@@ -1530,11 +1558,12 @@ mod tests {
 
         let mut page1 = pager.alloc(txid).unwrap();
         let pgid_last = PageId::new(7).unwrap();
-        let mut page1 = page1.init_interior(pgid_last).unwrap().unwrap();
+        let mut page1 = page1.init_interior(None, pgid_last).unwrap().unwrap();
         let pgid_ptr = PageId::new(8).unwrap();
         for i in 0..4 {
             let ok = page1
                 .insert_content(
+                    None,
                     i,
                     &mut Bytes::new(format!("{i:028}").as_bytes()),
                     28,
@@ -1549,7 +1578,7 @@ mod tests {
         assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
         assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
 
-        page1.delete(2).unwrap();
+        page1.delete(None, 2).unwrap();
         assert_eq!(3, page1.count());
         assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
         assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
@@ -1557,6 +1586,7 @@ mod tests {
 
         page1
             .insert_content(
+                None,
                 2,
                 &mut Bytes::new(b"0000000000000000000000000002"),
                 28,
@@ -1569,7 +1599,7 @@ mod tests {
         assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
         assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
 
-        page1.delete(3).unwrap();
+        page1.delete(None, 3).unwrap();
         assert_eq!(3, page1.count());
         assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
         assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());

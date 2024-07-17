@@ -687,7 +687,7 @@ impl<'a> WalRecord<'a> {
                 })
             }
 
-            _ => return Err(anyhow!("invalid wal record kind {kind}")),
+            _ => Err(anyhow!("invalid wal record kind {kind}")),
         }
     }
 }

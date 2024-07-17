@@ -369,7 +369,7 @@ fn redo_page(
         | WalRecord::HeaderSet { .. } => unreachable!(),
 
         WalRecord::InteriorInit { pgid, last } => {
-            if page.init_interior(last)?.is_none() {
+            if page.init_interior(Some(lsn), last)?.is_none() {
                 return Err(anyhow!("redo failed on interior init"));
             }
         }
@@ -385,7 +385,7 @@ fn redo_page(
                     "redo failed on interior insert because page is not an interior"
                 ));
             };
-            let ok = page.insert_content(index, &mut Bytes::new(raw), key_size, ptr)?;
+            let ok = page.insert_content(Some(lsn), index, &mut Bytes::new(raw), key_size, ptr)?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on interior insert because the content can't be inserted"
@@ -398,11 +398,11 @@ fn redo_page(
                     "redo failed on interior delete because page is not an interior"
                 ));
             };
-            page.delete(index)?;
+            page.delete(Some(lsn), index)?;
         }
 
         WalRecord::LeafInit { pgid } => {
-            if page.init_leaf()?.is_none() {
+            if page.init_leaf(Some(lsn))?.is_none() {
                 return Err(anyhow!("redo failed on leaf init"));
             };
         }
@@ -419,7 +419,8 @@ fn redo_page(
                     "redo failed on leaf insert because page is not a leaf"
                 ));
             };
-            let ok = page.insert_content(index, &mut Bytes::new(raw), key_size, value_size)?;
+            let ok =
+                page.insert_content(Some(lsn), index, &mut Bytes::new(raw), key_size, value_size)?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on leaf insert because the content can't be inserted"
@@ -433,7 +434,7 @@ fn redo_page(
 
 fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
     match analyze_result.active_tx {
-        TxState::None => return Ok(()),
+        TxState::None => Ok(()),
 
         // TODO: maybe just create the DB, and let the DB handle the rollback
         TxState::Active(..) => todo!("need to abort"),
