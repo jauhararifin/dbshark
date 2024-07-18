@@ -1,6 +1,7 @@
 use crate::pager::{PageId, PageIdExt};
+use crate::recovery::WAL_HEADER_SIZE;
 use anyhow::anyhow;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
@@ -113,12 +114,13 @@ pub(crate) struct Wal {
 
     relative_lsn_offset: u64,
 
-    internal: Mutex<WalInternal>,
+    internal: RwLock<WalInternal>,
 }
 
 struct WalInternal {
     buffer: Vec<u8>,
     offset_end: usize,
+    first_lsn_in_buffer: Option<Lsn>,
     next_lsn: Lsn,
 }
 
@@ -138,13 +140,10 @@ impl Wal {
 
             relative_lsn_offset,
 
-            internal: Mutex::new(WalInternal {
+            internal: RwLock::new(WalInternal {
                 buffer: vec![0u8; buff_size],
                 offset_end: 0,
-                // TODO: this should be read from the file
-                // the WAL file header should encodes these information:
-                // - last flushed lsn
-                // - lsn of last checkpoint
+                first_lsn_in_buffer: None,
                 next_lsn,
             }),
         })
@@ -154,7 +153,7 @@ impl Wal {
         let entry = WalEntry { txid, record };
         let size = entry.size();
 
-        let mut internal = self.internal.lock();
+        let mut internal = self.internal.write();
         if internal.offset_end + size > internal.buffer.len() {
             Self::flush(&mut self.f.lock(), &mut internal)?;
         }
@@ -165,11 +164,16 @@ impl Wal {
         internal.offset_end += size;
         internal.next_lsn = internal.next_lsn.add(size);
 
+        if internal.first_lsn_in_buffer.is_none() {
+            internal.first_lsn_in_buffer = Some(lsn);
+        }
+
+        log::debug!("appended wal entry={entry:?} lsn={lsn:?}");
         Ok(lsn)
     }
 
     pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
-        let mut internal = self.internal.lock();
+        let mut internal = self.internal.write();
         Self::flush(&mut self.f.lock(), &mut internal)
     }
 
@@ -178,7 +182,36 @@ impl Wal {
         f.write_all(&internal.buffer[..internal.offset_end])?;
         f.sync_all()?;
         internal.offset_end = 0;
+        internal.first_lsn_in_buffer = None;
         Ok(())
+    }
+
+    pub(crate) fn iterate_back(&self, upper_bound: Lsn) -> WalBackwardIterator {
+        let internal = self.internal.read();
+        let mut buffer = vec![0u8; internal.buffer.len()];
+        let buffer_len = buffer.len();
+        if let Some(first_lsn_in_buffer) = internal.first_lsn_in_buffer {
+            if upper_bound > first_lsn_in_buffer {
+                let offset = upper_bound.get() - first_lsn_in_buffer.get();
+                let to_copy = &internal.buffer[..offset as usize];
+                buffer[buffer_len - to_copy.len()..].copy_from_slice(to_copy);
+                return WalBackwardIterator {
+                    wal: self,
+                    lsn: upper_bound,
+                    buffer,
+                    start_offset: buffer_len - to_copy.len(),
+                    end_offset: buffer_len,
+                };
+            }
+        }
+
+        WalBackwardIterator {
+            wal: self,
+            lsn: upper_bound,
+            buffer,
+            start_offset: buffer_len,
+            end_offset: buffer_len,
+        }
     }
 
     pub(crate) fn shutdown(self) -> anyhow::Result<()> {
@@ -189,6 +222,75 @@ impl Wal {
         f.sync_all()?;
 
         Ok(())
+    }
+}
+
+pub(crate) struct WalBackwardIterator<'a> {
+    wal: &'a Wal,
+
+    lsn: Lsn,
+    buffer: Vec<u8>,
+    start_offset: usize,
+    end_offset: usize,
+}
+
+impl<'a> WalBackwardIterator<'a> {
+    pub(crate) fn next(&mut self) -> anyhow::Result<Option<(Lsn, WalEntry)>> {
+        let offset = self.lsn.get() - self.wal.relative_lsn_offset;
+        if offset as usize <= 2 * WAL_HEADER_SIZE {
+            return Ok(None);
+        }
+
+        if self.end_offset < 8 {
+            self.reset();
+        }
+
+        let buff = &self.buffer[self.start_offset..self.end_offset];
+        if buff.len() < 8 {
+            let s = 8 - buff.len();
+            let mut f = self.wal.f.lock();
+            f.seek(SeekFrom::Start(offset - 8))?;
+            f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
+            self.start_offset -= s;
+        }
+
+        let buff = &self.buffer[self.start_offset..self.end_offset];
+        let size = u64::from_be_bytes(buff[buff.len() - 8..].try_into().unwrap());
+
+        if self.end_offset < size as usize {
+            self.reset();
+        }
+
+        if self.buffer.len() < size as usize {
+            let s = size as usize - self.buffer.len();
+            let mut f = self.wal.f.lock();
+            f.seek(SeekFrom::Start(offset - size))?;
+            f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
+            self.start_offset -= s;
+        }
+
+        match WalEntry::decode(&self.buffer[self.end_offset - size as usize..self.end_offset]) {
+            WalDecodeResult::Ok(entry) => {
+                self.lsn = Lsn::new(self.lsn.get() - size).unwrap();
+                self.end_offset -= size as usize;
+                Ok(Some((self.lsn, entry)))
+            }
+
+            WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
+                Err(anyhow!("can't decode wal entry"))
+            }
+            WalDecodeResult::Err(err) => Err(err),
+        }
+    }
+
+    fn reset(&mut self) {
+        let len = self.end_offset - self.start_offset;
+        let buffer_len = self.buffer.len();
+        for i in 0..len {
+            self.buffer[buffer_len - i] = self.buffer[self.end_offset - 1];
+        }
+        self.end_offset = buffer_len;
+        self.start_offset = buffer_len - len;
     }
 }
 
@@ -568,7 +670,7 @@ impl<'a> WalEntry<'a> {
         // (entry) +
         // (padding) +
         // (8 bytes checksum) +
-        // (2 bytes for the whole record size. this is for backward iteration)
+        // (8 bytes for the whole record size. this is for backward iteration)
         8 + pad8(2 + record_size) + 8 + 8
     }
 
@@ -588,6 +690,8 @@ impl<'a> WalEntry<'a> {
         let checksum = crc64::crc64(0, &buff[0..next]);
         buff[next..next + 8].copy_from_slice(&checksum.to_be_bytes());
 
+        // TODO: the size is actually only 2 byte, maybe we can optimize
+        // the space usage
         let next = next + 8;
         let size = self.size();
         assert!(size < 1 << 16);

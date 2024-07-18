@@ -68,7 +68,7 @@ fn load_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
     Ok(wal_header)
 }
 
-const WAL_HEADER_SIZE: usize = 32;
+pub(crate) const WAL_HEADER_SIZE: usize = 32;
 
 #[derive(Debug)]
 struct WalHeader {
@@ -459,8 +459,10 @@ fn redo_page(
 }
 
 fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
+    log::debug!("aries undo started");
+
     match analyze_result.active_tx {
-        TxState::None => Ok(()),
+        TxState::None => {}
 
         // TODO: maybe just create the DB, and let the DB handle the rollback
         TxState::Active(..) => todo!("need to abort"),
@@ -473,4 +475,30 @@ fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
             "continue aborting, find the first non-CLR record and continue undo it from there"
         ),
     }
+
+    log::debug!("aries undo finished");
+
+    Ok(())
+}
+
+// TODO: maybe it's better to move this function somewhere else since undo is not only used for recovery
+// but during runtime as well.
+pub(crate) fn undo_txn(pager: &Pager, wal: &Wal, txid: TxId, lsn: Lsn) -> anyhow::Result<()> {
+    log::debug!("undo txn started");
+    let mut iterator = wal.iterate_back(lsn);
+    while let Some((lsn, entry)) = iterator.next()? {
+        log::debug!("undo txn item lsn={lsn:?} entry={entry:?}");
+    }
+
+    // TODO: iterate wal backward from the last log of txid
+    // TODO: then record what is the last log that has a CLR
+    // TODO: add rollback record if there is none
+    // TODO: for every log that doesn't have CLR, perform UNDO operation
+    // TODO: stop at tx begin
+    // TODO: and at the same time, append the CLR to the end of the WAL
+    // TODO: add txn-end record after done
+
+    log::debug!("undo txn finished");
+
+    Ok(())
 }

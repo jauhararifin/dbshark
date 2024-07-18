@@ -1,9 +1,9 @@
 use crate::btree::BTree;
 use crate::pager::{PageId, PageIdExt, Pager};
-use crate::recovery::recover;
+use crate::recovery::{recover, undo_txn};
 use crate::wal::{self, TxId, TxIdExt, Wal, WalRecord};
 use anyhow::anyhow;
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -68,6 +68,7 @@ impl Db {
         // TODO: start a background thread for periodically flush dirty pages
         // TODO: start a background thread for periodically checkpoint.
         // Maybe the checkpoint can happen right after the dirty pages are flushed.
+        // TODO: figure out how to roll the WAL file after it's getting bigger.
 
         Ok(Self {
             internal: RwLock::new(DbInternal {
@@ -192,7 +193,7 @@ pub struct Tx<'db> {
 impl<'db> Drop for Tx<'db> {
     fn drop(&mut self) {
         if !self.closed {
-            todo!("should we panic here?");
+            // todo!("should we panic here?");
         }
     }
 }
@@ -270,13 +271,16 @@ impl<'db> Tx<'db> {
     }
 
     pub fn rollback(mut self) -> anyhow::Result<()> {
-        self.db.wal.append(self.id, WalRecord::Rollback)?;
-        // TODO: undo all the changes made in this transaction.
-        // iterate the wal backwards and perform compensation mutation.
+        log::debug!("rollback transaction txid={:?}", self.id);
+
+        let lsn = self.db.wal.append(self.id, WalRecord::Rollback)?;
+        log::debug!("rollback log record txid={:?} lsn={lsn:?}", self.id);
+        undo_txn(&self.db.pager, &self.db.wal, self.id, lsn)?;
         self.db.wal.append(self.id, WalRecord::End)?;
 
         self.closed = true;
         self.db.last_unclosed_txn = None;
+
         Ok(())
     }
 }
