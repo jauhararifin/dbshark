@@ -1,5 +1,5 @@
 use crate::content::{Bytes, Content};
-use crate::wal::{Lsn, LsnExt, TxId, Wal, WalRecord};
+use crate::wal::{self, Lsn, LsnExt, TxId, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet};
@@ -845,6 +845,7 @@ impl<'a> PageWrite<'a> {
 
     pub(crate) fn init_interior(
         mut self,
+        clr: Option<Lsn>,
         lsn: Option<Lsn>,
         last: PageId,
     ) -> anyhow::Result<Option<InteriorPageWrite<'a>>> {
@@ -852,6 +853,7 @@ impl<'a> PageWrite<'a> {
             let pgid = self.id();
             record_mutation(
                 self.txid,
+                clr,
                 lsn,
                 self.pager,
                 &mut self.meta,
@@ -882,17 +884,19 @@ impl<'a> PageWrite<'a> {
 
     pub(crate) fn init_leaf(
         mut self,
+        clr: Option<Lsn>,
         lsn: Option<Lsn>,
     ) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             record_mutation(
                 self.txid,
+                clr,
                 lsn,
                 self.pager,
                 &mut self.meta,
                 WalRecord::LeafInit { pgid },
-            );
+            )?;
 
             self.meta.kind = PageKind::Leaf {
                 count: 0,
@@ -920,6 +924,7 @@ impl<'a> PageWrite<'a> {
 // TODO: during recovery, we need to pass the LSN of the log to upadte this page's rec_lsn and page_lsn.
 fn record_mutation(
     txid: TxId,
+    clr: Option<Lsn>,
     lsn: Option<Lsn>,
     pager: &Pager,
     meta: &mut PageMeta,
@@ -930,7 +935,7 @@ fn record_mutation(
             lsn.is_none(),
             "when the wal is set, the LSN is not necessary. LSN is only needed in redo phase"
         );
-        wal.append(txid, entry)?
+        wal.append(txid, clr, entry)?
     } else {
         let Some(lsn) = lsn else {
             panic!(
@@ -1087,8 +1092,29 @@ impl<'a> InteriorPageWrite<'a> {
         get_interior_cell(self.0.buffer, index)
     }
 
+    pub(crate) fn reset(
+        mut self,
+        clr: Option<Lsn>,
+        lsn: Option<Lsn>,
+    ) -> anyhow::Result<PageWrite<'a>> {
+        let pgid = self.id();
+        self.0.meta.kind = PageKind::None;
+
+        record_mutation(
+            self.0.txid,
+            clr,
+            lsn,
+            self.0.pager,
+            &mut self.0.meta,
+            WalRecord::InteriorReset { pgid },
+        )?;
+
+        Ok(self.0)
+    }
+
     pub(crate) fn insert_content(
         &mut self,
+        clr: Option<Lsn>,
         lsn: Option<Lsn>,
         i: usize,
         content: &mut impl Content,
@@ -1119,6 +1145,7 @@ impl<'a> InteriorPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
+            clr,
             lsn,
             self.0.pager,
             &mut self.0.meta,
@@ -1212,7 +1239,12 @@ impl<'a> InteriorPageWrite<'a> {
         *offset = new_offset;
     }
 
-    pub(crate) fn delete(&mut self, lsn: Option<Lsn>, index: usize) -> anyhow::Result<()> {
+    pub(crate) fn delete(
+        &mut self,
+        clr: Option<Lsn>,
+        lsn: Option<Lsn>,
+        index: usize,
+    ) -> anyhow::Result<()> {
         let id = self.0.meta.id;
 
         let cell = get_interior_cell(self.0.buffer, index);
@@ -1222,6 +1254,7 @@ impl<'a> InteriorPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
+            clr,
             lsn,
             self.0.pager,
             &mut self.0.meta,
@@ -1347,8 +1380,29 @@ impl<'a> LeafPageWrite<'a> {
         next
     }
 
+    pub(crate) fn reset(
+        mut self,
+        clr: Option<Lsn>,
+        lsn: Option<Lsn>,
+    ) -> anyhow::Result<PageWrite<'a>> {
+        let pgid = self.id();
+        self.0.meta.kind = PageKind::None;
+
+        record_mutation(
+            self.0.txid,
+            clr,
+            lsn,
+            self.0.pager,
+            &mut self.0.meta,
+            WalRecord::LeafReset { pgid },
+        )?;
+
+        Ok(self.0)
+    }
+
     pub(crate) fn insert_content(
         &mut self,
+        clr: Option<Lsn>,
         lsn: Option<Lsn>,
         i: usize,
         content: &mut impl Content,
@@ -1381,6 +1435,7 @@ impl<'a> LeafPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
+            clr,
             lsn,
             self.0.pager,
             &mut self.0.meta,
@@ -1556,11 +1611,12 @@ mod tests {
 
         let mut page1 = pager.alloc(txid).unwrap();
         let pgid_last = PageId::new(7).unwrap();
-        let mut page1 = page1.init_interior(None, pgid_last).unwrap().unwrap();
+        let mut page1 = page1.init_interior(None, None, pgid_last).unwrap().unwrap();
         let pgid_ptr = PageId::new(8).unwrap();
         for i in 0..4 {
             let ok = page1
                 .insert_content(
+                    None,
                     None,
                     i,
                     &mut Bytes::new(format!("{i:028}").as_bytes()),
@@ -1576,7 +1632,7 @@ mod tests {
         assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
         assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
 
-        page1.delete(None, 2).unwrap();
+        page1.delete(None, None, 2).unwrap();
         assert_eq!(3, page1.count());
         assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
         assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
@@ -1584,6 +1640,7 @@ mod tests {
 
         page1
             .insert_content(
+                None,
                 None,
                 2,
                 &mut Bytes::new(b"0000000000000000000000000002"),
@@ -1597,7 +1654,7 @@ mod tests {
         assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
         assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
 
-        page1.delete(None, 3).unwrap();
+        page1.delete(None, None, 3).unwrap();
         assert_eq!(3, page1.count());
         assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
         assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());

@@ -345,13 +345,15 @@ fn redo(
             | WalRecord::CheckpointBegin
             | WalRecord::CheckpointEnd { .. } => (),
 
-            WalRecord::HeaderSet { root, freelist } => {
+            WalRecord::HeaderSet { root, freelist, .. } => {
                 result.db_state = Some(DbState { root, freelist });
             }
 
-            WalRecord::InteriorInit { pgid, .. }
+            WalRecord::InteriorReset { pgid }
+            | WalRecord::InteriorInit { pgid, .. }
             | WalRecord::InteriorInsert { pgid, .. }
             | WalRecord::InteriorDelete { pgid, .. }
+            | WalRecord::LeafReset { pgid }
             | WalRecord::LeafInit { pgid, .. }
             | WalRecord::LeafInsert { pgid, .. } => {
                 redo_page(pager, analyze_result, lsn, &entry, pgid)?;
@@ -394,8 +396,16 @@ fn redo_page(
         | WalRecord::CheckpointEnd { .. }
         | WalRecord::HeaderSet { .. } => unreachable!(),
 
+        WalRecord::InteriorReset { pgid } => {
+            let Some(mut page) = page.into_interior() else {
+                return Err(anyhow!(
+                    "redo failed on interior reset because page is not an interior"
+                ));
+            };
+            page.reset(None, Some(lsn))?;
+        }
         WalRecord::InteriorInit { pgid, last } => {
-            if page.init_interior(Some(lsn), last)?.is_none() {
+            if page.init_interior(None, Some(lsn), last)?.is_none() {
                 return Err(anyhow!("redo failed on interior init"));
             }
         }
@@ -411,7 +421,8 @@ fn redo_page(
                     "redo failed on interior insert because page is not an interior"
                 ));
             };
-            let ok = page.insert_content(Some(lsn), index, &mut Bytes::new(raw), key_size, ptr)?;
+            let ok =
+                page.insert_content(None, Some(lsn), index, &mut Bytes::new(raw), key_size, ptr)?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on interior insert because the content can't be inserted"
@@ -424,11 +435,19 @@ fn redo_page(
                     "redo failed on interior delete because page is not an interior"
                 ));
             };
-            page.delete(Some(lsn), index)?;
+            page.delete(None, Some(lsn), index)?;
         }
 
+        WalRecord::LeafReset { pgid } => {
+            let Some(mut page) = page.into_leaf() else {
+                return Err(anyhow!(
+                    "redo failed on leaf reset because page is not a leaf"
+                ));
+            };
+            page.reset(None, Some(lsn))?;
+        }
         WalRecord::LeafInit { pgid } => {
-            if page.init_leaf(Some(lsn))?.is_none() {
+            if page.init_leaf(None, Some(lsn))?.is_none() {
                 return Err(anyhow!("redo failed on leaf init"));
             };
         }
@@ -445,8 +464,14 @@ fn redo_page(
                     "redo failed on leaf insert because page is not a leaf"
                 ));
             };
-            let ok =
-                page.insert_content(Some(lsn), index, &mut Bytes::new(raw), key_size, value_size)?;
+            let ok = page.insert_content(
+                None,
+                Some(lsn),
+                index,
+                &mut Bytes::new(raw),
+                key_size,
+                value_size,
+            )?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on leaf insert because the content can't be inserted"
@@ -485,20 +510,92 @@ fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
 // but during runtime as well.
 pub(crate) fn undo_txn(pager: &Pager, wal: &Wal, txid: TxId, lsn: Lsn) -> anyhow::Result<()> {
     log::debug!("undo txn started");
+
     let mut iterator = wal.iterate_back(lsn);
+    let mut last_clr = None;
+    let mut is_ended = false;
+
     while let Some((lsn, entry)) = iterator.next()? {
         log::debug!("undo txn item lsn={lsn:?} entry={entry:?}");
+        if entry.txid != txid {
+            continue;
+        }
+
+        if let Some(clr_lsn) = entry.clr {
+            if last_clr.is_none() {
+                last_clr = Some(clr_lsn);
+                continue;
+            }
+        } else {
+            if let Some(last_undone) = last_clr {
+                if lsn >= last_undone {
+                    continue;
+                }
+            }
+        }
+
+        let clr = Some(lsn);
+        match entry.record {
+            WalRecord::Begin => break,
+            WalRecord::Commit => {
+                return Err(anyhow!("found a commit log during transaction rollback"))
+            }
+            WalRecord::Rollback => (),
+            WalRecord::End => is_ended = true,
+
+            WalRecord::HeaderSet {
+                old_root,
+                old_freelist,
+                ..
+            } => {
+                todo!();
+            }
+
+            WalRecord::InteriorReset { pgid } => todo!(),
+            WalRecord::InteriorInit { pgid, .. } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_interior() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.reset(clr, None)?;
+            }
+            WalRecord::InteriorInsert { pgid, index, .. } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_interior() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.delete(clr, None, index)?;
+            }
+            WalRecord::InteriorDelete {
+                pgid,
+                index,
+                old_raw,
+                old_ptr,
+                old_overflow,
+                old_key_size,
+            } => {
+                todo!();
+            }
+
+            WalRecord::LeafReset { pgid } => todo!(),
+            WalRecord::LeafInit { pgid } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_leaf() else {
+                    return Err(anyhow!("expected a leaf page for undo"));
+                };
+                page.reset(clr, None)?;
+            }
+            WalRecord::LeafInsert { pgid, index, .. } => todo!(),
+
+            WalRecord::CheckpointBegin | WalRecord::CheckpointEnd { .. } => (),
+        }
     }
 
-    // TODO: iterate wal backward from the last log of txid
-    // TODO: then record what is the last log that has a CLR
-    // TODO: add rollback record if there is none
-    // TODO: for every log that doesn't have CLR, perform UNDO operation
-    // TODO: stop at tx begin
-    // TODO: and at the same time, append the CLR to the end of the WAL
-    // TODO: add txn-end record after done
+    if !is_ended {
+        log::debug!("appending txn-end txid={txid:?}");
+        wal.append(txid, None, WalRecord::End)?;
+    }
 
     log::debug!("undo txn finished");
-
     Ok(())
 }

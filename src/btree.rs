@@ -112,7 +112,7 @@ impl<'a> BTree<'a> {
             current = next;
         };
 
-        let Some(node) = page.init_leaf(None)? else {
+        let Some(node) = page.init_leaf(None, None)? else {
             return Err(anyhow!(
                 "invalid state, btree contain non-interior and non-leaf page"
             ));
@@ -161,7 +161,7 @@ impl<'a> BTree<'a> {
         key_size: usize,
     ) -> anyhow::Result<bool> {
         let value_size = content.remaining() - key_size;
-        let ok = node.insert_content(None, index, &mut content, key_size, value_size)?;
+        let ok = node.insert_content(None, None, index, &mut content, key_size, value_size)?;
         if !ok {
             return Ok(false);
         }

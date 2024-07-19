@@ -205,7 +205,7 @@ impl<'db> Tx<'db> {
             db,
             closed: false,
         };
-        tx.db.wal.append(tx.id, WalRecord::Begin)?;
+        tx.db.wal.append(tx.id, None, WalRecord::Begin)?;
         Ok(tx)
     }
 
@@ -249,9 +249,12 @@ impl<'db> Tx<'db> {
             let pgid = page.id();
             self.db.wal.append(
                 self.id,
+                None,
                 WalRecord::HeaderSet {
                     root: Some(pgid),
+                    old_root: self.db.root,
                     freelist: self.db.freelist,
+                    old_freelist: self.db.freelist,
                 },
             )?;
             drop(page);
@@ -261,8 +264,8 @@ impl<'db> Tx<'db> {
     }
 
     pub fn commit(mut self) -> anyhow::Result<()> {
-        let commit_lsn = self.db.wal.append(self.id, WalRecord::Commit)?;
-        self.db.wal.append(self.id, WalRecord::End)?;
+        let commit_lsn = self.db.wal.append(self.id, None, WalRecord::Commit)?;
+        self.db.wal.append(self.id, None, WalRecord::End)?;
         self.db.wal.sync(commit_lsn)?;
 
         self.closed = true;
@@ -273,10 +276,10 @@ impl<'db> Tx<'db> {
     pub fn rollback(mut self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
-        let lsn = self.db.wal.append(self.id, WalRecord::Rollback)?;
+        let lsn = self.db.wal.append(self.id, None, WalRecord::Rollback)?;
         log::debug!("rollback log record txid={:?} lsn={lsn:?}", self.id);
         undo_txn(&self.db.pager, &self.db.wal, self.id, lsn)?;
-        self.db.wal.append(self.id, WalRecord::End)?;
+        self.db.wal.append(self.id, None, WalRecord::End)?;
 
         self.closed = true;
         self.db.last_unclosed_txn = None;
