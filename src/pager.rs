@@ -63,6 +63,7 @@ impl PageIdExt for Option<PageId> {
 
 pub(crate) struct Pager {
     f: Mutex<File>,
+    double_buff_f: Mutex<File>,
     page_size: usize,
     n: usize,
 
@@ -83,7 +84,7 @@ pub(crate) struct PagerInternal {
     free_and_clean: HashSet<usize>,
 }
 
-const PAGE_HEADER_SIZE: usize = 24;
+const PAGE_HEADER_SIZE: usize = 32;
 const PAGE_FOOTER_SIZE: usize = 8;
 const INTERIOR_PAGE_HEADER_SIZE: usize = 16;
 const INTERIOR_PAGE_CELL_SIZE: usize = 24;
@@ -110,7 +111,12 @@ impl Drop for Pager {
 }
 
 impl Pager {
-    pub(crate) fn new(f: File, page_size: usize, n: usize) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        mut f: File,
+        mut double_buff_f: File,
+        page_size: usize,
+        n: usize,
+    ) -> anyhow::Result<Self> {
         Self::check_page_size(page_size)?;
 
         if n < 10 {
@@ -119,6 +125,8 @@ impl Pager {
                 n
             ));
         }
+
+        Self::recover_non_atomic_write(page_size, &mut f, &mut double_buff_f)?;
 
         let Some(buffer_size) = page_size.checked_mul(n) else {
             return Err(anyhow!("page size * n overflows: {} * {}", page_size, n));
@@ -144,6 +152,7 @@ impl Pager {
 
         Ok(Self {
             f: Mutex::new(f),
+            double_buff_f: Mutex::new(double_buff_f),
             page_size,
             n,
 
@@ -184,6 +193,39 @@ impl Pager {
             ));
         }
 
+        Ok(())
+    }
+
+    fn recover_non_atomic_write(
+        page_size: usize,
+        file: &mut File,
+        double_buff_file: &mut File,
+    ) -> anyhow::Result<()> {
+        let size = double_buff_file.metadata()?.len();
+        let page_count = (size as usize) / page_size;
+
+        let mut buff = vec![0u8; page_size * page_count];
+        double_buff_file.seek(SeekFrom::Start(0))?;
+        double_buff_file.read_exact(&mut buff)?;
+
+        for i in 0..page_count {
+            let mut buff = &mut buff[i * page_size..(i + 1) * page_size];
+            let dummy_pgid = PageId::new(1).unwrap();
+            let mut meta = PageMeta {
+                id: dummy_pgid,
+                kind: PageKind::None,
+                wal: None,
+            };
+
+            let ok = Self::decode_internal(page_size, &mut meta, buff)?;
+            if ok {
+                let offset = meta.id.get() * page_size as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(buff)?;
+            }
+        }
+
+        file.sync_all()?;
         Ok(())
     }
 
@@ -458,6 +500,7 @@ impl Pager {
 
     fn decode(&self, pgid: PageId, meta: &mut PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
         assert!(buff.len() == self.page_size);
+        meta.id = pgid;
 
         {
             let mut f = self.f.lock();
@@ -466,27 +509,47 @@ impl Pager {
             f.read_exact(buff)?;
         }
 
-        let header = &buff[..PAGE_HEADER_SIZE];
-        let footer = &buff[self.page_size - PAGE_FOOTER_SIZE..];
-        let payload = &buff[PAGE_HEADER_SIZE..self.page_size - PAGE_FOOTER_SIZE];
+        let ok = Self::decode_internal(self.page_size, meta, buff)?;
+        if !ok {
+            return Err(anyhow!(
+                "page {} is corrupted, checksum mismatch",
+                pgid.get(),
+            ));
+        }
 
-        let buff_checksum = &buff[self.page_size - PAGE_FOOTER_SIZE..];
+        if meta.id != pgid {
+            return Err(anyhow!(
+                "page {} is written with invalid pgid information {}",
+                pgid.get(),
+                meta.id.get(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn decode_internal(
+        page_size: usize,
+        meta: &mut PageMeta,
+        buff: &mut [u8],
+    ) -> anyhow::Result<bool> {
+        let header = &buff[..PAGE_HEADER_SIZE];
+        let footer = &buff[page_size - PAGE_FOOTER_SIZE..];
+        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
+
+        let buff_checksum = &buff[page_size - PAGE_FOOTER_SIZE..];
         let buff_version = &header[..2];
         let buff_kind = &header[2];
         let _ = &header[3..8];
         let buff_rec_lsn = &header[8..16];
         let buff_page_lsn = &header[16..24];
-        let buff_checksum_content = &buff[..self.page_size - PAGE_FOOTER_SIZE];
+        let buff_page_id = &header[24..32];
+        let buff_checksum_content = &buff[..page_size - PAGE_FOOTER_SIZE];
 
         let checksum = crc64::crc64(0, buff_checksum_content);
         let page_sum = u64::from_be_bytes(buff_checksum.try_into().unwrap());
         if checksum != page_sum {
-            return Err(anyhow!(
-                "page {} is corrupted, checksum mismatch, stored={:x} calculated={:x}",
-                pgid.get(),
-                page_sum,
-                checksum
-            ));
+            return Ok(false);
         }
         let version = u16::from_be_bytes(buff_version.try_into().unwrap());
         if version != 0 {
@@ -495,21 +558,27 @@ impl Pager {
 
         let rec_lsn = Lsn::from_be_bytes(buff_rec_lsn.try_into().unwrap());
         let page_lsn = Lsn::from_be_bytes(buff_page_lsn.try_into().unwrap());
+        let Some(page_id) = PageId::from_be_bytes(buff_page_id.try_into().unwrap()) else {
+            return Err(anyhow!("found an empty page_id field when decoding page",));
+        };
 
         let kind = match buff_kind {
             0 => PageKind::None,
-            1 => self.decode_interior_page(buff)?,
-            2 => self.decode_leaf_page(buff)?,
-            3 => self.decode_overflow_page(buff)?,
-            4 => self.decode_freelist_page(buff)?,
+            1 => Self::decode_interior_page(buff)?,
+            2 => Self::decode_leaf_page(buff)?,
+            3 => Self::decode_overflow_page(buff)?,
+            4 => Self::decode_freelist_page(buff)?,
             _ => return Err(anyhow!("page kind {buff_kind} is not recognized")),
         };
-        meta.id = pgid;
+        meta.id = page_id;
         meta.kind = kind;
 
         if let Some(rec_lsn) = rec_lsn {
             let Some(page_lsn) = page_lsn else {
-                return Err(anyhow!("page {} has rec_lsn but no page_lsn", pgid.get()));
+                return Err(anyhow!(
+                    "page {} has rec_lsn but no page_lsn",
+                    meta.id.get()
+                ));
             };
             meta.wal = Some(PageWalInfo {
                 rec: rec_lsn,
@@ -517,16 +586,21 @@ impl Pager {
             });
         } else {
             if page_lsn.is_some() {
-                return Err(anyhow!("page {} has page_lsn but no rec_lsn", pgid.get()));
+                return Err(anyhow!(
+                    "page {} has page_lsn but no rec_lsn",
+                    meta.id.get()
+                ));
             }
             meta.wal = None;
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    fn decode_interior_page(&self, buff: &[u8]) -> anyhow::Result<PageKind> {
-        let payload = &buff[PAGE_HEADER_SIZE..self.page_size - PAGE_FOOTER_SIZE];
+    fn decode_interior_page(buff: &[u8]) -> anyhow::Result<PageKind> {
+        let page_size = buff.len();
+
+        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
         let header = &payload[..INTERIOR_PAGE_HEADER_SIZE];
         let buff_last = &header[..8];
         let buff_count = &header[8..10];
@@ -560,8 +634,10 @@ impl Pager {
         })
     }
 
-    fn decode_leaf_page(&self, buff: &[u8]) -> anyhow::Result<PageKind> {
-        let payload = &buff[PAGE_HEADER_SIZE..self.page_size - PAGE_FOOTER_SIZE];
+    fn decode_leaf_page(buff: &[u8]) -> anyhow::Result<PageKind> {
+        let page_size = buff.len();
+
+        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
         let header = &payload[..LEAF_PAGE_HEADER_SIZE];
         let buff_next = &header[..8];
         let buff_count = &header[8..10];
@@ -586,8 +662,10 @@ impl Pager {
         })
     }
 
-    fn decode_overflow_page(&self, buff: &[u8]) -> anyhow::Result<PageKind> {
-        let payload = &buff[PAGE_HEADER_SIZE..self.page_size - PAGE_FOOTER_SIZE];
+    fn decode_overflow_page(buff: &[u8]) -> anyhow::Result<PageKind> {
+        let page_size = buff.len();
+
+        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
         let header = &payload[..OVERFLOW_PAGE_HEADER_SIZE];
         let buff_next = &header[..8];
         let buff_size = &header[8..10];
@@ -602,8 +680,10 @@ impl Pager {
         })
     }
 
-    fn decode_freelist_page(&self, buff: &[u8]) -> anyhow::Result<PageKind> {
-        let payload = &buff[PAGE_HEADER_SIZE..self.page_size - PAGE_FOOTER_SIZE];
+    fn decode_freelist_page(buff: &[u8]) -> anyhow::Result<PageKind> {
+        let page_size = buff.len();
+
+        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
         let header = &payload[..FREELIST_PAGE_HEADER_SIZE];
         let buff_next = &header[..8];
         let buff_count = &header[8..10];
@@ -642,6 +722,7 @@ impl Pager {
 
         header[8..16].copy_from_slice(&rec_lsn.to_be_bytes());
         header[16..24].copy_from_slice(&page_lsn.to_be_bytes());
+        header[24..32].copy_from_slice(&meta.id.to_be_bytes());
 
         let payload_buff = &mut buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
         match &meta.kind {
@@ -1649,11 +1730,14 @@ mod tests {
         let file_path = dir.path().join("test.wal");
         let mut file = File::create(file_path).unwrap();
 
+        let double_buff_file_path = dir.path().join("test.wal");
+        let mut double_buff_file = File::create(double_buff_file_path).unwrap();
+
         let wal_path = dir.path().join("test.wal");
         let mut wal_file = File::create(wal_path).unwrap();
         let wal = Arc::new(Wal::new(wal_file, 0, Lsn::new(64).unwrap(), page_size).unwrap());
 
-        let pager = Pager::new(file, page_size, 10).unwrap();
+        let pager = Pager::new(file, double_buff_file, page_size, 10).unwrap();
         pager.set_wal(wal);
         let txid = TxId::new(1).unwrap();
 

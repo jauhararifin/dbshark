@@ -36,6 +36,7 @@ pub struct Setting {}
 impl Db {
     pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
         let wal_path = path.with_extension("wal");
+        let double_buff_path = path.with_extension("dbuff");
 
         let mut db_file = OpenOptions::new()
             .read(true)
@@ -45,11 +46,18 @@ impl Db {
             .open(path)?;
         let header = Self::load_db_header(&mut db_file)?;
 
+        let mut double_buff_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(double_buff_path)?;
+
         if header.version != 0 {
             return Err(anyhow!("unsupported database version"));
         }
         let page_size = header.page_size as usize;
-        let pager = Pager::new(db_file, page_size, 1000)?;
+        let pager = Pager::new(db_file, double_buff_file, page_size, 1000)?;
 
         let wal_file = OpenOptions::new()
             .read(true)
