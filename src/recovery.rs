@@ -508,7 +508,14 @@ fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
 
 // TODO: maybe it's better to move this function somewhere else since undo is not only used for recovery
 // but during runtime as well.
-pub(crate) fn undo_txn(pager: &Pager, wal: &Wal, txid: TxId, lsn: Lsn) -> anyhow::Result<()> {
+pub(crate) fn undo_txn(
+    pager: &Pager,
+    wal: &Wal,
+    txid: TxId,
+    lsn: Lsn,
+    db_root: &mut Option<PageId>,
+    db_freelist: &mut Option<PageId>,
+) -> anyhow::Result<()> {
     log::debug!("undo txn started");
 
     let mut iterator = wal.iterate_back(lsn);
@@ -526,11 +533,9 @@ pub(crate) fn undo_txn(pager: &Pager, wal: &Wal, txid: TxId, lsn: Lsn) -> anyhow
                 last_clr = Some(clr_lsn);
                 continue;
             }
-        } else {
-            if let Some(last_undone) = last_clr {
-                if lsn >= last_undone {
-                    continue;
-                }
+        } else if let Some(last_undone) = last_clr {
+            if lsn >= last_undone {
+                continue;
             }
         }
 
@@ -548,6 +553,8 @@ pub(crate) fn undo_txn(pager: &Pager, wal: &Wal, txid: TxId, lsn: Lsn) -> anyhow
                 old_freelist,
                 ..
             } => {
+                *db_root = old_root;
+                *db_freelist = old_freelist;
                 todo!();
             }
 

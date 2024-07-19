@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::ops::DerefMut;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::{fs::File, path::Path};
@@ -18,6 +19,8 @@ struct DbInternal {
     pager: Pager,
     wal: Arc<Wal>,
     next_txid: TxId,
+
+    // TODO: maybe these two information should be managed by Pager
     root: Option<PageId>,
     freelist: Option<PageId>,
 
@@ -278,7 +281,11 @@ impl<'db> Tx<'db> {
 
         let lsn = self.db.wal.append(self.id, None, WalRecord::Rollback)?;
         log::debug!("rollback log record txid={:?} lsn={lsn:?}", self.id);
-        undo_txn(&self.db.pager, &self.db.wal, self.id, lsn)?;
+        let (pager, wal, db_root, db_freelist) = {
+            let db = self.db.deref_mut();
+            (&db.pager, &db.wal, &mut db.root, &mut db.freelist)
+        };
+        undo_txn(pager, wal, self.id, lsn, db_root, db_freelist)?;
         self.db.wal.append(self.id, None, WalRecord::End)?;
 
         self.closed = true;

@@ -14,6 +14,17 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+// TODO: idea for double buffering
+// Manage a separate buffer of N pages (maybe we can set N to be 10 and 20).
+// This buffer lives on memory. Before flushing a page, put it to this buffer first.
+// When full, or timeout, or forced, flush the buffer to a double-write buffer file somewhere
+// If success, then flush those N pages to the main db file.
+// When loading pages from master db file, first load it from master file first. It the checksum mismatch
+// load it from double-write file.
+
+// TODO: use better eviction policy. De-priorize pages with `page_lsn` < `flushed_lsn`.
+// Also use better algorithm such as tiny-lfu or secondchance.
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PageId(NonZeroU64);
 
@@ -345,6 +356,9 @@ impl Pager {
                 Self::encode(&meta_locked, buffer)?;
                 let mut f = self.f.lock();
                 // TODO: try to seek and write using a single syscall
+                // TODO(important): this is not safe. We can get non-atomic write.
+                // In order to make the write atomic, we have to do a double-write. Write to a shadow page
+                // first, then to the actual page.
                 f.seek(SeekFrom::Start(old_pgid.get() * self.page_size as u64))?;
                 f.write_all(buffer)?;
                 f.sync_all()?;
@@ -428,6 +442,9 @@ impl Pager {
                 Self::encode(&frame, buffer)?;
                 let mut f = self.f.lock();
                 // TODO: try to seek and write using a single syscall
+                // TODO(important): this is not safe. We can get non-atomic write.
+                // In order to make the write atomic, we have to do a double-write. Write to a shadow page
+                // first, then to the actual page.
                 f.seek(SeekFrom::Start(frame.id.get() * self.page_size as u64))?;
                 f.write_all(buffer)?;
                 f.sync_all()?;
@@ -690,6 +707,9 @@ impl Pager {
             f.write_all(buffer)?;
         }
 
+        // TODO(important): this is not safe. We can get non-atomic write.
+        // In order to make the write atomic, we have to do a double-write. Write to a shadow page
+        // first, then to the actual page.
         f.sync_all()?;
         Ok(())
     }
@@ -1098,8 +1118,6 @@ impl<'a> InteriorPageWrite<'a> {
         lsn: Option<Lsn>,
     ) -> anyhow::Result<PageWrite<'a>> {
         let pgid = self.id();
-        self.0.meta.kind = PageKind::None;
-
         record_mutation(
             self.0.txid,
             clr,
@@ -1109,6 +1127,7 @@ impl<'a> InteriorPageWrite<'a> {
             WalRecord::InteriorReset { pgid },
         )?;
 
+        self.0.meta.kind = PageKind::None;
         Ok(self.0)
     }
 
@@ -1143,6 +1162,10 @@ impl<'a> InteriorPageWrite<'a> {
         let content_offset = self.insert_cell(i, ptr, None, key_size, raw_size);
         content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
         let pgid = self.id();
+
+        // TODO(important): record the mutation before the insert cell happen. It is important
+        // to make sure that the WAL is written. If the page is mutated, but the WAL is not
+        // written, we might have a corrupted page.
         record_mutation(
             self.0.txid,
             clr,
@@ -1386,7 +1409,6 @@ impl<'a> LeafPageWrite<'a> {
         lsn: Option<Lsn>,
     ) -> anyhow::Result<PageWrite<'a>> {
         let pgid = self.id();
-        self.0.meta.kind = PageKind::None;
 
         record_mutation(
             self.0.txid,
@@ -1397,6 +1419,7 @@ impl<'a> LeafPageWrite<'a> {
             WalRecord::LeafReset { pgid },
         )?;
 
+        self.0.meta.kind = PageKind::None;
         Ok(self.0)
     }
 
@@ -1430,8 +1453,9 @@ impl<'a> LeafPageWrite<'a> {
         let raw_size = std::cmp::min(max_before_overflow, content_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let content_offset = self.insert_cell(i, None, key_size, value_size, raw_size);
-        content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
+        let reserved_offset = self.reserve_cell(i, None, key_size, value_size, raw_size);
+        content.put(&mut self.0.buffer[reserved_offset..reserved_offset + raw_size])?;
+
         let pgid = self.id();
         record_mutation(
             self.0.txid,
@@ -1442,17 +1466,18 @@ impl<'a> LeafPageWrite<'a> {
             WalRecord::LeafInsert {
                 pgid,
                 index: i,
-                raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
                 overflow: None,
                 key_size,
                 value_size,
             },
         )?;
 
+        self.insert_cell_meta(i, None, key_size, value_size, raw_size);
         Ok(true)
     }
 
-    fn insert_cell(
+    fn reserve_cell(
         &mut self,
         index: usize,
         overflow: Option<PageId>,
@@ -1481,6 +1506,32 @@ impl<'a> LeafPageWrite<'a> {
         };
         assert!(current_cell_size + added <= *offset);
 
+        *offset - raw_size
+    }
+
+    // insert_cell_meta assumes that the raw content is already inserted to the page
+    fn insert_cell_meta(
+        &mut self,
+        index: usize,
+        overflow: Option<PageId>,
+        key_size: usize,
+        val_size: usize,
+        raw_size: usize,
+    ) {
+        let added = LEAF_PAGE_CELL_SIZE + raw_size;
+        let PageKind::Leaf {
+            ref mut offset,
+            ref mut count,
+            ref mut remaining,
+            ..
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+        let current_cell_size =
+            PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * *count;
+        assert!(current_cell_size + added <= *offset);
+
         let shifted = *count - index;
         for i in 0..shifted {
             let x = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * (*count - i);
@@ -1494,14 +1545,11 @@ impl<'a> LeafPageWrite<'a> {
         *offset -= raw_size;
         *remaining -= added;
         *count += 1;
-
         cell[0..8].copy_from_slice(&overflow.map(|p| p.0.get()).unwrap_or(0).to_be_bytes());
         cell[8..12].copy_from_slice(&(key_size as u32).to_be_bytes());
         cell[12..16].copy_from_slice(&(val_size as u32).to_be_bytes());
         cell[16..18].copy_from_slice(&(*offset as u16).to_be_bytes());
         cell[18..20].copy_from_slice(&(raw_size as u16).to_be_bytes());
-
-        *offset
     }
 
     fn rearrange(&mut self) {

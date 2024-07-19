@@ -747,6 +747,8 @@ impl<'a> WalEntry<'a> {
 
         // TODO: the size is actually only 2 byte, maybe we can optimize
         // the space usage
+        // TODO(important): also, it's better to put the size before the checksum to make
+        // the size's itegrity is not violated.
         let next = next + 8;
         let size = self.size();
         assert!(size < 1 << 16);
