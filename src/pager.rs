@@ -70,6 +70,7 @@ pub(crate) struct Pager {
     wal: OnceLock<Arc<Wal>>,
 
     internal: RwLock<PagerInternal>,
+    flush_internal: RwLock<PagerFlushInternal>,
 }
 
 pub(crate) struct PagerInternal {
@@ -82,6 +83,13 @@ pub(crate) struct PagerInternal {
     free_frames: HashSet<usize>,
     dirty_frames: HashSet<usize>,
     free_and_clean: HashSet<usize>,
+}
+
+struct PagerFlushInternal {
+    // TODO: maybe add assert to check if it's not possible that a same page
+    // is stored in both flushing_pages and buffer pool.
+    flushing_pages: Box<[u8]>,
+    flushing_pgids: Vec<PageId>,
 }
 
 const PAGE_HEADER_SIZE: usize = 32;
@@ -150,6 +158,9 @@ impl Pager {
             file_page_count = 1;
         }
 
+        let flushing_area_n = 10;
+        let flushing_pages = vec![0u8; page_size * flushing_area_n].into_boxed_slice();
+
         Ok(Self {
             f: Mutex::new(f),
             double_buff_f: Mutex::new(double_buff_f),
@@ -168,6 +179,10 @@ impl Pager {
                 free_frames: HashSet::default(),
                 dirty_frames: HashSet::default(),
                 free_and_clean: HashSet::default(),
+            }),
+            flush_internal: RwLock::new(PagerFlushInternal {
+                flushing_pages,
+                flushing_pgids: vec![],
             }),
         })
     }
@@ -303,6 +318,9 @@ impl Pager {
         pgid: PageId,
         mut is_existing_page: bool,
     ) -> anyhow::Result<(usize, &RwLock<PageMeta>, *mut u8)> {
+        // TODO: if the page is in the flushing area, bring it back to buffer pool without
+        // reading from disk.
+
         if pgid.get() as usize >= internal.file_page_count {
             is_existing_page = false;
         }
@@ -396,14 +414,17 @@ impl Pager {
             drop(internal);
             if evicted {
                 Self::encode(&meta_locked, buffer)?;
-                let mut f = self.f.lock();
-                // TODO: try to seek and write using a single syscall
-                // TODO(important): this is not safe. We can get non-atomic write.
-                // In order to make the write atomic, we have to do a double-write. Write to a shadow page
-                // first, then to the actual page.
-                f.seek(SeekFrom::Start(old_pgid.get() * self.page_size as u64))?;
-                f.write_all(buffer)?;
-                f.sync_all()?;
+
+                let mut flush_internal = self.flush_internal.write();
+                Self::evict_page(
+                    &mut flush_internal,
+                    &self.f,
+                    &self.double_buff_f,
+                    self.page_size,
+                    pgid,
+                    buffer,
+                )?;
+                drop(flush_internal);
             }
 
             if is_existing_page {
@@ -432,6 +453,83 @@ impl Pager {
             // TODO: consider sleep and retry this process
             Err(anyhow!("all pages are pinned"))
         }
+    }
+
+    fn flush_page(
+        f: &Mutex<File>,
+        double_buff_f: &Mutex<File>,
+        pgid: PageId,
+        buffer: &[u8],
+    ) -> anyhow::Result<()> {
+        // TODO: reduce the number of syscall here.
+        let mut double_buff_f = double_buff_f.lock();
+        double_buff_f.seek(SeekFrom::Start(0))?;
+        double_buff_f.write_all(buffer)?;
+        double_buff_f.sync_all()?;
+        drop(double_buff_f);
+
+        let mut f = f.lock();
+        let page_size = buffer.len();
+        f.seek(SeekFrom::Start(pgid.get() * page_size as u64))?;
+        f.write_all(buffer)?;
+        f.sync_all()?;
+        drop(f);
+
+        Ok(())
+    }
+
+    fn evict_page(
+        internal: &mut PagerFlushInternal,
+        f: &Mutex<File>,
+        double_buff_f: &Mutex<File>,
+        page_size: usize,
+        pgid: PageId,
+        buffer: &[u8],
+    ) -> anyhow::Result<()> {
+        if let Some(i) = internal.flushing_pgids.iter().position(|p| p == &pgid) {
+            internal.flushing_pages[i * page_size..(i + 1) * page_size].copy_from_slice(buffer);
+        } else {
+            let is_full =
+                internal.flushing_pgids.len() * page_size >= internal.flushing_pages.len();
+            if is_full {
+                Self::flush_and_clear_flushing_pages(internal, f, double_buff_f, page_size)?;
+            }
+
+            let i = internal.flushing_pgids.len();
+            internal.flushing_pgids.push(pgid);
+            internal.flushing_pages[i * page_size..(i + 1) * page_size].copy_from_slice(buffer);
+        }
+
+        Ok(())
+    }
+
+    fn flush_and_clear_flushing_pages(
+        internal: &mut PagerFlushInternal,
+        f: &Mutex<File>,
+        double_buff_f: &Mutex<File>,
+        page_size: usize,
+    ) -> anyhow::Result<()> {
+        let mut double_buff_f = double_buff_f.lock();
+        double_buff_f.set_len(0)?;
+        double_buff_f.seek(SeekFrom::Start(0))?;
+        double_buff_f.write_all(&internal.flushing_pages)?;
+        double_buff_f.sync_all()?;
+        drop(double_buff_f);
+
+        // TODO: maybe we can use vectorized write to write them all in one single syscall
+        // TODO: also, we need to make sure that the WAL log is already written safely before we can
+        // write to disk.
+        let mut f = f.lock();
+        for (i, pgid) in internal.flushing_pgids.iter().enumerate() {
+            f.seek(SeekFrom::Start(pgid.get() * page_size as u64))?;
+            f.write_all(&internal.flushing_pages[i * page_size..(i + 1) * page_size])?;
+        }
+        f.sync_all()?;
+        drop(f);
+
+        internal.flushing_pgids.clear();
+
+        Ok(())
     }
 
     fn flush_thread_handler(
@@ -475,23 +573,17 @@ impl Pager {
 
             // TODO: maybe acquire read lock first and skip it if it's already clean.
             // only when it's dirty, we acquire write lock and flush it.
+            // TODO: maybe we can batch few pages together to reduce the number of syscall.
             let mut frame = meta.write();
             if let Some(ref wal_info) = frame.wal {
                 if let Some(wal) = self.wal.get() {
                     wal.sync(wal_info.page)?;
                 }
+                frame.wal = None;
+                let frame = RwLockWriteGuard::downgrade(frame);
 
                 Self::encode(&frame, buffer)?;
-                let mut f = self.f.lock();
-                // TODO: try to seek and write using a single syscall
-                // TODO(important): this is not safe. We can get non-atomic write.
-                // In order to make the write atomic, we have to do a double-write. Write to a shadow page
-                // first, then to the actual page.
-                f.seek(SeekFrom::Start(frame.id.get() * self.page_size as u64))?;
-                f.write_all(buffer)?;
-                f.sync_all()?;
-
-                frame.wal = None;
+                Self::flush_page(&self.f, &self.double_buff_f, frame.id, buffer)?;
             }
         }
 
@@ -784,6 +876,11 @@ impl Pager {
             };
             Self::encode(&meta, buffer)?;
             // TODO: try to seek and write using a single syscall
+            // TODO(important): this is not safe. We can get non-atomic write.
+            // In order to make the write atomic, we have to do a double-write. Write to a shadow page
+            // first, then to the actual page.
+            // TODO: also, we need to make sure that the WAL log is already written safely before we can
+            // write to disk.
             f.seek(SeekFrom::Start(pgid.0.get() * self.page_size as u64))?;
             f.write_all(buffer)?;
         }
