@@ -332,6 +332,7 @@ pub(crate) enum WalRecord<'a> {
         raw: &'a [u8],
         ptr: PageId,
         key_size: usize,
+        overflow: Option<PageId>,
     },
     InteriorDelete {
         pgid: PageId,
@@ -348,7 +349,8 @@ pub(crate) enum WalRecord<'a> {
 
     LeafReset {
         pgid: PageId,
-        // TODO: add more fields for undoing this process
+        page_version: u16,
+        payload: &'a [u8],
     },
     LeafUndoReset {
         pgid: PageId,
@@ -363,6 +365,18 @@ pub(crate) enum WalRecord<'a> {
         overflow: Option<PageId>,
         key_size: usize,
         value_size: usize,
+    },
+    LeafDelete {
+        pgid: PageId,
+        index: usize,
+        old_raw: &'a [u8],
+        old_overflow: Option<PageId>,
+        old_key_size: usize,
+        old_val_size: usize,
+    },
+    LeafUndoDelete {
+        pgid: PageId,
+        index: usize,
     },
 
     CheckpointBegin,
@@ -404,6 +418,8 @@ const WAL_RECORD_LEAF_RESET_KIND: u8 = 30;
 const WAL_RECORD_LEAF_UNDO_RESET_KIND: u8 = 31;
 const WAL_RECORD_LEAF_INIT_KIND: u8 = 32;
 const WAL_RECORD_LEAF_INSERT_KIND: u8 = 33;
+const WAL_RECORD_LEAF_DELETE_KIND: u8 = 34;
+const WAL_RECORD_LEAF_UNDO_DELETE_KIND: u8 = 35;
 
 const WAL_RECORD_CHECKPOINT_BEGIN_KIND: u8 = 100;
 const WAL_RECORD_CHECKPOINT_END_KIND: u8 = 101;
@@ -429,6 +445,8 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafUndoReset { .. } => WAL_RECORD_LEAF_UNDO_RESET_KIND,
             WalRecord::LeafInit { .. } => WAL_RECORD_LEAF_INIT_KIND,
             WalRecord::LeafInsert { .. } => WAL_RECORD_LEAF_INSERT_KIND,
+            WalRecord::LeafDelete { .. } => WAL_RECORD_LEAF_DELETE_KIND,
+            WalRecord::LeafUndoDelete { .. } => WAL_RECORD_LEAF_UNDO_DELETE_KIND,
 
             WalRecord::CheckpointBegin { .. } => WAL_RECORD_CHECKPOINT_BEGIN_KIND,
             WalRecord::CheckpointEnd { .. } => WAL_RECORD_CHECKPOINT_END_KIND,
@@ -444,7 +462,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::InteriorReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::InteriorUndoReset { .. } => 8,
             WalRecord::InteriorInit { .. } => 16,
-            WalRecord::InteriorInsert { raw, .. } => 24 + raw.len(),
+            WalRecord::InteriorInsert { raw, .. } => 32 + raw.len(),
             WalRecord::InteriorDelete { old_raw, .. } => 32 + old_raw.len(),
             WalRecord::InteriorUndoDelete { .. } => 10,
 
@@ -452,6 +470,8 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafUndoReset { .. } => 8,
             WalRecord::LeafInit { .. } => 8,
             WalRecord::LeafInsert { raw, .. } => 28 + raw.len(),
+            WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
+            WalRecord::LeafUndoDelete { .. } => 10,
 
             WalRecord::CheckpointBegin => 0,
             WalRecord::CheckpointEnd { dirty_pages, .. } => 8 + 16 * dirty_pages.len() + 8,
@@ -497,6 +517,7 @@ impl<'a> WalRecord<'a> {
                 raw,
                 ptr,
                 key_size,
+                overflow,
             } => {
                 assert!(raw.len() <= u16::MAX as usize);
                 assert!(*key_size <= u32::MAX as usize);
@@ -507,7 +528,8 @@ impl<'a> WalRecord<'a> {
                 buff[12..14].copy_from_slice(&(raw.len() as u16).to_be_bytes());
                 buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[16..24].copy_from_slice(&ptr.to_be_bytes());
-                buff[24..24 + raw.len()].copy_from_slice(raw);
+                buff[24..32].copy_from_slice(&overflow.to_be_bytes());
+                buff[32..32 + raw.len()].copy_from_slice(raw);
             }
             WalRecord::InteriorDelete {
                 pgid,
@@ -534,8 +556,16 @@ impl<'a> WalRecord<'a> {
                 buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
             }
 
-            WalRecord::LeafReset { pgid } => {
+            WalRecord::LeafReset {
+                pgid,
+                page_version,
+                payload,
+            } => {
+                assert!(payload.len() <= u16::MAX as usize);
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
+                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                buff[12..12 + payload.len()].copy_from_slice(payload);
             }
             WalRecord::LeafUndoReset { pgid } => {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
@@ -564,6 +594,33 @@ impl<'a> WalRecord<'a> {
                 buff[24..28].copy_from_slice(&(*value_size as u32).to_be_bytes());
                 buff[28..].copy_from_slice(raw);
             }
+            WalRecord::LeafDelete {
+                pgid,
+                index,
+                old_raw,
+                old_overflow,
+                old_key_size,
+                old_val_size,
+            } => {
+                assert!(old_raw.len() <= u16::MAX as usize);
+                assert!(*index <= u16::MAX as usize);
+                assert!(*old_key_size <= u32::MAX as usize);
+                assert!(*old_val_size <= u32::MAX as usize);
+
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
+                buff[10..12].copy_from_slice(&(old_raw.len() as u16).to_be_bytes());
+                buff[12..16].copy_from_slice(&(*old_key_size as u32).to_be_bytes());
+                buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
+                buff[24..28].copy_from_slice(&(*old_val_size as u32).to_be_bytes());
+                buff[28..].copy_from_slice(old_raw);
+            }
+            WalRecord::LeafUndoDelete { pgid, index } => {
+                assert!(*index <= u16::MAX as usize);
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
+            }
+
             WalRecord::CheckpointBegin => (),
             WalRecord::CheckpointEnd {
                 dirty_pages,
@@ -656,12 +713,14 @@ impl<'a> WalRecord<'a> {
                 let Some(ptr) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
                     return Err(anyhow!("zero pointer in interior cell"));
                 };
+                let overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
                 Ok(Self::InteriorInsert {
                     pgid,
                     index: index as usize,
                     raw: &buff[24..24 + raw_size as usize],
                     ptr,
                     key_size: key_size as usize,
+                    overflow,
                 })
             }
             WAL_RECORD_INTERIOR_DELETE_KIND => {
@@ -699,7 +758,13 @@ impl<'a> WalRecord<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::LeafReset { pgid })
+                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
+                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
+                Ok(Self::InteriorReset {
+                    pgid,
+                    page_version,
+                    payload: &buff[12..12 + size as usize],
+                })
             }
             WAL_RECORD_LEAF_UNDO_RESET_KIND => {
                 let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
@@ -729,6 +794,34 @@ impl<'a> WalRecord<'a> {
                     overflow,
                     key_size: key_size as usize,
                     value_size: value_size as usize,
+                })
+            }
+            WAL_RECORD_LEAF_DELETE_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
+                let raw_size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
+                let old_key_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
+                let old_overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
+                let old_val_size = u32::from_be_bytes(buff[24..28].try_into().unwrap());
+                Ok(Self::LeafDelete {
+                    pgid,
+                    index: index as usize,
+                    old_raw: &buff[24..24 + raw_size as usize],
+                    old_overflow,
+                    old_key_size: old_key_size as usize,
+                    old_val_size: old_key_size as usize,
+                })
+            }
+            WAL_RECORD_LEAF_UNDO_DELETE_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
+                Ok(Self::LeafUndoDelete {
+                    pgid,
+                    index: index as usize,
                 })
             }
 

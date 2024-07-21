@@ -658,7 +658,7 @@ impl Pager {
 
         let kind = match buff_kind {
             0 => PageKind::None,
-            1 => Self::decode_interior_page(buff)?,
+            1 => Self::decode_interior_page(payload)?,
             2 => Self::decode_leaf_page(buff)?,
             3 => Self::decode_overflow_page(buff)?,
             4 => Self::decode_freelist_page(buff)?,
@@ -691,10 +691,7 @@ impl Pager {
         Ok(true)
     }
 
-    fn decode_interior_page(buff: &[u8]) -> anyhow::Result<PageKind> {
-        let page_size = buff.len();
-
-        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
+    fn decode_interior_page(payload: &[u8]) -> anyhow::Result<PageKind> {
         let header = &payload[..INTERIOR_PAGE_HEADER_SIZE];
         let buff_last = &header[..8];
         let buff_count = &header[8..10];
@@ -709,14 +706,14 @@ impl Pager {
 
         let mut remaining = payload.len() - INTERIOR_PAGE_HEADER_SIZE;
         for i in 0..count {
-            let cell_offset =
-                PAGE_HEADER_SIZE + INTERIOR_PAGE_HEADER_SIZE + INTERIOR_PAGE_CELL_SIZE * i as usize;
-            let buf = PageId::from_be_bytes(buff[cell_offset..cell_offset + 8].try_into().unwrap());
+            let cell_offset = INTERIOR_PAGE_HEADER_SIZE + INTERIOR_PAGE_CELL_SIZE * i as usize;
+            let buf =
+                PageId::from_be_bytes(payload[cell_offset..cell_offset + 8].try_into().unwrap());
             if buf.is_none() {
                 return Err(anyhow!("got zero ptr on interior page"));
             }
 
-            let cell = get_interior_cell(buff, i as usize);
+            let cell = get_interior_cell(payload, i as usize);
             remaining -= INTERIOR_PAGE_CELL_SIZE + cell.raw().len();
         }
 
@@ -1072,6 +1069,30 @@ impl<'a> PageWrite<'a> {
         Ok(self.into_interior())
     }
 
+    pub(crate) fn set_interior(
+        mut self,
+        ctx: LogContext<'_>,
+        payload: &'a [u8],
+    ) -> anyhow::Result<InteriorPageWrite<'a>> {
+        assert!(
+            matches!(self.meta.kind, PageKind::None),
+            "page is not empty"
+        );
+        let LogContext::Redo(lsn) = ctx else {
+            panic!("set_interior only can be used for redo-ing wal");
+        };
+
+        let pgid = self.id();
+        record_redo_mutation(lsn, &mut self.meta);
+
+        self.meta.kind = Pager::decode_interior_page(payload)?;
+        self.buffer.copy_from_slice(payload);
+
+        Ok(self
+            .into_interior()
+            .expect("the page should be an interior now"))
+    }
+
     pub(crate) fn into_interior(self) -> Option<InteriorPageWrite<'a>> {
         if let PageKind::Interior { .. } = &self.meta.kind {
             Some(InteriorPageWrite(self))
@@ -1149,6 +1170,17 @@ fn record_mutation(
     Ok(())
 }
 
+fn record_redo_mutation(lsn: Lsn, meta: &mut PageMeta) {
+    if let Some(ref mut wal_info) = meta.wal {
+        wal_info.page = lsn;
+    } else {
+        meta.wal = Some(PageWalInfo {
+            rec: lsn,
+            page: lsn,
+        });
+    }
+}
+
 pub(crate) trait BTreePage<'a> {
     type Cell: BTreeCell;
     fn count(&'a self) -> usize;
@@ -1168,7 +1200,10 @@ impl<'a, 'b> BTreePage<'b> for InteriorPageRead<'a> {
     }
 
     fn get(&'b self, index: usize) -> Self::Cell {
-        get_interior_cell(self.0.buffer, index)
+        get_interior_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 }
 
@@ -1258,7 +1293,10 @@ impl<'a, 'b> BTreePage<'b> for InteriorPageWrite<'a> {
     }
 
     fn get(&'b self, index: usize) -> Self::Cell {
-        get_interior_cell(self.0.buffer, index)
+        get_interior_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 }
 
@@ -1282,7 +1320,10 @@ impl<'a> InteriorPageWrite<'a> {
     }
 
     pub(crate) fn get(&self, index: usize) -> InteriorCell<'_> {
-        get_interior_cell(self.0.buffer, index)
+        get_interior_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
@@ -1310,6 +1351,7 @@ impl<'a> InteriorPageWrite<'a> {
         content: &mut impl Content,
         key_size: usize,
         ptr: PageId,
+        overflow: Option<PageId>,
     ) -> anyhow::Result<bool> {
         let total_size = content.remaining();
         let payload_size =
@@ -1330,7 +1372,7 @@ impl<'a> InteriorPageWrite<'a> {
         let raw_size = std::cmp::min(max_before_overflow, total_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let content_offset = self.insert_cell(i, ptr, None, key_size, raw_size);
+        let content_offset = self.insert_cell(i, ptr, overflow, key_size, raw_size);
         content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
         let pgid = self.id();
 
@@ -1347,6 +1389,7 @@ impl<'a> InteriorPageWrite<'a> {
                 raw: &self.0.buffer[content_offset..content_offset + raw_size],
                 ptr,
                 key_size,
+                overflow,
             },
             WalRecord::InteriorInsert {
                 pgid,
@@ -1354,6 +1397,7 @@ impl<'a> InteriorPageWrite<'a> {
                 raw: &self.0.buffer[content_offset..content_offset + raw_size],
                 ptr,
                 key_size,
+                overflow,
             },
         )?;
 
@@ -1420,7 +1464,10 @@ impl<'a> InteriorPageWrite<'a> {
 
         let mut new_offset = self.0.pager.page_size - PAGE_FOOTER_SIZE;
         for i in 0..self.count() {
-            let copied_cell = get_interior_cell(&copied, i);
+            let copied_cell = get_interior_cell(
+                &copied[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                i,
+            );
             let copied_content = copied_cell.raw();
             new_offset -= copied_content.len();
             self.0.buffer[new_offset..new_offset + copied_content.len()]
@@ -1441,7 +1488,10 @@ impl<'a> InteriorPageWrite<'a> {
     pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
         let id = self.0.meta.id;
 
-        let cell = get_interior_cell(self.0.buffer, index);
+        let cell = get_interior_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        );
         let content_offset = u16::from_be_bytes(cell.cell[20..22].try_into().unwrap()) as usize;
         let content_size = u16::from_be_bytes(cell.cell[22..24].try_into().unwrap()) as usize;
 
@@ -1580,12 +1630,63 @@ impl<'a> LeafPageWrite<'a> {
             self.0.txid,
             ctx,
             &mut self.0.meta,
-            WalRecord::LeafReset { pgid },
+            WalRecord::LeafReset {
+                pgid,
+                page_version: 0,
+                payload: &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            },
             WalRecord::LeafUndoReset { pgid },
         )?;
 
         self.0.meta.kind = PageKind::None;
         Ok(self.0)
+    }
+
+    pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
+        let pgid = self.0.meta.id;
+        let cell = get_leaf_cell(self.0.buffer, index);
+        let content_offset = u16::from_be_bytes(cell.cell[16..18].try_into().unwrap()) as usize;
+        let content_size = u16::from_be_bytes(cell.cell[18..20].try_into().unwrap()) as usize;
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta,
+            WalRecord::LeafDelete {
+                pgid,
+                index,
+                old_raw: &self.0.buffer[content_offset..content_offset + content_size],
+                old_overflow: cell.overflow(),
+                old_key_size: cell.key_size(),
+                old_val_size: cell.val_size(),
+            },
+            WalRecord::LeafUndoDelete { pgid, index },
+        )?;
+
+        let PageKind::Leaf {
+            ref mut offset,
+            ref mut remaining,
+            ref mut count,
+            ..
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+
+        if *offset == content_offset {
+            *offset += content_size;
+        }
+        *remaining += LEAF_PAGE_CELL_SIZE + content_size;
+        *count -= 1;
+
+        for i in index..*count {
+            let x = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * i;
+            let (a, b) = self.0.buffer.split_at_mut(x + LEAF_PAGE_CELL_SIZE);
+            let a_len = a.len();
+            a[a_len - LEAF_PAGE_CELL_SIZE..].copy_from_slice(&b[..LEAF_PAGE_CELL_SIZE]);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn insert_content(
@@ -1595,9 +1696,8 @@ impl<'a> LeafPageWrite<'a> {
         content: &mut impl Content,
         key_size: usize,
         value_size: usize,
+        overflow: Option<PageId>,
     ) -> anyhow::Result<bool> {
-        // TODO: record mutation
-
         let content_size = content.remaining();
         let payload_size =
             self.0.buffer.len() - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
@@ -1617,7 +1717,7 @@ impl<'a> LeafPageWrite<'a> {
         let raw_size = std::cmp::min(max_before_overflow, content_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let reserved_offset = self.reserve_cell(i, None, key_size, value_size, raw_size);
+        let reserved_offset = self.reserve_cell(i, key_size, value_size, raw_size);
         content.put(&mut self.0.buffer[reserved_offset..reserved_offset + raw_size])?;
 
         let pgid = self.id();
@@ -1629,7 +1729,7 @@ impl<'a> LeafPageWrite<'a> {
                 pgid,
                 index: i,
                 raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
-                overflow: None,
+                overflow,
                 key_size,
                 value_size,
             },
@@ -1637,20 +1737,19 @@ impl<'a> LeafPageWrite<'a> {
                 pgid,
                 index: i,
                 raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
-                overflow: None,
+                overflow,
                 key_size,
                 value_size,
             },
         )?;
 
-        self.insert_cell_meta(i, None, key_size, value_size, raw_size);
+        self.insert_cell_meta(i, overflow, key_size, value_size, raw_size);
         Ok(true)
     }
 
     fn reserve_cell(
         &mut self,
         index: usize,
-        overflow: Option<PageId>,
         key_size: usize,
         val_size: usize,
         raw_size: usize,
@@ -1844,6 +1943,7 @@ mod tests {
                     &mut Bytes::new(format!("{i:028}").as_bytes()),
                     28,
                     pgid_ptr,
+                    None,
                 )
                 .unwrap();
             assert!(ok);
@@ -1867,6 +1967,7 @@ mod tests {
                 &mut Bytes::new(b"0000000000000000000000000002"),
                 28,
                 pgid_ptr,
+                None,
             )
             .unwrap();
         assert_eq!(4, page1.count());

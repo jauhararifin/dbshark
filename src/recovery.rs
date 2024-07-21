@@ -355,10 +355,12 @@ fn redo(
             | WalRecord::InteriorInsert { pgid, .. }
             | WalRecord::InteriorDelete { pgid, .. }
             | WalRecord::InteriorUndoDelete { pgid, .. }
-            | WalRecord::LeafReset { pgid }
+            | WalRecord::LeafReset { pgid, .. }
             | WalRecord::LeafUndoReset { pgid }
             | WalRecord::LeafInit { pgid, .. }
-            | WalRecord::LeafInsert { pgid, .. } => {
+            | WalRecord::LeafInsert { pgid, .. }
+            | WalRecord::LeafDelete { pgid, .. }
+            | WalRecord::LeafUndoDelete { pgid, .. } => {
                 redo_page(pager, analyze_result, lsn, &entry, pgid)?;
             }
         };
@@ -419,6 +421,7 @@ fn redo_page(
             raw,
             ptr,
             key_size,
+            overflow,
             ..
         } => {
             let Some(mut page) = page.into_interior() else {
@@ -426,7 +429,8 @@ fn redo_page(
                     "redo failed on interior insert because page is not an interior"
                 ));
             };
-            let ok = page.insert_content(ctx, index, &mut Bytes::new(raw), key_size, ptr)?;
+            let ok =
+                page.insert_content(ctx, index, &mut Bytes::new(raw), key_size, ptr, overflow)?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on interior insert because the content can't be inserted"
@@ -442,7 +446,7 @@ fn redo_page(
             page.delete(ctx, index)?;
         }
 
-        WalRecord::LeafReset { pgid } | WalRecord::LeafUndoReset { pgid } => {
+        WalRecord::LeafReset { pgid, .. } | WalRecord::LeafUndoReset { pgid } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
                     "redo failed on leaf reset because page is not a leaf"
@@ -468,12 +472,27 @@ fn redo_page(
                     "redo failed on leaf insert because page is not a leaf"
                 ));
             };
-            let ok = page.insert_content(ctx, index, &mut Bytes::new(raw), key_size, value_size)?;
+            let ok = page.insert_content(
+                ctx,
+                index,
+                &mut Bytes::new(raw),
+                key_size,
+                value_size,
+                overflow,
+            )?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on leaf insert because the content can't be inserted"
                 ));
             }
+        }
+        WalRecord::LeafDelete { index, .. } | WalRecord::LeafUndoDelete { index, .. } => {
+            let Some(mut page) = page.into_leaf() else {
+                return Err(anyhow!(
+                    "redo failed on leaf delete because page is not a leaf"
+                ));
+            };
+            page.delete(ctx, index)?;
         }
     }
 
@@ -554,7 +573,6 @@ pub(crate) fn undo_txn(
             } => {
                 *db_root = old_root;
                 *db_freelist = old_freelist;
-                todo!();
             }
 
             WalRecord::InteriorReset {
@@ -565,9 +583,12 @@ pub(crate) fn undo_txn(
                 if page_version != 0 {
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
-                todo!();
+                let page = pager.write(txid, pgid)?;
+                page.set_interior(ctx, payload)?;
             }
-            WalRecord::InteriorUndoReset { pgid } => todo!(),
+            WalRecord::InteriorUndoReset { pgid } => {
+                unreachable!("InteriorUndoReset only used for CLR which shouldn't be undone");
+            }
             WalRecord::InteriorInit { pgid, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_interior() else {
@@ -589,10 +610,29 @@ pub(crate) fn undo_txn(
                 old_ptr,
                 old_overflow,
                 old_key_size,
-            } => todo!(),
-            WalRecord::InteriorUndoDelete { pgid, index } => todo!(),
+            } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_interior() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.insert_content(
+                    ctx,
+                    index,
+                    &mut Bytes::new(old_raw),
+                    old_key_size,
+                    old_ptr,
+                    old_overflow,
+                )?;
+            }
+            WalRecord::InteriorUndoDelete { pgid, index } => {
+                unreachable!("InteriorUndoDelete only used for CLR which shouldn't be undone");
+            }
 
-            WalRecord::LeafReset { pgid } => todo!(),
+            WalRecord::LeafReset {
+                pgid,
+                page_version,
+                payload,
+            } => todo!(),
             WalRecord::LeafUndoReset { pgid } => todo!(),
             WalRecord::LeafInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
@@ -601,7 +641,37 @@ pub(crate) fn undo_txn(
                 };
                 page.reset(ctx)?;
             }
-            WalRecord::LeafInsert { pgid, index, .. } => todo!(),
+            WalRecord::LeafInsert { pgid, index, .. } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_leaf() else {
+                    return Err(anyhow!("expected an leaf page for undo"));
+                };
+                page.delete(ctx, index)?;
+            }
+            WalRecord::LeafDelete {
+                pgid,
+                index,
+                old_raw,
+                old_overflow,
+                old_key_size,
+                old_val_size,
+            } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_leaf() else {
+                    return Err(anyhow!("expected a leaf page for undo"));
+                };
+                page.insert_content(
+                    ctx,
+                    index,
+                    &mut Bytes::new(old_raw),
+                    old_key_size,
+                    old_val_size,
+                    old_overflow,
+                )?;
+            }
+            WalRecord::LeafUndoDelete { pgid, index } => {
+                unreachable!("LeafUndoDelete only used for CLR which shouldn't be undone");
+            }
 
             WalRecord::CheckpointBegin | WalRecord::CheckpointEnd { .. } => (),
         }

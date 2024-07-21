@@ -167,7 +167,7 @@ impl<'a> BTree<'a> {
         key_size: usize,
     ) -> anyhow::Result<bool> {
         let value_size = content.remaining() - key_size;
-        let ok = node.insert_content(self.ctx, index, &mut content, key_size, value_size)?;
+        let ok = node.insert_content(self.ctx, index, &mut content, key_size, value_size, None)?;
         if !ok {
             return Ok(false);
         }
