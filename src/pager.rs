@@ -61,13 +61,18 @@ impl PageIdExt for Option<PageId> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LogContext<'a> {
+    Runtime(&'a Wal),
+    Redo(Lsn),
+    Undo(&'a Wal, Lsn),
+}
+
 pub(crate) struct Pager {
     f: Mutex<File>,
     double_buff_f: Mutex<File>,
     page_size: usize,
     n: usize,
-
-    wal: OnceLock<Arc<Wal>>,
 
     internal: RwLock<PagerInternal>,
     flush_internal: RwLock<PagerFlushInternal>,
@@ -167,8 +172,6 @@ impl Pager {
             page_size,
             n,
 
-            wal: OnceLock::default(),
-
             internal: RwLock::new(PagerInternal {
                 allocated: 0,
                 file_page_count,
@@ -242,12 +245,6 @@ impl Pager {
 
         file.sync_all()?;
         Ok(())
-    }
-
-    pub(crate) fn set_wal(&self, wal: Arc<Wal>) {
-        if self.wal.set(wal).is_err() {
-            panic!("can't set wal twice")
-        }
     }
 
     pub(crate) fn page_count(&self) -> usize {
@@ -534,6 +531,7 @@ impl Pager {
 
     fn flush_thread_handler(
         pager: Arc<Pager>,
+        wal: &Wal,
         recv: Receiver<()>,
         error_handler: Option<impl Fn(anyhow::Error) + Send + Sync>,
     ) {
@@ -541,7 +539,7 @@ impl Pager {
             if recv.recv_timeout(Duration::from_secs(60 * 5)).is_ok() {
                 break;
             }
-            if let Err(err) = pager.flush_dirty_pages() {
+            if let Err(err) = pager.flush_dirty_pages(wal) {
                 if let Some(ref error_handler) = error_handler {
                     error_handler(err);
                 }
@@ -549,7 +547,7 @@ impl Pager {
         }
     }
 
-    fn flush_dirty_pages(&self) -> anyhow::Result<()> {
+    fn flush_dirty_pages(&self, wal: &Wal) -> anyhow::Result<()> {
         for frame_id in 0..self.n {
             let (meta, buffer) = {
                 let mut internal = self.internal.write();
@@ -576,9 +574,7 @@ impl Pager {
             // TODO: maybe we can batch few pages together to reduce the number of syscall.
             let mut frame = meta.write();
             if let Some(ref wal_info) = frame.wal {
-                if let Some(wal) = self.wal.get() {
-                    wal.sync(wal_info.page)?;
-                }
+                wal.sync(wal_info.page)?;
                 frame.wal = None;
                 let frame = RwLockWriteGuard::downgrade(frame);
 
@@ -1022,7 +1018,7 @@ pub(crate) struct PageWrite<'a> {
     buffer: &'a mut [u8],
 }
 
-impl<'a> Drop for PageWrite<'a> {
+impl Drop for PageWrite<'_> {
     fn drop(&mut self) {
         self.pager.release(self.frame_id, self.meta.wal.is_some());
     }
@@ -1043,17 +1039,14 @@ impl<'a> PageWrite<'a> {
 
     pub(crate) fn init_interior(
         mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
+        ctx: LogContext<'_>,
         last: PageId,
     ) -> anyhow::Result<Option<InteriorPageWrite<'a>>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             record_mutation(
                 self.txid,
-                clr,
-                lsn,
-                self.pager,
+                ctx,
                 &mut self.meta,
                 WalRecord::InteriorInit { pgid, last },
             )?;
@@ -1082,19 +1075,11 @@ impl<'a> PageWrite<'a> {
 
     pub(crate) fn init_leaf(
         mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
+        ctx: LogContext<'_>,
     ) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
-            record_mutation(
-                self.txid,
-                clr,
-                lsn,
-                self.pager,
-                &mut self.meta,
-                WalRecord::LeafInit { pgid },
-            )?;
+            record_mutation(self.txid, ctx, &mut self.meta, WalRecord::LeafInit { pgid })?;
 
             self.meta.kind = PageKind::Leaf {
                 count: 0,
@@ -1122,25 +1107,14 @@ impl<'a> PageWrite<'a> {
 // TODO: during recovery, we need to pass the LSN of the log to upadte this page's rec_lsn and page_lsn.
 fn record_mutation(
     txid: TxId,
-    clr: Option<Lsn>,
-    lsn: Option<Lsn>,
-    pager: &Pager,
+    ctx: LogContext<'_>,
     meta: &mut PageMeta,
     entry: WalRecord,
 ) -> anyhow::Result<()> {
-    let lsn = if let Some(wal) = pager.wal.get() {
-        assert!(
-            lsn.is_none(),
-            "when the wal is set, the LSN is not necessary. LSN is only needed in redo phase"
-        );
-        wal.append(txid, clr, entry)?
-    } else {
-        let Some(lsn) = lsn else {
-            panic!(
-                "when WAL is not present, it means we are in redo phase, so we need to pass LSN"
-            );
-        };
-        lsn
+    let lsn = match ctx {
+        LogContext::Runtime(wal) => wal.append(txid, None, entry)?,
+        LogContext::Undo(wal, clr) => wal.append(txid, Some(clr), entry)?,
+        LogContext::Redo(lsn) => lsn,
     };
 
     if let Some(ref mut wal_info) = meta.wal {
@@ -1151,6 +1125,7 @@ fn record_mutation(
             page: lsn,
         });
     }
+
     Ok(())
 }
 
@@ -1290,17 +1265,11 @@ impl<'a> InteriorPageWrite<'a> {
         get_interior_cell(self.0.buffer, index)
     }
 
-    pub(crate) fn reset(
-        mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
-    ) -> anyhow::Result<PageWrite<'a>> {
+    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
-            clr,
-            lsn,
-            self.0.pager,
+            ctx,
             &mut self.0.meta,
             WalRecord::InteriorReset { pgid },
         )?;
@@ -1311,8 +1280,7 @@ impl<'a> InteriorPageWrite<'a> {
 
     pub(crate) fn insert_content(
         &mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
+        ctx: LogContext<'_>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,
@@ -1346,9 +1314,7 @@ impl<'a> InteriorPageWrite<'a> {
         // written, we might have a corrupted page.
         record_mutation(
             self.0.txid,
-            clr,
-            lsn,
-            self.0.pager,
+            ctx,
             &mut self.0.meta,
             WalRecord::InteriorInsert {
                 pgid,
@@ -1440,12 +1406,7 @@ impl<'a> InteriorPageWrite<'a> {
         *offset = new_offset;
     }
 
-    pub(crate) fn delete(
-        &mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
-        index: usize,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
         let id = self.0.meta.id;
 
         let cell = get_interior_cell(self.0.buffer, index);
@@ -1455,9 +1416,7 @@ impl<'a> InteriorPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
-            clr,
-            lsn,
-            self.0.pager,
+            ctx,
             &mut self.0.meta,
             WalRecord::InteriorDelete {
                 pgid,
@@ -1581,18 +1540,12 @@ impl<'a> LeafPageWrite<'a> {
         next
     }
 
-    pub(crate) fn reset(
-        mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
-    ) -> anyhow::Result<PageWrite<'a>> {
+    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
         let pgid = self.id();
 
         record_mutation(
             self.0.txid,
-            clr,
-            lsn,
-            self.0.pager,
+            ctx,
             &mut self.0.meta,
             WalRecord::LeafReset { pgid },
         )?;
@@ -1603,8 +1556,7 @@ impl<'a> LeafPageWrite<'a> {
 
     pub(crate) fn insert_content(
         &mut self,
-        clr: Option<Lsn>,
-        lsn: Option<Lsn>,
+        ctx: LogContext<'_>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,
@@ -1637,9 +1589,7 @@ impl<'a> LeafPageWrite<'a> {
         let pgid = self.id();
         record_mutation(
             self.0.txid,
-            clr,
-            lsn,
-            self.0.pager,
+            ctx,
             &mut self.0.meta,
             WalRecord::LeafInsert {
                 pgid,
@@ -1835,18 +1785,19 @@ mod tests {
         let wal = Arc::new(Wal::new(wal_file, 0, Lsn::new(64).unwrap(), page_size).unwrap());
 
         let pager = Pager::new(file, double_buff_file, page_size, 10).unwrap();
-        pager.set_wal(wal);
         let txid = TxId::new(1).unwrap();
 
         let mut page1 = pager.alloc(txid).unwrap();
         let pgid_last = PageId::new(7).unwrap();
-        let mut page1 = page1.init_interior(None, None, pgid_last).unwrap().unwrap();
+        let mut page1 = page1
+            .init_interior(LogContext::Runtime(&wal), pgid_last)
+            .unwrap()
+            .unwrap();
         let pgid_ptr = PageId::new(8).unwrap();
         for i in 0..4 {
             let ok = page1
                 .insert_content(
-                    None,
-                    None,
+                    LogContext::Runtime(&wal),
                     i,
                     &mut Bytes::new(format!("{i:028}").as_bytes()),
                     28,
@@ -1861,7 +1812,7 @@ mod tests {
         assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
         assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
 
-        page1.delete(None, None, 2).unwrap();
+        page1.delete(LogContext::Runtime(&wal), 2).unwrap();
         assert_eq!(3, page1.count());
         assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
         assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
@@ -1869,8 +1820,7 @@ mod tests {
 
         page1
             .insert_content(
-                None,
-                None,
+                LogContext::Runtime(&wal),
                 2,
                 &mut Bytes::new(b"0000000000000000000000000002"),
                 28,
@@ -1883,7 +1833,7 @@ mod tests {
         assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
         assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
 
-        page1.delete(None, None, 3).unwrap();
+        page1.delete(LogContext::Runtime(&wal), 3).unwrap();
         assert_eq!(3, page1.count());
         assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
         assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());

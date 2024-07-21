@@ -1,16 +1,16 @@
-use std::fs::remove_dir_all;
-
 use crate::content::{Bytes, Content};
 use crate::pager::{
     BTreeCell, BTreePage, InteriorCell, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite,
-    OverflowPageRead, PageId, Pager,
+    LogContext, OverflowPageRead, PageId, Pager,
 };
-use crate::wal::TxId;
+use crate::wal::{TxId, Wal};
 use anyhow::anyhow;
+use std::fs::remove_dir_all;
 
 pub(crate) struct BTree<'a> {
     txid: TxId,
     pager: &'a Pager,
+    ctx: LogContext<'a>,
     root: PageId,
     freelist: Option<PageId>,
 }
@@ -32,12 +32,14 @@ impl<'a> BTree<'a> {
     pub(crate) fn new(
         txid: TxId,
         pager: &'a Pager,
+        wal: &'a Wal,
         root: PageId,
         freelist: Option<PageId>,
     ) -> BTree<'a> {
         BTree {
             txid,
             pager,
+            ctx: LogContext::Runtime(wal),
             root,
             freelist,
         }
@@ -112,7 +114,7 @@ impl<'a> BTree<'a> {
             current = next;
         };
 
-        let Some(node) = page.init_leaf(None, None)? else {
+        let Some(node) = page.init_leaf(self.ctx)? else {
             return Err(anyhow!(
                 "invalid state, btree contain non-interior and non-leaf page"
             ));
@@ -161,7 +163,7 @@ impl<'a> BTree<'a> {
         key_size: usize,
     ) -> anyhow::Result<bool> {
         let value_size = content.remaining() - key_size;
-        let ok = node.insert_content(None, None, index, &mut content, key_size, value_size)?;
+        let ok = node.insert_content(self.ctx, index, &mut content, key_size, value_size)?;
         if !ok {
             return Ok(false);
         }

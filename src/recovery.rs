@@ -1,5 +1,5 @@
 use crate::content::Bytes;
-use crate::pager::{PageId, PageIdExt, PageWrite, Pager};
+use crate::pager::{LogContext, PageId, PageIdExt, PageWrite, Pager};
 use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalDecodeResult, WalEntry, WalRecord};
 use anyhow::anyhow;
 use parking_lot::Mutex;
@@ -387,6 +387,8 @@ fn redo_page(
         }
     }
 
+    let ctx = LogContext::Redo(lsn);
+
     match entry.record {
         WalRecord::Begin
         | WalRecord::Commit
@@ -402,10 +404,10 @@ fn redo_page(
                     "redo failed on interior reset because page is not an interior"
                 ));
             };
-            page.reset(None, Some(lsn))?;
+            page.reset(ctx)?;
         }
         WalRecord::InteriorInit { pgid, last } => {
-            if page.init_interior(None, Some(lsn), last)?.is_none() {
+            if page.init_interior(ctx, last)?.is_none() {
                 return Err(anyhow!("redo failed on interior init"));
             }
         }
@@ -421,8 +423,7 @@ fn redo_page(
                     "redo failed on interior insert because page is not an interior"
                 ));
             };
-            let ok =
-                page.insert_content(None, Some(lsn), index, &mut Bytes::new(raw), key_size, ptr)?;
+            let ok = page.insert_content(ctx, index, &mut Bytes::new(raw), key_size, ptr)?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on interior insert because the content can't be inserted"
@@ -435,7 +436,7 @@ fn redo_page(
                     "redo failed on interior delete because page is not an interior"
                 ));
             };
-            page.delete(None, Some(lsn), index)?;
+            page.delete(ctx, index)?;
         }
 
         WalRecord::LeafReset { pgid } => {
@@ -444,10 +445,10 @@ fn redo_page(
                     "redo failed on leaf reset because page is not a leaf"
                 ));
             };
-            page.reset(None, Some(lsn))?;
+            page.reset(ctx)?;
         }
         WalRecord::LeafInit { pgid } => {
-            if page.init_leaf(None, Some(lsn))?.is_none() {
+            if page.init_leaf(ctx)?.is_none() {
                 return Err(anyhow!("redo failed on leaf init"));
             };
         }
@@ -464,14 +465,7 @@ fn redo_page(
                     "redo failed on leaf insert because page is not a leaf"
                 ));
             };
-            let ok = page.insert_content(
-                None,
-                Some(lsn),
-                index,
-                &mut Bytes::new(raw),
-                key_size,
-                value_size,
-            )?;
+            let ok = page.insert_content(ctx, index, &mut Bytes::new(raw), key_size, value_size)?;
             if !ok {
                 return Err(anyhow!(
                     "redo failed on leaf insert because the content can't be inserted"
@@ -522,6 +516,8 @@ pub(crate) fn undo_txn(
     let mut last_clr = None;
     let mut is_ended = false;
 
+    let ctx = LogContext::Undo(wal, lsn);
+
     while let Some((lsn, entry)) = iterator.next()? {
         log::debug!("undo txn item lsn={lsn:?} entry={entry:?}");
         if entry.txid != txid {
@@ -564,14 +560,14 @@ pub(crate) fn undo_txn(
                 let Some(mut page) = page.into_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.reset(clr, None)?;
+                page.reset(ctx)?;
             }
             WalRecord::InteriorInsert { pgid, index, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.delete(clr, None, index)?;
+                page.delete(ctx, index)?;
             }
             WalRecord::InteriorDelete {
                 pgid,
@@ -590,7 +586,7 @@ pub(crate) fn undo_txn(
                 let Some(mut page) = page.into_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo"));
                 };
-                page.reset(clr, None)?;
+                page.reset(ctx)?;
             }
             WalRecord::LeafInsert { pgid, index, .. } => todo!(),
 

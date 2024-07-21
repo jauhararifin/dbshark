@@ -68,8 +68,6 @@ impl Db {
         let wal = recover(wal_file, &pager, page_size)?;
         let wal = Arc::new(wal);
 
-        pager.set_wal(wal.clone());
-
         let next_txid = if let Some(txid) = header.last_txid {
             txid.next()
         } else {
@@ -223,7 +221,13 @@ impl<'db> Tx<'db> {
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
-        let mut btree = BTree::new(self.id, &self.db.pager, root_pgid, self.db.freelist);
+        let mut btree = BTree::new(
+            self.id,
+            &self.db.pager,
+            &self.db.wal,
+            root_pgid,
+            self.db.freelist,
+        );
         let mut result = btree.seek(name.as_bytes())?;
         let bucket_pgid = if !result.found {
             drop(result);
@@ -248,7 +252,13 @@ impl<'db> Tx<'db> {
         };
 
         Ok(Bucket {
-            btree: BTree::new(self.id, &self.db.pager, bucket_pgid, self.db.freelist),
+            btree: BTree::new(
+                self.id,
+                &self.db.pager,
+                &self.db.wal,
+                bucket_pgid,
+                self.db.freelist,
+            ),
         })
     }
 
