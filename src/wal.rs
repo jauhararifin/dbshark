@@ -316,7 +316,8 @@ pub(crate) enum WalRecord<'a> {
 
     InteriorReset {
         pgid: PageId,
-        // TODO: add more fields for undoing this process
+        page_version: u16,
+        payload: &'a [u8],
     },
     InteriorUndoReset {
         pgid: PageId,
@@ -440,7 +441,7 @@ impl<'a> WalRecord<'a> {
 
             WalRecord::HeaderSet { .. } => 32,
 
-            WalRecord::InteriorReset { .. } => 8,
+            WalRecord::InteriorReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::InteriorUndoReset { .. } => 8,
             WalRecord::InteriorInit { .. } => 16,
             WalRecord::InteriorInsert { raw, .. } => 24 + raw.len(),
@@ -472,8 +473,16 @@ impl<'a> WalRecord<'a> {
                 buff[24..32].copy_from_slice(&old_freelist.to_be_bytes());
             }
 
-            WalRecord::InteriorReset { pgid } => {
+            WalRecord::InteriorReset {
+                pgid,
+                page_version,
+                payload,
+            } => {
+                assert!(payload.len() <= u16::MAX as usize);
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
+                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                buff[12..12 + payload.len()].copy_from_slice(payload);
             }
             WalRecord::InteriorUndoReset { pgid } => {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
@@ -614,13 +623,19 @@ impl<'a> WalRecord<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::InteriorReset { pgid })
+                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
+                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
+                Ok(Self::InteriorReset {
+                    pgid,
+                    page_version,
+                    payload: &buff[12..12 + size as usize],
+                })
             }
             WAL_RECORD_INTERIOR_UNDO_RESET_KIND => {
                 let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::InteriorReset { pgid })
+                Ok(Self::InteriorUndoReset { pgid })
             }
             WAL_RECORD_INTERIOR_INIT_KIND => {
                 let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {

@@ -349,7 +349,7 @@ fn redo(
                 result.db_state = Some(DbState { root, freelist });
             }
 
-            WalRecord::InteriorReset { pgid }
+            WalRecord::InteriorReset { pgid, .. }
             | WalRecord::InteriorUndoReset { pgid }
             | WalRecord::InteriorInit { pgid, .. }
             | WalRecord::InteriorInsert { pgid, .. }
@@ -401,7 +401,7 @@ fn redo_page(
         | WalRecord::CheckpointEnd { .. }
         | WalRecord::HeaderSet { .. } => unreachable!(),
 
-        WalRecord::InteriorReset { pgid } | WalRecord::InteriorUndoReset { pgid } => {
+        WalRecord::InteriorReset { pgid, .. } | WalRecord::InteriorUndoReset { pgid } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
                     "redo failed on interior reset because page is not an interior"
@@ -557,7 +557,16 @@ pub(crate) fn undo_txn(
                 todo!();
             }
 
-            WalRecord::InteriorReset { pgid } => todo!(),
+            WalRecord::InteriorReset {
+                pgid,
+                page_version,
+                payload,
+            } => {
+                if page_version != 0 {
+                    return Err(anyhow!("page version {page_version} is not supported"));
+                }
+                todo!();
+            }
             WalRecord::InteriorUndoReset { pgid } => todo!(),
             WalRecord::InteriorInit { pgid, .. } => {
                 let page = pager.write(txid, pgid)?;

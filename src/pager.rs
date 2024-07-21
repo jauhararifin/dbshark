@@ -1291,7 +1291,11 @@ impl<'a> InteriorPageWrite<'a> {
             self.0.txid,
             ctx,
             &mut self.0.meta,
-            WalRecord::InteriorReset { pgid },
+            WalRecord::InteriorReset {
+                pgid,
+                page_version: 0,
+                payload: &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            },
             WalRecord::InteriorUndoReset { pgid },
         )?;
 
