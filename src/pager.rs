@@ -68,6 +68,12 @@ pub(crate) enum LogContext<'a> {
     Undo(&'a Wal, Lsn),
 }
 
+impl LogContext<'_> {
+    fn is_undo(&self) -> bool {
+        matches!(self, Self::Undo(..))
+    }
+}
+
 pub(crate) struct Pager {
     f: Mutex<File>,
     double_buff_f: Mutex<File>,
@@ -1049,6 +1055,7 @@ impl<'a> PageWrite<'a> {
                 ctx,
                 &mut self.meta,
                 WalRecord::InteriorInit { pgid, last },
+                WalRecord::InteriorInit { pgid, last },
             )?;
 
             self.meta.kind = PageKind::Interior {
@@ -1079,7 +1086,13 @@ impl<'a> PageWrite<'a> {
     ) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
-            record_mutation(self.txid, ctx, &mut self.meta, WalRecord::LeafInit { pgid })?;
+            record_mutation(
+                self.txid,
+                ctx,
+                &mut self.meta,
+                WalRecord::LeafInit { pgid },
+                WalRecord::LeafInit { pgid },
+            )?;
 
             self.meta.kind = PageKind::Leaf {
                 count: 0,
@@ -1110,7 +1123,14 @@ fn record_mutation(
     ctx: LogContext<'_>,
     meta: &mut PageMeta,
     entry: WalRecord,
+    compensation_entry: WalRecord,
 ) -> anyhow::Result<()> {
+    let entry = if ctx.is_undo() {
+        compensation_entry
+    } else {
+        entry
+    };
+
     let lsn = match ctx {
         LogContext::Runtime(wal) => wal.append(txid, None, entry)?,
         LogContext::Undo(wal, clr) => wal.append(txid, Some(clr), entry)?,
@@ -1272,6 +1292,7 @@ impl<'a> InteriorPageWrite<'a> {
             ctx,
             &mut self.0.meta,
             WalRecord::InteriorReset { pgid },
+            WalRecord::InteriorUndoReset { pgid },
         )?;
 
         self.0.meta.kind = PageKind::None;
@@ -1316,6 +1337,13 @@ impl<'a> InteriorPageWrite<'a> {
             self.0.txid,
             ctx,
             &mut self.0.meta,
+            WalRecord::InteriorInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                ptr,
+                key_size,
+            },
             WalRecord::InteriorInsert {
                 pgid,
                 index: i,
@@ -1426,6 +1454,7 @@ impl<'a> InteriorPageWrite<'a> {
                 old_overflow: cell.overflow(),
                 old_key_size: cell.key_size(),
             },
+            WalRecord::InteriorUndoDelete { pgid, index },
         )?;
 
         let PageKind::Interior {
@@ -1548,6 +1577,7 @@ impl<'a> LeafPageWrite<'a> {
             ctx,
             &mut self.0.meta,
             WalRecord::LeafReset { pgid },
+            WalRecord::LeafUndoReset { pgid },
         )?;
 
         self.0.meta.kind = PageKind::None;
@@ -1591,6 +1621,14 @@ impl<'a> LeafPageWrite<'a> {
             self.0.txid,
             ctx,
             &mut self.0.meta,
+            WalRecord::LeafInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
+                overflow: None,
+                key_size,
+                value_size,
+            },
             WalRecord::LeafInsert {
                 pgid,
                 index: i,

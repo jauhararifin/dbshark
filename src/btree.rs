@@ -57,7 +57,11 @@ impl<'a> BTree<'a> {
     }
 
     fn put_fast(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<bool> {
-        // TODO: try to acquire only the leaf node and insert there
+        // TODO: try to acquire only the leaf node and insert there.
+        // Unfortunately, this might not have a lot of benefit when we only allow
+        // a single write txn running since there is no contention. If we want to
+        // support MVCC so that we can have 1 write txn + N read txn running
+        // concurrently, we might have a benefit of doing fast path.
         Ok(false)
     }
 

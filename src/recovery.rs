@@ -350,10 +350,13 @@ fn redo(
             }
 
             WalRecord::InteriorReset { pgid }
+            | WalRecord::InteriorUndoReset { pgid }
             | WalRecord::InteriorInit { pgid, .. }
             | WalRecord::InteriorInsert { pgid, .. }
             | WalRecord::InteriorDelete { pgid, .. }
+            | WalRecord::InteriorUndoDelete { pgid, .. }
             | WalRecord::LeafReset { pgid }
+            | WalRecord::LeafUndoReset { pgid }
             | WalRecord::LeafInit { pgid, .. }
             | WalRecord::LeafInsert { pgid, .. } => {
                 redo_page(pager, analyze_result, lsn, &entry, pgid)?;
@@ -398,7 +401,7 @@ fn redo_page(
         | WalRecord::CheckpointEnd { .. }
         | WalRecord::HeaderSet { .. } => unreachable!(),
 
-        WalRecord::InteriorReset { pgid } => {
+        WalRecord::InteriorReset { pgid } | WalRecord::InteriorUndoReset { pgid } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
                     "redo failed on interior reset because page is not an interior"
@@ -430,7 +433,7 @@ fn redo_page(
                 ));
             }
         }
-        WalRecord::InteriorDelete { index, .. } => {
+        WalRecord::InteriorDelete { index, .. } | WalRecord::InteriorUndoDelete { index, .. } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
                     "redo failed on interior delete because page is not an interior"
@@ -439,7 +442,7 @@ fn redo_page(
             page.delete(ctx, index)?;
         }
 
-        WalRecord::LeafReset { pgid } => {
+        WalRecord::LeafReset { pgid } | WalRecord::LeafUndoReset { pgid } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
                     "redo failed on leaf reset because page is not a leaf"
@@ -555,6 +558,7 @@ pub(crate) fn undo_txn(
             }
 
             WalRecord::InteriorReset { pgid } => todo!(),
+            WalRecord::InteriorUndoReset { pgid } => todo!(),
             WalRecord::InteriorInit { pgid, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_interior() else {
@@ -576,11 +580,11 @@ pub(crate) fn undo_txn(
                 old_ptr,
                 old_overflow,
                 old_key_size,
-            } => {
-                todo!();
-            }
+            } => todo!(),
+            WalRecord::InteriorUndoDelete { pgid, index } => todo!(),
 
             WalRecord::LeafReset { pgid } => todo!(),
+            WalRecord::LeafUndoReset { pgid } => todo!(),
             WalRecord::LeafInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {
