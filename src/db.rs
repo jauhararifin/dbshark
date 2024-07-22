@@ -136,8 +136,9 @@ impl Db {
     pub fn update(&self) -> anyhow::Result<Tx> {
         let mut internal = self.internal.write();
 
-        if let Some(txid) = internal.last_unclosed_txn {
-            todo!("rollback the last unclosed txn first");
+        if let Some(txid) = internal.last_unclosed_txn.take() {
+            log::debug!("previous transaction {txid:?} is not closed yet");
+            internal.rollback_txn(txid)?;
         }
 
         let txid = internal.next_txid;
@@ -145,6 +146,23 @@ impl Db {
         internal.last_unclosed_txn = Some(txid);
 
         Tx::new(txid, internal)
+    }
+}
+
+impl DbInternal {
+    fn rollback_txn(&mut self, txid: TxId) -> anyhow::Result<()> {
+        let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
+        log::debug!("rollback log record txid={:?} lsn={lsn:?}", txid);
+        undo_txn(
+            &self.pager,
+            &self.wal,
+            txid,
+            lsn,
+            &mut self.root,
+            &mut self.freelist,
+        )?;
+        self.wal.append(txid, None, WalRecord::End)?;
+        Ok(())
     }
 }
 
@@ -297,15 +315,7 @@ impl<'db> Tx<'db> {
     pub fn rollback(mut self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
-        let lsn = self.db.wal.append(self.id, None, WalRecord::Rollback)?;
-        log::debug!("rollback log record txid={:?} lsn={lsn:?}", self.id);
-        let (pager, wal, db_root, db_freelist) = {
-            let db = self.db.deref_mut();
-            (&db.pager, &db.wal, &mut db.root, &mut db.freelist)
-        };
-        undo_txn(pager, wal, self.id, lsn, db_root, db_freelist)?;
-        self.db.wal.append(self.id, None, WalRecord::End)?;
-
+        self.db.rollback_txn(self.id)?;
         self.closed = true;
         self.db.last_unclosed_txn = None;
 
