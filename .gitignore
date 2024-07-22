@@ -2,4 +2,5 @@
 tarpaulin-report.html
 
 test.db
+test.dbuff
 test.wal

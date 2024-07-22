@@ -1,9 +1,17 @@
 use dbest::{Db, Setting};
 use std::path::Path;
 
+use std::sync::Once;
+static INIT: Once = Once::new();
+fn setup() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
+
 #[test]
 fn test_db_happy_path() {
-    env_logger::init();
+    setup();
 
     _ = std::fs::remove_file("test.db");
     _ = std::fs::remove_file("test.wal");
@@ -25,7 +33,7 @@ fn test_db_happy_path() {
 
 #[test]
 fn test_db_rollback() {
-    env_logger::init();
+    setup();
 
     _ = std::fs::remove_file("test.db");
     _ = std::fs::remove_file("test.wal");
