@@ -1228,11 +1228,11 @@ impl<'a> InteriorPageRead<'a> {
 }
 
 fn get_interior_cell(buff: &[u8], index: usize) -> InteriorCell<'_> {
-    let cell_offset =
-        PAGE_HEADER_SIZE + INTERIOR_PAGE_HEADER_SIZE + INTERIOR_PAGE_CELL_SIZE * index;
+    let cell_offset = INTERIOR_PAGE_HEADER_SIZE + INTERIOR_PAGE_CELL_SIZE * index;
     let cell = &buff[cell_offset..cell_offset + INTERIOR_PAGE_CELL_SIZE];
     let offset = u16::from_be_bytes(cell[20..22].try_into().unwrap()) as usize;
     let size = u16::from_be_bytes(cell[22..24].try_into().unwrap()) as usize;
+    let offset = offset - PAGE_HEADER_SIZE;
     let raw = &buff[offset..offset + size];
     InteriorCell { cell, raw }
 }
@@ -1940,8 +1940,8 @@ mod tests {
                 .insert_content(
                     LogContext::Runtime(&wal),
                     i,
-                    &mut Bytes::new(format!("{i:028}").as_bytes()),
-                    28,
+                    &mut Bytes::new(format!("{i:026}").as_bytes()),
+                    26,
                     pgid_ptr,
                     None,
                 )
@@ -1949,38 +1949,38 @@ mod tests {
             assert!(ok);
         }
         assert_eq!(4, page1.count());
-        assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
-        assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
-        assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
-        assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
+        assert_eq!(b"00000000000000000000000000", page1.get(0).raw());
+        assert_eq!(b"00000000000000000000000001", page1.get(1).raw());
+        assert_eq!(b"00000000000000000000000002", page1.get(2).raw());
+        assert_eq!(b"00000000000000000000000003", page1.get(3).raw());
 
         page1.delete(LogContext::Runtime(&wal), 2).unwrap();
         assert_eq!(3, page1.count());
-        assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
-        assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
-        assert_eq!(b"0000000000000000000000000003", page1.get(2).raw());
+        assert_eq!(b"00000000000000000000000000", page1.get(0).raw());
+        assert_eq!(b"00000000000000000000000001", page1.get(1).raw());
+        assert_eq!(b"00000000000000000000000003", page1.get(2).raw());
 
         page1
             .insert_content(
                 LogContext::Runtime(&wal),
                 2,
-                &mut Bytes::new(b"0000000000000000000000000002"),
-                28,
+                &mut Bytes::new(b"00000000000000000000000002"),
+                26,
                 pgid_ptr,
                 None,
             )
             .unwrap();
         assert_eq!(4, page1.count());
-        assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
-        assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
-        assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
-        assert_eq!(b"0000000000000000000000000003", page1.get(3).raw());
+        assert_eq!(b"00000000000000000000000000", page1.get(0).raw());
+        assert_eq!(b"00000000000000000000000001", page1.get(1).raw());
+        assert_eq!(b"00000000000000000000000002", page1.get(2).raw());
+        assert_eq!(b"00000000000000000000000003", page1.get(3).raw());
 
         page1.delete(LogContext::Runtime(&wal), 3).unwrap();
         assert_eq!(3, page1.count());
-        assert_eq!(b"0000000000000000000000000000", page1.get(0).raw());
-        assert_eq!(b"0000000000000000000000000001", page1.get(1).raw());
-        assert_eq!(b"0000000000000000000000000002", page1.get(2).raw());
+        assert_eq!(b"00000000000000000000000000", page1.get(0).raw());
+        assert_eq!(b"00000000000000000000000001", page1.get(1).raw());
+        assert_eq!(b"00000000000000000000000002", page1.get(2).raw());
 
         drop(page1);
 
