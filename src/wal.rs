@@ -12,11 +12,7 @@ pub(crate) struct TxId(NonZeroU64);
 
 impl TxId {
     pub(crate) fn new(id: u64) -> Option<Self> {
-        if id >= 1 << 56 {
-            None
-        } else {
-            NonZeroU64::new(id).map(Self)
-        }
+        NonZeroU64::new(id).map(Self)
     }
 
     pub(crate) fn get(self) -> u64 {
@@ -260,7 +256,9 @@ impl<'a> WalBackwardIterator<'a> {
         }
 
         let buff = &self.buffer[self.start_offset..self.end_offset];
-        let size = u64::from_be_bytes(buff[buff.len() - 8..].try_into().unwrap());
+        let rec_size =
+            u16::from_be_bytes(buff[buff.len() - 16..buff.len() - 14].try_into().unwrap());
+        let size = WalEntry::size_by_record_size(rec_size as usize);
 
         if self.end_offset < size as usize {
             self.reset();
@@ -269,14 +267,14 @@ impl<'a> WalBackwardIterator<'a> {
         if self.buffer.len() < size as usize {
             let s = size as usize - self.buffer.len();
             let mut f = self.wal.f.lock();
-            f.seek(SeekFrom::Start(offset - size))?;
+            f.seek(SeekFrom::Start(offset - size as u64))?;
             f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
             self.start_offset -= s;
         }
 
         match WalEntry::decode(&self.buffer[self.end_offset - size as usize..self.end_offset]) {
             WalDecodeResult::Ok(entry) => {
-                self.lsn = Lsn::new(self.lsn.get() - size).unwrap();
+                self.lsn = Lsn::new(self.lsn.get() - size as u64).unwrap();
                 self.end_offset -= size as usize;
                 Ok(Some((self.lsn, entry)))
             }
@@ -882,71 +880,72 @@ impl<'a> WalEntry<'a> {
     }
 
     fn size_by_record_size(record_size: usize) -> usize {
-        // (8 bytes for txid+kind) +
+        // (8 bytes for txid) +
+        // (8 bytes for clr)
         // (2 bytes for entry size) +
+        // (1 bytes for kind)
         // (entry) +
-        // (padding) +
+        // (padding 8) +
+        // (2 bytes for entry size for backward iteration) +
+        // (padding 8) +
         // (8 bytes checksum) +
-        // (8 bytes for the whole record size. this is for backward iteration)
-        8 + 8 + pad8(2 + record_size) + 8 + 8
+        // 8 + 8 + 2 + 1 + pad8(2 + record_size) + 8 + 8
+        pad8(8 + 8 + 2 + 1 + record_size) + 2 + 6 + 8
     }
 
     fn encode(&self, buff: &mut [u8]) {
         buff[0..8].copy_from_slice(&self.txid.get().to_be_bytes());
-        buff[0] = self.record.kind();
-
         buff[8..16].copy_from_slice(&self.clr.to_be_bytes());
 
         let record_size = self.record.size();
-        assert!(record_size < 1 << 16);
-
+        assert!(
+            record_size < 1 << 16,
+            "record size should be less than a page"
+        );
         buff[16..18].copy_from_slice(&(record_size as u16).to_be_bytes());
-        self.record.encode(&mut buff[18..18 + record_size]);
+        buff[18] = self.record.kind();
 
-        let next = pad8(18 + record_size);
-        buff[18 + record_size..next].fill(0);
+        self.record.encode(&mut buff[19..19 + record_size]);
 
+        let next = pad8(19 + record_size);
+        buff[19 + record_size..next].fill(0);
+
+        buff[next..next + 2].copy_from_slice(&(record_size as u16).to_be_bytes());
+        buff[next + 2..next + 8].fill(0);
+
+        let next = next + 8;
         let checksum = crc64::crc64(0, &buff[0..next]);
         buff[next..next + 8].copy_from_slice(&checksum.to_be_bytes());
-
-        // TODO: the size is actually only 2 byte, maybe we can optimize
-        // the space usage
-        // TODO(important): also, it's better to put the size before the checksum to make
-        // the size's itegrity is not violated.
-        let next = next + 8;
-        let size = self.size();
-        assert!(size < 1 << 16);
-        assert_eq!(size, next + 8);
-        buff[next..next + 8].copy_from_slice(&(size as u64).to_be_bytes());
     }
 
     pub(crate) fn decode(buff: &[u8]) -> WalDecodeResult<'_> {
-        if buff.len() < 32 {
+        if buff.len() < 19 {
             return WalDecodeResult::NeedMoreBytes;
         }
 
-        let kind = buff[0];
-
-        let mut txid_buff: [u8; 8] = buff[0..8].try_into().unwrap();
-        txid_buff[0] = 0;
-        let Some(txid) = TxId::from_be_bytes(txid_buff) else {
+        let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
             return WalDecodeResult::Err(anyhow!("wal record is corrupted"));
         };
-
         let clr = Lsn::from_be_bytes(buff[8..16].try_into().unwrap());
-
         let record_size = u16::from_be_bytes(buff[16..18].try_into().unwrap()) as usize;
+        let kind = buff[18];
+
         let total_length = Self::size_by_record_size(record_size);
         if buff.len() < total_length {
             return WalDecodeResult::NeedMoreBytes;
         }
+        assert!(total_length < 1 << 16);
 
-        let record = match WalRecord::decode(&buff[18..18 + record_size], kind) {
+        let record = match WalRecord::decode(&buff[19..19 + record_size], kind) {
             Ok(record) => record,
             Err(e) => return WalDecodeResult::Err(e),
         };
-        let next = pad8(18 + record_size);
+        let next = pad8(19 + record_size);
 
+        let record_size_2 = u16::from_be_bytes(buff[next..next + 2].try_into().unwrap());
+        assert_eq!(record_size, record_size_2 as usize);
+
+        let next = pad8(next + 2);
         let calculated_checksum = crc64::crc64(0, &buff[0..next]);
         let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
         if calculated_checksum != stored_checksum {
@@ -975,24 +974,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_pad8() {
+        for i in 0..10000 {
+            let result = pad8(i);
+            assert!(result % 8 == 0);
+            assert!(result >= i);
+            assert!(result - i < 8);
+        }
+    }
+
+    #[test]
     fn test_txid() {
         assert_eq!(None, TxId::new(0), "txid cannot be zero");
         assert_eq!(1, TxId::new(1).unwrap().get());
         assert_eq!(10, TxId::new(10).unwrap().get());
         assert_eq!(10, TxId::new(10).unwrap().get());
-        let max_txid = TxId::new(72057594037927935).unwrap();
-        assert_eq!(72057594037927935, max_txid.get());
-        assert_eq!(
-            0,
-            max_txid.get().to_be_bytes()[0],
-            "first MSB of txid should be zero"
-        );
-
-        assert_eq!(
-            None,
-            TxId::new(72057594037927936),
-            "txid cannot be 2^56 or graeter"
-        );
     }
 
     #[test]
@@ -1006,13 +1002,15 @@ mod tests {
         entry.encode(&mut buff);
         assert_eq!(
             &[
-                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // kind=1, txid=1
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // empty CLR
-                0x00, 0x00, // entry size
-                // the entry is zero bytes
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // txid=1
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // clr=None
+                0x00, 0x00, // rec_size=0
+                0x01, // kind=1
+                // entry is zero bytes
+                0x00, 0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
+                0x00, 0x00, // rec_size=0
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
-                0x7e, 0xe5, 0x3d, 0x16, 0x71, 0xf1, 0x54, 0x89, // checksum
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, // size
+                0x99, 0x09, 0x9b, 0x03, 0x3a, 0xf2, 0xa4, 0x0e, // checksum
             ],
             buff.as_slice()
         );
