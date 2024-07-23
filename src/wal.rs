@@ -5,7 +5,6 @@ use parking_lot::{Mutex, RwLock};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
-use std::os::unix::fs::MetadataExt;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TxId(NonZeroU64);
@@ -297,7 +296,7 @@ impl<'a> WalBackwardIterator<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WalRecord<'a> {
     Begin,
     Commit,
@@ -464,7 +463,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::InteriorDelete { old_raw, .. } => 32 + old_raw.len(),
             WalRecord::InteriorUndoDelete { .. } => 10,
 
-            WalRecord::LeafReset { .. } => 8,
+            WalRecord::LeafReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::LeafUndoReset { .. } => 8,
             WalRecord::LeafInit { .. } => 8,
             WalRecord::LeafInsert { raw, .. } => 28 + raw.len(),
@@ -547,6 +546,7 @@ impl<'a> WalRecord<'a> {
                 buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[16..24].copy_from_slice(&old_ptr.to_be_bytes());
                 buff[24..32].copy_from_slice(&old_overflow.to_be_bytes());
+                buff[32..].copy_from_slice(old_raw);
             }
             WalRecord::InteriorUndoDelete { pgid, index } => {
                 assert!(*index <= u16::MAX as usize);
@@ -715,7 +715,7 @@ impl<'a> WalRecord<'a> {
                 Ok(Self::InteriorInsert {
                     pgid,
                     index: index as usize,
-                    raw: &buff[24..24 + raw_size as usize],
+                    raw: &buff[32..32 + raw_size as usize],
                     ptr,
                     key_size: key_size as usize,
                     overflow,
@@ -735,7 +735,7 @@ impl<'a> WalRecord<'a> {
                 Ok(Self::InteriorDelete {
                     pgid,
                     index: index as usize,
-                    old_raw: &buff[24..24 + raw_size as usize],
+                    old_raw: &buff[32..32 + raw_size as usize],
                     old_ptr,
                     old_overflow,
                     old_key_size: key_size as usize,
@@ -758,7 +758,7 @@ impl<'a> WalRecord<'a> {
                 };
                 let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
                 let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                Ok(Self::InteriorReset {
+                Ok(Self::LeafReset {
                     pgid,
                     page_version,
                     payload: &buff[12..12 + size as usize],
@@ -806,7 +806,7 @@ impl<'a> WalRecord<'a> {
                 Ok(Self::LeafDelete {
                     pgid,
                     index: index as usize,
-                    old_raw: &buff[24..24 + raw_size as usize],
+                    old_raw: &buff[28..28 + raw_size as usize],
                     old_overflow,
                     old_key_size: old_key_size as usize,
                     old_val_size: old_key_size as usize,
@@ -863,7 +863,7 @@ impl<'a> WalRecord<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WalEntry<'a> {
     pub(crate) txid: TxId,
     pub(crate) clr: Option<Lsn>,
@@ -911,7 +911,7 @@ impl<'a> WalEntry<'a> {
         buff[19 + record_size..next].fill(0);
 
         buff[next..next + 2].copy_from_slice(&(record_size as u16).to_be_bytes());
-        buff[next + 2..next + 8].fill(0);
+        buff[next + 2..next + 8].copy_from_slice(b"abcxyz");
 
         let next = next + 8;
         let checksum = crc64::crc64(0, &buff[0..next]);
@@ -945,6 +945,9 @@ impl<'a> WalEntry<'a> {
         let record_size_2 = u16::from_be_bytes(buff[next..next + 2].try_into().unwrap());
         assert_eq!(record_size, record_size_2 as usize);
 
+        let magic_bytes = &buff[next + 2..next + 8];
+        assert_eq!(magic_bytes, b"abcxyz");
+
         let next = pad8(next + 2);
         let calculated_checksum = crc64::crc64(0, &buff[0..next]);
         let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
@@ -963,6 +966,16 @@ pub(crate) enum WalDecodeResult<'a> {
     NeedMoreBytes,
     Incomplete,
     Err(anyhow::Error),
+}
+
+impl<'a> WalDecodeResult<'a> {
+    pub(crate) fn unwrap(self) -> WalEntry<'a> {
+        if let Self::Ok(entry) = self {
+            entry
+        } else {
+            panic!("calling unwrap on non-ok WalDecodeResult");
+        }
+    }
 }
 
 fn pad8(size: usize) -> usize {
@@ -1009,11 +1022,291 @@ mod tests {
                 // entry is zero bytes
                 0x00, 0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
                 0x00, 0x00, // rec_size=0
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
-                0x99, 0x09, 0x9b, 0x03, 0x3a, 0xf2, 0xa4, 0x0e, // checksum
+                0x61, 0x62, 0x63, 0x78, 0x79, 0x7a, // pad to 8 byutes
+                0x5b, 0xe0, 0x06, 0xdf, 0x57, 0x10, 0x38, 0x35 // checksum
             ],
             buff.as_slice()
         );
+
+        let decoded_entry = WalEntry::decode(&buff).unwrap();
+        assert_eq!(entry, decoded_entry);
+    }
+
+    #[test]
+    fn test_encode_decode() {
+        let testcases = vec![
+            WalEntry {
+                txid: TxId::new(1).unwrap(),
+                clr: None,
+                record: WalRecord::Begin,
+            },
+            WalEntry {
+                txid: TxId::new(2).unwrap(),
+                clr: Lsn::new(1),
+                record: WalRecord::Commit,
+            },
+            WalEntry {
+                txid: TxId::new(2).unwrap(),
+                clr: Lsn::new(121),
+                record: WalRecord::Rollback,
+            },
+            WalEntry {
+                txid: TxId::new(2).unwrap(),
+                clr: None,
+                record: WalRecord::End,
+            },
+            WalEntry {
+                txid: TxId::new(2).unwrap(),
+                clr: None,
+                record: WalRecord::HeaderSet {
+                    root: None,
+                    old_root: PageId::new(1),
+                    freelist: PageId::new(101),
+                    old_freelist: None,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::HeaderSet {
+                    root: PageId::new(23),
+                    old_root: PageId::new(1),
+                    freelist: PageId::new(101),
+                    old_freelist: PageId::new(33),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorReset {
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 12,
+                    payload: b"this_is_just_a_dummy_bytes",
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorUndoReset {
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorInit {
+                    pgid: PageId::new(23).unwrap(),
+                    last: PageId::new(24).unwrap(),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorInsert {
+                    pgid: PageId::new(100).unwrap(),
+                    index: 0,
+                    raw: b"content",
+                    ptr: PageId::new(101).unwrap(),
+                    key_size: 2,
+                    overflow: None,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorInsert {
+                    pgid: PageId::new(100).unwrap(),
+                    index: u16::MAX as usize,
+                    raw: b"key00000",
+                    ptr: PageId::new(101).unwrap(),
+                    key_size: 123456789,
+                    overflow: PageId::new(202),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorDelete {
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    old_raw: b"the_old_raw_content",
+                    old_ptr: PageId::new(10).unwrap(),
+                    old_overflow: None,
+                    old_key_size: 19,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorDelete {
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    old_raw: b"the_old_raw_content",
+                    old_ptr: PageId::new(10).unwrap(),
+                    old_overflow: PageId::new(1),
+                    old_key_size: 1000,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::InteriorUndoDelete {
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafReset {
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 12,
+                    payload: b"this_is_just_a_dummy_bytes",
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafUndoReset {
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafInit {
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafInsert {
+                    pgid: PageId::new(100).unwrap(),
+                    index: 0,
+                    raw: b"key00000val00000",
+                    overflow: None,
+                    key_size: 8,
+                    value_size: 8,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafInsert {
+                    pgid: PageId::new(100).unwrap(),
+                    index: 23,
+                    raw: b"key0",
+                    overflow: PageId::new(101),
+                    key_size: 8,
+                    value_size: 8,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafDelete {
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                    old_raw: b"key0",
+                    old_overflow: PageId::new(101),
+                    old_key_size: 8,
+                    old_val_size: 8,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::LeafUndoDelete {
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::CheckpointBegin,
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::CheckpointEnd {
+                    dirty_pages: vec![],
+                    active_tx: TxState::None,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::CheckpointEnd {
+                    dirty_pages: vec![
+                        DirtyPage {
+                            id: PageId::new(22).unwrap(),
+                            rec_lsn: Lsn::new(10).unwrap(),
+                        },
+                        DirtyPage {
+                            id: PageId::new(23).unwrap(),
+                            rec_lsn: Lsn::new(12).unwrap(),
+                        },
+                    ],
+                    active_tx: TxState::Active(TxId::new(12).unwrap()),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::CheckpointEnd {
+                    dirty_pages: vec![
+                        DirtyPage {
+                            id: PageId::new(22).unwrap(),
+                            rec_lsn: Lsn::new(10).unwrap(),
+                        },
+                        DirtyPage {
+                            id: PageId::new(23).unwrap(),
+                            rec_lsn: Lsn::new(12).unwrap(),
+                        },
+                    ],
+                    active_tx: TxState::Committing(TxId::new(12).unwrap()),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::CheckpointEnd {
+                    dirty_pages: vec![
+                        DirtyPage {
+                            id: PageId::new(22).unwrap(),
+                            rec_lsn: Lsn::new(10).unwrap(),
+                        },
+                        DirtyPage {
+                            id: PageId::new(23).unwrap(),
+                            rec_lsn: Lsn::new(12).unwrap(),
+                        },
+                    ],
+                    active_tx: TxState::Aborting(TxId::new(12).unwrap()),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::CheckpointEnd {
+                    dirty_pages: (0u64..10000)
+                        .map(|i| DirtyPage {
+                            id: PageId::new(1 + i).unwrap(),
+                            rec_lsn: Lsn::new(10 + i).unwrap(),
+                        })
+                        .collect(),
+                    active_tx: TxState::Aborting(TxId::new(12).unwrap()),
+                },
+            },
+        ];
+
+        for testcase in testcases {
+            let mut buff = vec![0u8; testcase.size()];
+            testcase.encode(&mut buff);
+            let decoded_entry = WalEntry::decode(&buff).unwrap();
+            assert_eq!(testcase, decoded_entry);
+        }
     }
 
     #[test]
