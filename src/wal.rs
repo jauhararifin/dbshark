@@ -6,6 +6,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 
+// TODO(important): the checkpoint-end record might have a huge number
+// of dirty pages and might not fit into a single page size. We can either
+// - increase the limit of wal entry size into u64
+// - or, split the checkpoint-end record into multiple entry
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TxId(NonZeroU64);
 
@@ -38,8 +43,8 @@ impl TxIdExt for TxId {
 }
 impl TxIdExt for Option<TxId> {
     fn to_be_bytes(&self) -> [u8; 8] {
-        if let Some(pgid) = self {
-            pgid.to_be_bytes()
+        if let Some(txid) = self {
+            txid.to_be_bytes()
         } else {
             0u64.to_be_bytes()
         }
