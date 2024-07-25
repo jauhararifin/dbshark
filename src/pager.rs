@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub(crate) const MINIMUM_PAGE_SIZE: usize = 256;
+
 // TODO: idea for double buffering
 // Manage a separate buffer of N pages (maybe we can set N to be 10 and 20).
 // This buffer lives on memory. Before flushing a page, put it to this buffer first.
@@ -204,9 +206,10 @@ impl Pager {
             ));
         }
 
-        if page_size < 256 {
+        if page_size < MINIMUM_PAGE_SIZE {
             return Err(anyhow!(
-                "page size must be at least 256 bytes, but got {}",
+                "page size must be at least {} bytes, but got {}",
+                MINIMUM_PAGE_SIZE,
                 page_size
             ));
         }

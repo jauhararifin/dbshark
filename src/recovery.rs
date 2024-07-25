@@ -201,7 +201,7 @@ fn analyze(
     let mut next_lsn = wal_header.checkpoint;
     let mut tx_state = TxState::None;
     let mut checkpoint_begin_found = false;
-    let mut checkpoint_end_found = false;
+    let mut checkpoint_end_completed = false;
     let mut last_txn: Option<TxId> = None;
     let mut dirty_pages = HashMap::default();
 
@@ -245,19 +245,23 @@ fn analyze(
                 active_tx,
                 dirty_pages: dp,
             } => {
-                if checkpoint_end_found {
+                if checkpoint_end_completed {
                     continue;
                 }
-                checkpoint_end_found = true;
 
-                match active_tx {
-                    TxState::None => (),
-                    TxState::Committing(txid) | TxState::Active(txid) | TxState::Aborting(txid) => {
-                        if let Some(last_txid) = last_txn {
-                            assert!(txid.get() <= last_txid.get());
-                        } else {
-                            assert_eq!(TxState::None, tx_state);
-                            tx_state = active_tx;
+                if let Some(active_tx) = active_tx {
+                    checkpoint_end_completed = true;
+                    match active_tx {
+                        TxState::None => (),
+                        TxState::Committing(txid)
+                        | TxState::Active(txid)
+                        | TxState::Aborting(txid) => {
+                            if let Some(last_txid) = last_txn {
+                                assert!(txid.get() <= last_txid.get());
+                            } else {
+                                assert_eq!(TxState::None, tx_state);
+                                tx_state = active_tx;
+                            }
                         }
                     }
                 }
@@ -283,7 +287,7 @@ fn analyze(
 
     log::debug!("aries analysis finished next_lsn={next_lsn:?} dirty_pages={dirty_pages:?} tx_state={tx_state:?}");
 
-    if checkpoint_begin_found && !checkpoint_end_found {
+    if checkpoint_begin_found && !checkpoint_end_completed {
         return Err(anyhow!(
             "wal file is corrupted, checkpoint begin found but checkpoint end not found"
         ));
