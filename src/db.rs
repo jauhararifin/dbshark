@@ -15,14 +15,14 @@ use std::{fs::File, path::Path};
 
 pub struct Db {
     internal: RwLock<DbInternal>,
+    pager: Arc<Pager>,
+    wal: Arc<Wal>,
 
     background_chan: Sender<()>,
     background_thread: JoinHandle<()>,
 }
 
 struct DbInternal {
-    pager: Arc<Pager>,
-    wal: Arc<Wal>,
     next_txid: TxId,
 
     // TODO: maybe these two information should be managed by Pager
@@ -111,9 +111,9 @@ impl Db {
         // TODO: figure out how to roll the WAL file after it's getting bigger.
 
         Ok(Self {
+            pager,
+            wal,
             internal: RwLock::new(DbInternal {
-                pager,
-                wal,
                 next_txid,
                 root: None,
                 freelist: None,
@@ -172,14 +172,26 @@ impl Db {
 
         if let Some(txid) = internal.last_unclosed_txn.take() {
             log::debug!("previous transaction {txid:?} is not closed yet");
-            internal.rollback_txn(txid)?;
+            let internal: &mut DbInternal = &mut internal;
+            rollback_txn(
+                &self.wal,
+                &self.pager,
+                &mut internal.root,
+                &mut internal.freelist,
+                txid,
+            )?;
         }
 
         let txid = internal.next_txid;
         internal.next_txid = internal.next_txid.next();
         internal.last_unclosed_txn = Some(txid);
 
-        Tx::new(txid, internal)
+        Tx::new(txid, self.wal.clone(), self.pager.clone(), internal)
+    }
+
+    pub fn force_flush(&self) -> anyhow::Result<()> {
+        self.pager.flush_dirty_pages(&self.wal)?;
+        Ok(())
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {
@@ -188,7 +200,12 @@ impl Db {
         if self.background_thread.join().is_err() {
             return Err(anyhow!("cannot join background thread"));
         }
-        let pager = Arc::into_inner(internal.pager).expect(
+
+        // Since we own self, it means there are no active transaction since active transaction
+        // borrows the db. And there are no ongoing flush and checkpoint since they also borrow
+        // the db. The background thread to periodically flush and perform checkpoint is also
+        // finished due to the join above. So, there is only one reference to the pager.
+        let pager = Arc::into_inner(self.pager).expect(
             "there should only be one reference to pager after the background thread is returned",
         );
         pager.shutdown()?;
@@ -197,21 +214,18 @@ impl Db {
     }
 }
 
-impl DbInternal {
-    fn rollback_txn(&mut self, txid: TxId) -> anyhow::Result<()> {
-        let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
-        log::debug!("rollback log record txid={:?} lsn={lsn:?}", txid);
-        undo_txn(
-            &self.pager,
-            &self.wal,
-            txid,
-            lsn,
-            &mut self.root,
-            &mut self.freelist,
-        )?;
-        self.wal.append(txid, None, WalRecord::End)?;
-        Ok(())
-    }
+fn rollback_txn(
+    wal: &Wal,
+    pager: &Pager,
+    root: &mut Option<PageId>,
+    freelist: &mut Option<PageId>,
+    txid: TxId,
+) -> anyhow::Result<()> {
+    let lsn = wal.append(txid, None, WalRecord::Rollback)?;
+    log::debug!("rollback log record txid={:?} lsn={lsn:?}", txid);
+    undo_txn(pager, wal, txid, lsn, root, freelist)?;
+    wal.append(txid, None, WalRecord::End)?;
+    Ok(())
 }
 
 const DB_HEADER_SIZE: usize = 40;
@@ -260,6 +274,8 @@ impl Header {
 
 pub struct Tx<'db> {
     id: TxId,
+    wal: Arc<Wal>,
+    pager: Arc<Pager>,
     db: RwLockWriteGuard<'db, DbInternal>,
 
     closed: bool,
@@ -274,30 +290,31 @@ impl<'db> Drop for Tx<'db> {
 }
 
 impl<'db> Tx<'db> {
-    fn new(id: TxId, db: RwLockWriteGuard<'db, DbInternal>) -> anyhow::Result<Self> {
+    fn new(
+        id: TxId,
+        wal: Arc<Wal>,
+        pager: Arc<Pager>,
+        db: RwLockWriteGuard<'db, DbInternal>,
+    ) -> anyhow::Result<Self> {
         let tx = Self {
             id,
+            wal,
+            pager,
             db,
             closed: false,
         };
-        tx.db.wal.append(tx.id, None, WalRecord::Begin)?;
+        tx.wal.append(tx.id, None, WalRecord::Begin)?;
         Ok(tx)
     }
 
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
-        let mut btree = BTree::new(
-            self.id,
-            &self.db.pager,
-            &self.db.wal,
-            root_pgid,
-            self.db.freelist,
-        );
+        let mut btree = BTree::new(self.id, &self.pager, &self.wal, root_pgid, self.db.freelist);
         let mut result = btree.seek(name.as_bytes())?;
         let bucket_pgid = if !result.found {
             drop(result);
-            let bucket_root = self.db.pager.alloc(self.id)?;
+            let bucket_root = self.pager.alloc(self.id)?;
             let bucket_root_id = bucket_root.id();
             drop(bucket_root);
 
@@ -320,8 +337,8 @@ impl<'db> Tx<'db> {
         Ok(Bucket {
             btree: BTree::new(
                 self.id,
-                &self.db.pager,
-                &self.db.wal,
+                &self.pager,
+                &self.wal,
                 bucket_pgid,
                 self.db.freelist,
             ),
@@ -332,9 +349,9 @@ impl<'db> Tx<'db> {
         if let Some(pgid) = self.db.root {
             Ok(pgid)
         } else {
-            let page = self.db.pager.alloc(self.id)?;
+            let page = self.pager.alloc(self.id)?;
             let pgid = page.id();
-            self.db.wal.append(
+            self.wal.append(
                 self.id,
                 None,
                 WalRecord::HeaderSet {
@@ -351,9 +368,9 @@ impl<'db> Tx<'db> {
     }
 
     pub fn commit(mut self) -> anyhow::Result<()> {
-        let commit_lsn = self.db.wal.append(self.id, None, WalRecord::Commit)?;
-        self.db.wal.append(self.id, None, WalRecord::End)?;
-        self.db.wal.sync(commit_lsn)?;
+        let commit_lsn = self.wal.append(self.id, None, WalRecord::Commit)?;
+        self.wal.append(self.id, None, WalRecord::End)?;
+        self.wal.sync(commit_lsn)?;
 
         self.closed = true;
         self.db.last_unclosed_txn = None;
@@ -363,7 +380,14 @@ impl<'db> Tx<'db> {
     pub fn rollback(mut self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
-        self.db.rollback_txn(self.id)?;
+        let db: &mut DbInternal = &mut self.db;
+        rollback_txn(
+            &self.wal,
+            &self.pager,
+            &mut db.root,
+            &mut db.freelist,
+            self.id,
+        )?;
         self.closed = true;
         self.db.last_unclosed_txn = None;
 

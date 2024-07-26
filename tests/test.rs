@@ -14,6 +14,7 @@ fn test_db_happy_path() {
     setup();
 
     _ = std::fs::remove_file("test.db");
+    _ = std::fs::remove_file("test.dbuff");
     _ = std::fs::remove_file("test.wal");
 
     let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
@@ -21,6 +22,7 @@ fn test_db_happy_path() {
 
     let mut bucket = tx.bucket("table1").unwrap();
     bucket.put(b"key00001", b"val00001").unwrap();
+    db.force_flush().unwrap();
     let result = bucket.get(b"key00001").unwrap();
     assert_eq!(Some(b"val00001".to_vec()), result);
 
@@ -36,6 +38,7 @@ fn test_db_rollback() {
     setup();
 
     _ = std::fs::remove_file("test.db");
+    _ = std::fs::remove_file("test.dbuff");
     _ = std::fs::remove_file("test.wal");
 
     let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
