@@ -1,22 +1,27 @@
 use crate::btree::BTree;
 use crate::pager::{PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
-use crate::wal::{self, TxId, TxIdExt, Wal, WalRecord};
+use crate::wal::{TxId, TxIdExt, Wal, WalRecord};
 use anyhow::anyhow;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::ops::DerefMut;
 use std::os::unix::fs::MetadataExt;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 use std::{fs::File, path::Path};
 
 pub struct Db {
     internal: RwLock<DbInternal>,
+
+    background_chan: Sender<()>,
+    background_thread: JoinHandle<()>,
 }
 
 struct DbInternal {
-    pager: Pager,
+    pager: Arc<Pager>,
     wal: Arc<Wal>,
     next_txid: TxId,
 
@@ -46,7 +51,7 @@ impl Db {
             .open(path)?;
         let header = Self::load_db_header(&mut db_file)?;
 
-        let mut double_buff_file = OpenOptions::new()
+        let double_buff_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -57,7 +62,7 @@ impl Db {
             return Err(anyhow!("unsupported database version"));
         }
         let page_size = header.page_size as usize;
-        let pager = Pager::new(db_file, double_buff_file, page_size, 1000)?;
+        let pager = Arc::new(Pager::new(db_file, double_buff_file, page_size, 1000)?);
 
         let wal_file = OpenOptions::new()
             .read(true)
@@ -67,6 +72,32 @@ impl Db {
             .open(wal_path)?;
         let wal = recover(wal_file, &pager, page_size)?;
         let wal = Arc::new(wal);
+
+        let (sender, receiver) = channel();
+        let background_thread = {
+            let wal = wal.clone();
+            let pager = pager.clone();
+            std::thread::spawn(move || loop {
+                let Err(err) = receiver.recv_timeout(Duration::from_secs(60 * 60)) else {
+                    break;
+                };
+                if err != std::sync::mpsc::RecvTimeoutError::Timeout {
+                    break;
+                }
+                if let Err(err) = pager.flush_dirty_pages(&wal) {
+                    // TODO: handle the error.
+                    // Maybe we can send the error to the DB, so that any next operation in the DB
+                    // will return an error. If we can't flush the dirty pages, we might not be
+                    // able to do anything anyway.
+                }
+                if let Err(err) = pager.checkpoint(&wal) {
+                    // TODO: handle the error
+                    // Maybe we can send the error to the DB, so that any next operation in the DB
+                    // will return an error. If we can't flush the dirty pages, we might not be
+                    // able to do anything anyway.
+                }
+            })
+        };
 
         let next_txid = if let Some(txid) = header.last_txid {
             txid.next()
@@ -88,6 +119,9 @@ impl Db {
                 freelist: None,
                 last_unclosed_txn: None,
             }),
+
+            background_chan: sender,
+            background_thread,
         })
     }
 
@@ -146,6 +180,20 @@ impl Db {
         internal.last_unclosed_txn = Some(txid);
 
         Tx::new(txid, internal)
+    }
+
+    pub fn shutdown(self) -> anyhow::Result<()> {
+        let internal = self.internal.into_inner();
+        self.background_chan.send(())?;
+        if self.background_thread.join().is_err() {
+            return Err(anyhow!("cannot join background thread"));
+        }
+        let pager = Arc::into_inner(internal.pager).expect(
+            "there should only be one reference to pager after the background thread is returned",
+        );
+        pager.shutdown()?;
+
+        Ok(())
     }
 }
 

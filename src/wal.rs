@@ -185,6 +185,7 @@ impl Wal {
     }
 
     fn flush(f: &mut File, internal: &mut WalInternal) -> anyhow::Result<()> {
+        // TODO(important): I think this is wrong, we should seek to the last log
         f.seek(SeekFrom::End(0))?;
         f.write_all(&internal.buffer[..internal.offset_end])?;
         f.sync_all()?;

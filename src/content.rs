@@ -74,19 +74,19 @@ mod tests {
     #[test]
     fn test_bytes() {
         let mut a = Bytes::new(b"abc");
-        let mut b = Bytes::new(b"abc");
+        let b = Bytes::new(b"abc");
         assert_eq!(a.compare(b).unwrap(), Ordering::Equal);
 
         let mut a = Bytes::new(b"abc");
-        let mut b = Bytes::new(b"abd");
+        let b = Bytes::new(b"abd");
         assert_eq!(a.compare(b).unwrap(), Ordering::Less);
 
         let mut a = Bytes::new(b"abc");
-        let mut b = Bytes::new(b"ab");
+        let b = Bytes::new(b"ab");
         assert_eq!(a.compare(b).unwrap(), Ordering::Greater);
 
         let mut a = Bytes::new(b"ab");
-        let mut b = Bytes::new(b"abc");
+        let b = Bytes::new(b"abc");
         assert_eq!(a.compare(b).unwrap(), Ordering::Less);
     }
 }

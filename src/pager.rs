@@ -1,5 +1,5 @@
-use crate::content::{Bytes, Content};
-use crate::wal::{self, Lsn, LsnExt, TxId, Wal, WalRecord};
+use crate::content::Content;
+use crate::wal::{Lsn, LsnExt, TxId, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet};
@@ -7,12 +7,6 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt;
-use std::sync::atomic::{self, AtomicBool};
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 pub(crate) const MINIMUM_PAGE_SIZE: usize = 256;
 
@@ -121,12 +115,15 @@ impl Drop for Pager {
     fn drop(&mut self) {
         let internal = self.internal.write();
         unsafe {
-            let v = Vec::from_raw_parts(
+            drop(Vec::from_raw_parts(
                 internal.buffer,
                 self.page_size * self.n,
                 self.page_size * self.n,
-            );
-            let v = Box::from_raw(std::slice::from_raw_parts_mut(internal.metas, self.n));
+            ));
+            drop(Box::from_raw(std::slice::from_raw_parts_mut(
+                internal.metas,
+                self.n,
+            )));
         }
     }
 }
@@ -155,7 +152,7 @@ impl Pager {
 
         let dummy_pgid = PageId(NonZeroU64::new(1).unwrap());
         let metas = (0..n)
-            .map(|i| {
+            .map(|_| {
                 RwLock::new(PageMeta {
                     id: dummy_pgid,
                     kind: PageKind::None,
@@ -236,7 +233,7 @@ impl Pager {
         double_buff_file.read_exact(&mut buff)?;
 
         for i in 0..page_count {
-            let mut buff = &mut buff[i * page_size..(i + 1) * page_size];
+            let buff = &mut buff[i * page_size..(i + 1) * page_size];
             let dummy_pgid = PageId::new(1).unwrap();
             let mut meta = PageMeta {
                 id: dummy_pgid,
@@ -264,6 +261,9 @@ impl Pager {
     // doesn't need to mutate the buffer pool if the page is already in the pool.
     // We only need to fallback to write lock when the a page need to be evicted or
     // fetched. We can use atomic integer to increase and decrease reference count.
+    // TODO: maybe, we don't even need a read vs write lock for a page since there can only
+    // be one write mutation at a time. We might give the `&mut Pager` to the write txn
+    // alltogether.
     pub(crate) fn read(&self, pgid: PageId) -> anyhow::Result<PageRead> {
         let internal = self.internal.write();
         let (frame_id, meta, buffer) = self.acquire(internal, pgid, true)?;
@@ -382,7 +382,6 @@ impl Pager {
             }
             drop(meta_locked);
 
-            let offset = frame_id * self.page_size;
             Ok((frame_id, meta, buffer_offset))
         } else {
             let (frame_id, evicted) = Self::evict_one(&mut internal)?;
@@ -538,28 +537,10 @@ impl Pager {
         Ok(())
     }
 
-    fn flush_thread_handler(
-        pager: Arc<Pager>,
-        wal: &Wal,
-        recv: Receiver<()>,
-        error_handler: Option<impl Fn(anyhow::Error) + Send + Sync>,
-    ) {
-        loop {
-            if recv.recv_timeout(Duration::from_secs(60 * 5)).is_ok() {
-                break;
-            }
-            if let Err(err) = pager.flush_dirty_pages(wal) {
-                if let Some(ref error_handler) = error_handler {
-                    error_handler(err);
-                }
-            }
-        }
-    }
-
-    fn flush_dirty_pages(&self, wal: &Wal) -> anyhow::Result<()> {
+    pub(crate) fn flush_dirty_pages(&self, wal: &Wal) -> anyhow::Result<()> {
         for frame_id in 0..self.n {
             let (meta, buffer) = {
-                let mut internal = self.internal.write();
+                let internal = self.internal.write();
 
                 // SAFETY:
                 // - it's guaranteed that the address pointed by metas + frame_id is valid
@@ -593,6 +574,10 @@ impl Pager {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
+        todo!();
     }
 
     fn decode(&self, pgid: PageId, meta: &mut PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
@@ -631,7 +616,6 @@ impl Pager {
         buff: &mut [u8],
     ) -> anyhow::Result<bool> {
         let header = &buff[..PAGE_HEADER_SIZE];
-        let footer = &buff[page_size - PAGE_FOOTER_SIZE..];
         let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
 
         let buff_checksum = &buff[page_size - PAGE_FOOTER_SIZE..];
@@ -858,7 +842,6 @@ impl Pager {
             }
         }
 
-        let footer = &mut buff[page_size - PAGE_FOOTER_SIZE..];
         let checksum = crc64::crc64(0, &buff[..page_size - PAGE_FOOTER_SIZE]);
         buff[page_size - 8..].copy_from_slice(&checksum.to_be_bytes());
 
@@ -866,7 +849,7 @@ impl Pager {
     }
 
     pub(crate) fn shutdown(mut self) -> anyhow::Result<()> {
-        let mut internal = self.internal.get_mut();
+        let internal = self.internal.get_mut();
         let mut f = self.f.lock();
 
         for (pgid, frame_id) in internal.page_to_frame.iter() {
@@ -1912,6 +1895,8 @@ fn get_overflow_content(buff: &[u8], size: usize) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::Bytes;
+    use std::sync::Arc;
 
     #[test]
     fn test_pager_interior() {

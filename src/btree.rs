@@ -1,11 +1,10 @@
 use crate::content::{Bytes, Content};
 use crate::pager::{
-    BTreeCell, BTreePage, InteriorCell, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite,
-    LogContext, OverflowPageRead, PageId, Pager,
+    BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
+    OverflowPageRead, PageId, Pager,
 };
 use crate::wal::{TxId, Wal};
 use anyhow::anyhow;
-use std::fs::remove_dir_all;
 
 pub(crate) struct BTree<'a> {
     txid: TxId,
