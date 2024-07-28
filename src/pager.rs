@@ -539,14 +539,9 @@ impl Pager {
 
     // Note: unlike the original aries design where the flushing process and checkpoint are
     // considered different component, this DB combines them together. During checkpoint, all
-    // dirty pages are flushed. This makes the checkpoint process longer, but simpler. The
-    // checkpoint-end record doesn't have to store all the dirty page tables since all of them
-    // should be fluhsed.
-    pub(crate) fn checkpoint(&self, active_tx: TxState, wal: &Wal) -> anyhow::Result<()> {
-        // TODO: Technically, this doesn't require transaction id
-        let checkpoint_begin_lsn =
-            wal.append(TxId::new(1).unwrap(), None, WalRecord::CheckpointBegin)?;
-
+    // dirty pages are flushed. This makes the checkpoint process longer, but simpler. We also
+    // don't need checkpoint-end log record.
+    pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
         for frame_id in 0..self.n {
             let (meta, buffer) = {
                 let internal = self.internal.write();
@@ -581,8 +576,6 @@ impl Pager {
                 Self::flush_page(&self.f, &self.double_buff_f, frame.id, buffer)?;
             }
         }
-
-        wal.append_checkpoint_end(checkpoint_begin_lsn, active_tx)?;
 
         Ok(())
     }

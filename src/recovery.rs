@@ -130,8 +130,6 @@ fn analyze(
 
     let mut next_lsn = wal_header.checkpoint;
     let mut tx_state = TxState::None;
-    let mut checkpoint_begin_found = false;
-    let mut checkpoint_end_completed = false;
     let mut last_txn: Option<TxId> = None;
     let mut dirty_pages = HashMap::default();
 
@@ -140,6 +138,7 @@ fn analyze(
     // TODO: change assert into return error
     while let Some((lsn, entry)) = iter.next()? {
         log::debug!("recovery item lsn={lsn:?} entry={entry:?}");
+
         match entry.record {
             WalRecord::Begin => {
                 assert_eq!(
@@ -161,33 +160,24 @@ fn analyze(
                     tx_state,
                     "when a transaction aborted, there should be exactly one active tx previously"
                 );
-                tx_state = TxState::Aborting(entry.txid);
+                tx_state = TxState::Aborting {
+                    txid: entry.txid,
+                    rollback: lsn,
+                };
             }
             WalRecord::End => {
-                assert!(TxState::Committing(entry.txid) == tx_state || TxState::Aborting(entry.txid) == tx_state, "when a transaction ended, there should be exactly one committing or aborting tx previously");
+                assert!(
+                    TxState::Committing(entry.txid) == tx_state ||
+                    if let TxState::Aborting{txid, ..} = tx_state {
+                        txid == entry.txid
+                    } else { false },
+                    "when a transaction ended, there should be exactly one committing or aborting tx previously",
+                );
                 tx_state = TxState::None;
             }
 
-            WalRecord::CheckpointBegin => {
-                checkpoint_begin_found = true;
-            }
-            WalRecord::CheckpointEnd { active_tx } => {
-                if checkpoint_end_completed {
-                    continue;
-                }
-                checkpoint_end_completed = true;
-
-                match active_tx {
-                    TxState::None => (),
-                    TxState::Committing(txid) | TxState::Active(txid) | TxState::Aborting(txid) => {
-                        if let Some(last_txid) = last_txn {
-                            assert!(txid.get() <= last_txid.get());
-                        } else {
-                            assert_eq!(TxState::None, tx_state);
-                            tx_state = active_tx;
-                        }
-                    }
-                }
+            WalRecord::CheckpointBegin { active_tx } => {
+                tx_state = active_tx;
             }
 
             WalRecord::InteriorInit { pgid, .. }
@@ -205,12 +195,6 @@ fn analyze(
     }
 
     log::debug!("aries analysis finished next_lsn={next_lsn:?} dirty_pages={dirty_pages:?} tx_state={tx_state:?}");
-
-    if checkpoint_begin_found && !checkpoint_end_completed {
-        return Err(anyhow!(
-            "wal file is corrupted, checkpoint begin found but checkpoint end not found"
-        ));
-    }
 
     let mut min_rec_lsn = next_lsn;
     for rec_lsn in dirty_pages.values() {
@@ -265,8 +249,7 @@ fn redo(
             | WalRecord::Commit
             | WalRecord::Rollback
             | WalRecord::End
-            | WalRecord::CheckpointBegin
-            | WalRecord::CheckpointEnd { .. } => (),
+            | WalRecord::CheckpointBegin { .. } => (),
 
             WalRecord::HeaderSet { root, freelist, .. } => {
                 result.db_state = Some(DbState { root, freelist });
@@ -322,8 +305,7 @@ fn redo_page(
         | WalRecord::Commit
         | WalRecord::Rollback
         | WalRecord::End
-        | WalRecord::CheckpointBegin
-        | WalRecord::CheckpointEnd { .. }
+        | WalRecord::CheckpointBegin { .. }
         | WalRecord::HeaderSet { .. } => unreachable!(),
 
         WalRecord::InteriorReset { pgid, .. } | WalRecord::InteriorUndoReset { pgid } => {
@@ -435,9 +417,12 @@ fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
         TxState::Committing(..) => todo!("just need to create txn-end record"),
 
         // TODO: maybe just create the DB, and let the DB handle the rollback
-        TxState::Aborting(..) => todo!(
-            "continue aborting, find the first non-CLR record and continue undo it from there"
-        ),
+        TxState::Aborting { txid, rollback } => {
+            undo_txn(todo!(), todo!(), txid, rollback, todo!(), todo!(), todo!());
+            todo!(
+                "continue aborting, find the first non-CLR record and continue undo it from there"
+            );
+        }
     }
 
     log::debug!("aries undo finished");
@@ -452,10 +437,11 @@ pub(crate) fn undo_txn(
     wal: &Wal,
     txid: TxId,
     lsn: Lsn,
+    last_undone_clr: Lsn,
     db_root: &mut Option<PageId>,
     db_freelist: &mut Option<PageId>,
 ) -> anyhow::Result<()> {
-    log::debug!("undo txn started");
+    log::debug!("undo txn started from={lsn:?} last_undone_clr={last_undone_clr:?}");
 
     let mut iterator = wal.iterate_back(lsn);
     let mut last_clr = None;
@@ -466,6 +452,9 @@ pub(crate) fn undo_txn(
     while let Some((lsn, entry)) = iterator.next()? {
         log::debug!("undo txn item lsn={lsn:?} entry={entry:?}");
         if entry.txid != txid {
+            continue;
+        }
+        if lsn >= last_undone_clr {
             continue;
         }
 
@@ -596,7 +585,7 @@ pub(crate) fn undo_txn(
                 unreachable!("LeafUndoDelete only used for CLR which shouldn't be undone");
             }
 
-            WalRecord::CheckpointBegin | WalRecord::CheckpointEnd { .. } => (),
+            WalRecord::CheckpointBegin { .. } => (),
         }
     }
 

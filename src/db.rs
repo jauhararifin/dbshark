@@ -99,11 +99,12 @@ impl Db {
                     break;
                 }
 
-                if let Err(err) = pager.checkpoint(tx_state.read().tx_state, &wal) {
+                if let Err(err) = Self::checkpoint(&pager, &wal, &tx_state) {
                     // TODO: handle the error.
                     // Maybe we can send the error to the DB, so that any next operation in the DB
                     // will return an error. If we can't flush the dirty pages, we might not be
                     // able to do anything anyway.
+                    todo!()
                 }
             })
         };
@@ -148,6 +149,22 @@ impl Db {
         Err(anyhow!("database is corrupted, both db header are broken"))
     }
 
+    fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<DbTxState>) -> anyhow::Result<()> {
+        let checkpoint_lsn = {
+            let tx_state = tx_state.read();
+            wal.append(
+                TxId::new(1).unwrap(),
+                None,
+                WalRecord::CheckpointBegin {
+                    active_tx: tx_state.tx_state,
+                },
+            )?
+        };
+        pager.checkpoint(&wal)?;
+        wal.update_checkpoint(checkpoint_lsn)?;
+        Ok(())
+    }
+
     fn init_db(f: &mut File) -> anyhow::Result<Header> {
         let header = Header {
             version: 0,
@@ -169,17 +186,26 @@ impl Db {
         if let TxState::Active(txid) = tx_state.tx_state {
             log::debug!("previous transaction {txid:?} is not closed yet");
 
-            tx_state.tx_state = TxState::Aborting(txid);
-
-            let mut internal = self.internal.write();
-            let internal: &mut DbInternal = &mut internal;
-            rollback_txn(
-                &self.wal,
-                &self.pager,
-                &mut internal.root,
-                &mut internal.freelist,
+            let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
+            tx_state.tx_state = TxState::Aborting {
                 txid,
-            )?;
+                rollback: lsn,
+            };
+
+            {
+                let mut db = self.internal.write();
+                let mut db: &mut DbInternal = &mut db;
+                undo_txn(
+                    &self.pager,
+                    &self.wal,
+                    txid,
+                    lsn,
+                    lsn,
+                    &mut db.root,
+                    &mut db.freelist,
+                )?;
+                self.wal.append(txid, None, WalRecord::End)?;
+            }
 
             tx_state.tx_state = TxState::None;
         }
@@ -192,10 +218,7 @@ impl Db {
     }
 
     pub fn force_checkpoint(&self) -> anyhow::Result<()> {
-        let tx_state = self.tx_state.read();
-        log::debug!("force checkpoint tx_state={:?}", tx_state.tx_state);
-        self.pager.checkpoint(tx_state.tx_state, &self.wal)?;
-        drop(tx_state);
+        Self::checkpoint(&self.pager, &self.wal, &self.tx_state)?;
         Ok(())
     }
 
@@ -217,20 +240,6 @@ impl Db {
 
         Ok(())
     }
-}
-
-fn rollback_txn(
-    wal: &Wal,
-    pager: &Pager,
-    root: &mut Option<PageId>,
-    freelist: &mut Option<PageId>,
-    txid: TxId,
-) -> anyhow::Result<()> {
-    let lsn = wal.append(txid, None, WalRecord::Rollback)?;
-    log::debug!("rollback log record txid={:?} lsn={lsn:?}", txid);
-    undo_txn(pager, wal, txid, lsn, root, freelist)?;
-    wal.append(txid, None, WalRecord::End)?;
-    Ok(())
 }
 
 const DB_HEADER_SIZE: usize = 40;
@@ -394,25 +403,32 @@ impl<'db> Tx<'db> {
     pub fn rollback(mut self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
-        {
+        let lsn = {
+            let lsn = self.wal.append(self.id, None, WalRecord::Rollback)?;
             let mut tx_state = self.tx_state.write();
             assert_eq!(tx_state.tx_state, TxState::Active(self.id));
-            tx_state.tx_state = TxState::Aborting(self.id);
-        }
+            tx_state.tx_state = TxState::Aborting {
+                txid: self.id,
+                rollback: lsn,
+            };
+            lsn
+        };
 
         let db: &mut DbInternal = &mut self.db;
-        rollback_txn(
-            &self.wal,
+        undo_txn(
             &self.pager,
+            &self.wal,
+            self.id,
+            lsn,
+            lsn,
             &mut db.root,
             &mut db.freelist,
-            self.id,
         )?;
+        self.wal.append(self.id, None, WalRecord::End)?;
         self.closed = true;
 
         {
             let mut tx_state = self.tx_state.write();
-            assert_eq!(tx_state.tx_state, TxState::Aborting(self.id));
             tx_state.tx_state = TxState::None;
         }
 

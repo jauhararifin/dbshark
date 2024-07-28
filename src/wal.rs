@@ -177,18 +177,7 @@ impl Wal {
 
     // TODO: some entries like checkpoint begin and checkpoint end don't require transaction id
     // since they are not associated with any transaction.
-    pub(crate) fn append_checkpoint_end(
-        &self,
-        checkpoint_begin_lsn: Lsn,
-        active_tx: TxState,
-    ) -> anyhow::Result<()> {
-        // TODO: technically we don't need the txid here.
-        self.append(
-            TxId::new(1).unwrap(),
-            None,
-            WalRecord::CheckpointEnd { active_tx },
-        )?;
-
+    pub(crate) fn update_checkpoint(&self, checkpoint_begin_lsn: Lsn) -> anyhow::Result<()> {
         let wal_header = WalHeader {
             version: 0,
             checkpoint: Some(checkpoint_begin_lsn),
@@ -290,22 +279,22 @@ impl<'a> WalBackwardIterator<'a> {
             u16::from_be_bytes(buff[buff.len() - 16..buff.len() - 14].try_into().unwrap());
         let size = WalEntry::size_by_record_size(rec_size as usize);
 
-        if self.end_offset < size as usize {
+        if self.end_offset < size {
             self.reset();
         }
 
-        if self.buffer.len() < size as usize {
-            let s = size as usize - self.buffer.len();
+        if self.buffer.len() < size {
+            let s = size - self.buffer.len();
             let mut f = self.wal.f.lock();
             f.seek(SeekFrom::Start(offset - size as u64))?;
             f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
             self.start_offset -= s;
         }
 
-        match WalEntry::decode(&self.buffer[self.end_offset - size as usize..self.end_offset]) {
+        match WalEntry::decode(&self.buffer[self.end_offset - size..self.end_offset]) {
             WalDecodeResult::Ok(entry) => {
                 self.lsn = Lsn::new(self.lsn.get() - size as u64).unwrap();
-                self.end_offset -= size as usize;
+                self.end_offset -= size;
                 Ok(Some((self.lsn, entry)))
             }
 
@@ -407,8 +396,7 @@ pub(crate) enum WalRecord<'a> {
         index: usize,
     },
 
-    CheckpointBegin,
-    CheckpointEnd {
+    CheckpointBegin {
         active_tx: TxState,
     },
 }
@@ -424,7 +412,7 @@ pub(crate) enum TxState {
     None,
     Active(TxId),
     Committing(TxId),
-    Aborting(TxId),
+    Aborting { txid: TxId, rollback: Lsn },
 }
 
 const WAL_RECORD_BEGIN_KIND: u8 = 1;
@@ -449,7 +437,6 @@ const WAL_RECORD_LEAF_DELETE_KIND: u8 = 34;
 const WAL_RECORD_LEAF_UNDO_DELETE_KIND: u8 = 35;
 
 const WAL_RECORD_CHECKPOINT_BEGIN_KIND: u8 = 100;
-const WAL_RECORD_CHECKPOINT_END_KIND: u8 = 101;
 
 impl<'a> WalRecord<'a> {
     fn kind(&self) -> u8 {
@@ -476,7 +463,6 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafUndoDelete { .. } => WAL_RECORD_LEAF_UNDO_DELETE_KIND,
 
             WalRecord::CheckpointBegin { .. } => WAL_RECORD_CHECKPOINT_BEGIN_KIND,
-            WalRecord::CheckpointEnd { .. } => WAL_RECORD_CHECKPOINT_END_KIND,
         }
     }
 
@@ -500,8 +486,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
             WalRecord::LeafUndoDelete { .. } => 10,
 
-            WalRecord::CheckpointBegin => 0,
-            WalRecord::CheckpointEnd { .. } => 9,
+            WalRecord::CheckpointBegin { .. } => 24,
         }
     }
 
@@ -649,23 +634,23 @@ impl<'a> WalRecord<'a> {
                 buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
             }
 
-            WalRecord::CheckpointBegin => (),
-            WalRecord::CheckpointEnd { active_tx } => match active_tx {
+            WalRecord::CheckpointBegin { active_tx } => match active_tx {
                 TxState::None => {
-                    buff[8] = 1;
-                    buff[0..8].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+                    buff[0] = 1;
+                    buff[8..16].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
                 }
                 TxState::Active(txid) => {
-                    buff[8] = 2;
-                    buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                    buff[0] = 2;
+                    buff[8..16].copy_from_slice(&txid.to_be_bytes());
                 }
                 TxState::Committing(txid) => {
-                    buff[8] = 3;
-                    buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                    buff[0] = 3;
+                    buff[8..16].copy_from_slice(&txid.to_be_bytes());
                 }
-                TxState::Aborting(txid) => {
-                    buff[8] = 4;
-                    buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                TxState::Aborting { txid, rollback } => {
+                    buff[0] = 4;
+                    buff[8..16].copy_from_slice(&txid.to_be_bytes());
+                    buff[16..24].copy_from_slice(&rollback.to_be_bytes());
                 }
             },
         }
@@ -840,31 +825,31 @@ impl<'a> WalRecord<'a> {
                 })
             }
 
-            WAL_RECORD_CHECKPOINT_BEGIN_KIND => Ok(Self::CheckpointBegin),
-            WAL_RECORD_CHECKPOINT_END_KIND => {
-                let active_tx = match buff[8] {
+            WAL_RECORD_CHECKPOINT_BEGIN_KIND => {
+                let active_tx = match buff[0] {
                     1 => TxState::None,
                     2 => {
-                        let txid = TxId::from_be_bytes(buff[0..8].try_into().unwrap())
+                        let txid = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
                             .ok_or(anyhow!("found zero transaction id"))?;
                         TxState::Active(txid)
                     }
                     3 => {
-                        let txid = TxId::from_be_bytes(buff[0..8].try_into().unwrap())
+                        let txid = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
                             .ok_or(anyhow!("found zero transaction id"))?;
                         TxState::Committing(txid)
                     }
                     4 => {
-                        let txid = TxId::from_be_bytes(buff[0..8].try_into().unwrap())
+                        let txid = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
                             .ok_or(anyhow!("found zero transaction id"))?;
-                        TxState::Aborting(txid)
+                        let rollback = Lsn::from_be_bytes(buff[16..24].try_into().unwrap())
+                            .ok_or(anyhow!("found zero lsn"))?;
+                        TxState::Aborting { txid, rollback }
                     }
                     kind => return Err(anyhow!("invalid checkout end kind {kind}")),
                 };
 
-                Ok(Self::CheckpointEnd { active_tx })
+                Ok(Self::CheckpointBegin { active_tx })
             }
-
             _ => Err(anyhow!("invalid wal record kind {kind}")),
         }
     }
@@ -1309,34 +1294,32 @@ mod tests {
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
-                record: WalRecord::CheckpointBegin,
-            },
-            WalEntry {
-                txid: TxId::new(1011).unwrap(),
-                clr: Lsn::new(99),
-                record: WalRecord::CheckpointEnd {
+                record: WalRecord::CheckpointBegin {
                     active_tx: TxState::None,
                 },
             },
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
-                record: WalRecord::CheckpointEnd {
+                record: WalRecord::CheckpointBegin {
                     active_tx: TxState::Active(TxId::new(12).unwrap()),
                 },
             },
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
-                record: WalRecord::CheckpointEnd {
+                record: WalRecord::CheckpointBegin {
                     active_tx: TxState::Committing(TxId::new(12).unwrap()),
                 },
             },
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
-                record: WalRecord::CheckpointEnd {
-                    active_tx: TxState::Aborting(TxId::new(12).unwrap()),
+                record: WalRecord::CheckpointBegin {
+                    active_tx: TxState::Aborting {
+                        txid: TxId::new(12).unwrap(),
+                        rollback: Lsn::new(10).unwrap(),
+                    },
                 },
             },
         ];
