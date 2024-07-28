@@ -1,5 +1,4 @@
 use crate::pager::{PageId, PageIdExt, MINIMUM_PAGE_SIZE};
-use crate::recovery::WAL_HEADER_SIZE;
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock};
 use std::fs::File;
@@ -174,6 +173,33 @@ impl Wal {
 
         log::debug!("appended wal entry={entry:?} lsn={lsn:?}");
         Ok(lsn)
+    }
+
+    // TODO: some entries like checkpoint begin and checkpoint end don't require transaction id
+    // since they are not associated with any transaction.
+    pub(crate) fn append_checkpoint_end(
+        &self,
+        checkpoint_begin_lsn: Lsn,
+        active_tx: TxState,
+    ) -> anyhow::Result<()> {
+        // TODO: technically we don't need the txid here.
+        self.append(
+            TxId::new(1).unwrap(),
+            None,
+            WalRecord::CheckpointEnd { active_tx },
+        )?;
+
+        let wal_header = WalHeader {
+            version: 0,
+            checkpoint: Some(checkpoint_begin_lsn),
+            relative_lsn_offset: 0,
+        };
+
+        let mut f = self.f.lock();
+        write_wal_header(&mut f, &wal_header)?;
+        drop(f);
+
+        Ok(())
     }
 
     pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
@@ -961,6 +987,83 @@ impl<'a> WalDecodeResult<'a> {
 
 fn pad8(size: usize) -> usize {
     (size + 7) & !7
+}
+
+pub(crate) const WAL_HEADER_SIZE: usize = 32;
+
+#[derive(Debug)]
+pub(crate) struct WalHeader {
+    pub(crate) version: u16,
+    pub(crate) checkpoint: Option<Lsn>,
+    pub(crate) relative_lsn_offset: u64,
+}
+
+impl WalHeader {
+    pub(crate) fn decode(buff: &[u8]) -> Option<Self> {
+        let version = u16::from_be_bytes(buff[6..8].try_into().unwrap());
+        let relative_lsn_offset = u64::from_be_bytes(buff[8..16].try_into().unwrap());
+        let checkpoint = Lsn::from_be_bytes(buff[16..24].try_into().unwrap());
+
+        let stored_checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
+        let calculated_checksum = crc64::crc64(0, &buff[0..24]);
+        if stored_checksum != calculated_checksum {
+            return None;
+        }
+
+        Some(WalHeader {
+            version,
+            checkpoint,
+            relative_lsn_offset,
+        })
+    }
+
+    pub(crate) fn encode(&self, buff: &mut [u8]) {
+        buff[0..6].copy_from_slice(b"db_wal");
+        buff[6..8].copy_from_slice(&self.version.to_be_bytes());
+        buff[8..16].copy_from_slice(&self.relative_lsn_offset.to_be_bytes());
+        buff[16..24].copy_from_slice(&self.checkpoint.to_be_bytes());
+        let checksum = crc64::crc64(0, &buff[0..24]);
+        buff[24..32].copy_from_slice(&checksum.to_be_bytes());
+    }
+}
+
+pub(crate) fn build_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
+    let header = WalHeader {
+        version: 0,
+        relative_lsn_offset: 0,
+        checkpoint: None,
+    };
+    write_wal_header(f, &header)?;
+    Ok(header)
+}
+
+fn write_wal_header(f: &mut File, header: &WalHeader) -> anyhow::Result<()> {
+    f.seek(SeekFrom::Start(0))?;
+    let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
+    header.encode(&mut header_buff[..WAL_HEADER_SIZE]);
+    header.encode(&mut header_buff[WAL_HEADER_SIZE..]);
+    f.write_all(&header_buff)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn load_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
+    f.seek(SeekFrom::Start(0))?;
+    let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
+    f.read_exact(&mut header_buff)?;
+    if header_buff[0..6].cmp(b"db_wal").is_ne() {
+        return Err(anyhow!("the file is not a wal file"));
+    }
+
+    let wal_header = WalHeader::decode(&header_buff[..WAL_HEADER_SIZE])
+        .or_else(|| WalHeader::decode(&header_buff[WAL_HEADER_SIZE..]))
+        .ok_or_else(|| anyhow!("corrupted wal file"))?;
+
+    if wal_header.version != 0 {
+        return Err(anyhow!("unsupported WAL version: {}", wal_header.version));
+    }
+
+    Ok(wal_header)
 }
 
 #[cfg(test)]

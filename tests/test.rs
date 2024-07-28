@@ -29,7 +29,7 @@ fn test_db_happy_path() {
     tx.commit().expect("commit must succeed");
     drop(db);
 
-    let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
+    let db = Db::open(Path::new("test1.db"), Setting::default()).unwrap();
     drop(db);
 }
 
@@ -78,6 +78,6 @@ fn test_db_rollback() {
         tx.rollback().unwrap();
     }
 
-    let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
+    let db = Db::open(Path::new("test2.db"), Setting::default()).unwrap();
     drop(db);
 }

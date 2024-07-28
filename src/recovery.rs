@@ -1,6 +1,9 @@
 use crate::content::Bytes;
 use crate::pager::{LogContext, PageId, PageIdExt, PageWrite, Pager};
-use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalDecodeResult, WalEntry, WalRecord};
+use crate::wal::{
+    build_wal_header, load_wal_header, Lsn, LsnExt, TxId, TxState, Wal, WalDecodeResult, WalEntry,
+    WalHeader, WalRecord, WAL_HEADER_SIZE,
+};
 use anyhow::anyhow;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -30,79 +33,6 @@ fn get_wal_header(f: &mut File, page_size: usize) -> anyhow::Result<WalHeader> {
         build_wal_header(f)
     } else {
         load_wal_header(f)
-    }
-}
-
-fn build_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
-    let header = WalHeader {
-        version: 0,
-        relative_lsn_offset: 0,
-        checkpoint: None,
-    };
-
-    f.seek(SeekFrom::Start(0))?;
-    let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
-    header.encode(&mut header_buff[..WAL_HEADER_SIZE]);
-    header.encode(&mut header_buff[WAL_HEADER_SIZE..]);
-    f.write_all(&header_buff)?;
-
-    Ok(header)
-}
-
-fn load_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
-    f.seek(SeekFrom::Start(0))?;
-    let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
-    f.read_exact(&mut header_buff)?;
-    if header_buff[0..6].cmp(b"db_wal").is_ne() {
-        return Err(anyhow!("the file is not a wal file"));
-    }
-
-    let wal_header = WalHeader::decode(&header_buff[..WAL_HEADER_SIZE])
-        .or_else(|| WalHeader::decode(&header_buff[WAL_HEADER_SIZE..]))
-        .ok_or_else(|| anyhow!("corrupted wal file"))?;
-
-    if wal_header.version != 0 {
-        return Err(anyhow!("unsupported WAL version: {}", wal_header.version));
-    }
-
-    Ok(wal_header)
-}
-
-pub(crate) const WAL_HEADER_SIZE: usize = 32;
-
-#[derive(Debug)]
-struct WalHeader {
-    version: u16,
-    checkpoint: Option<Lsn>,
-    relative_lsn_offset: u64,
-}
-
-impl WalHeader {
-    fn decode(buff: &[u8]) -> Option<Self> {
-        let version = u16::from_be_bytes(buff[6..8].try_into().unwrap());
-        let relative_lsn_offset = u64::from_be_bytes(buff[8..16].try_into().unwrap());
-        let checkpoint = Lsn::from_be_bytes(buff[16..24].try_into().unwrap());
-
-        let stored_checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
-        let calculated_checksum = crc64::crc64(0, &buff[0..24]);
-        if stored_checksum != calculated_checksum {
-            return None;
-        }
-
-        Some(WalHeader {
-            version,
-            checkpoint,
-            relative_lsn_offset,
-        })
-    }
-
-    fn encode(&self, buff: &mut [u8]) {
-        buff[0..6].copy_from_slice(b"db_wal");
-        buff[6..8].copy_from_slice(&self.version.to_be_bytes());
-        buff[8..16].copy_from_slice(&self.relative_lsn_offset.to_be_bytes());
-        buff[16..24].copy_from_slice(&self.checkpoint.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..24]);
-        buff[24..32].copy_from_slice(&checksum.to_be_bytes());
     }
 }
 

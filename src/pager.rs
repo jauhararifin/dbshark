@@ -544,7 +544,8 @@ impl Pager {
     // should be fluhsed.
     pub(crate) fn checkpoint(&self, active_tx: TxState, wal: &Wal) -> anyhow::Result<()> {
         // TODO: Technically, this doesn't require transaction id
-        wal.append(TxId::new(1).unwrap(), None, WalRecord::CheckpointBegin)?;
+        let checkpoint_begin_lsn =
+            wal.append(TxId::new(1).unwrap(), None, WalRecord::CheckpointBegin)?;
 
         for frame_id in 0..self.n {
             let (meta, buffer) = {
@@ -581,15 +582,7 @@ impl Pager {
             }
         }
 
-        // TODO: Technically, this doesn't require transaction id
-        wal.append(
-            TxId::new(1).unwrap(),
-            None,
-            WalRecord::CheckpointEnd { active_tx },
-        )?;
-
-        // TODO: at this point, we need to update the master record in the wal to point into this
-        // record.
+        wal.append_checkpoint_end(checkpoint_begin_lsn, active_tx)?;
 
         Ok(())
     }

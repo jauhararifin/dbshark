@@ -40,6 +40,7 @@ pub struct Setting {}
 
 impl Db {
     pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
+        log::debug!("opening db on {path:?}");
         let wal_path = path.with_extension("wal");
         let double_buff_path = path.with_extension("dbuff");
 
@@ -106,11 +107,6 @@ impl Db {
                 }
             })
         };
-
-        // TODO: start a background thread for periodically flush dirty pages
-        // TODO: start a background thread for periodically checkpoint.
-        // Maybe the checkpoint can happen right after the dirty pages are flushed.
-        // TODO: figure out how to roll the WAL file after it's getting bigger.
 
         Ok(Self {
             pager,
@@ -197,6 +193,7 @@ impl Db {
 
     pub fn force_checkpoint(&self) -> anyhow::Result<()> {
         let tx_state = self.tx_state.read();
+        log::debug!("force checkpoint tx_state={:?}", tx_state.tx_state);
         self.pager.checkpoint(tx_state.tx_state, &self.wal)?;
         drop(tx_state);
         Ok(())
