@@ -40,16 +40,24 @@ pub struct Setting {}
 
 impl Db {
     pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
+        if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        }
+        if !path.is_dir() {
+            return Err(anyhow!("path is not a directory"));
+        }
+
         log::debug!("opening db on {path:?}");
-        let wal_path = path.with_extension("wal");
-        let double_buff_path = path.with_extension("dbuff");
+        let db_path = path.join("main");
+        let wal_path = path.join("wal");
+        let double_buff_path = path.join("dbuff");
 
         let mut db_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(db_path)?;
         let header = Self::load_db_header(&mut db_file)?;
 
         let double_buff_file = OpenOptions::new()
