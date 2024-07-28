@@ -18,14 +18,17 @@ pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::R
 
     let analyze_result = analyze(&mut f, &wal_header, page_size)?;
     let redo_result = redo(&mut f, pager, &wal_header, &analyze_result, page_size)?;
-    undo(&analyze_result)?;
 
-    Wal::new(
+    let wal = Wal::new(
         f,
         wal_header.relative_lsn_offset,
         analyze_result.next_lsn,
         page_size,
-    )
+    )?;
+
+    undo(&analyze_result, pager, &wal)?;
+
+    Ok(wal)
 }
 
 fn get_wal_header(f: &mut File, page_size: usize) -> anyhow::Result<WalHeader> {
@@ -404,21 +407,25 @@ fn redo_page(
     Ok(())
 }
 
-fn undo(analyze_result: &AriesAnalyzeResult) -> anyhow::Result<()> {
+fn undo(analyze_result: &AriesAnalyzeResult, pager: &Pager, wal: &Wal) -> anyhow::Result<()> {
     log::debug!("aries undo started");
 
     match analyze_result.active_tx {
         TxState::None => {}
 
-        // TODO: maybe just create the DB, and let the DB handle the rollback
-        TxState::Active(..) => todo!("need to abort"),
+        TxState::Active(txid) => {
+            let lsn = wal.append(txid, None, WalRecord::Rollback)?;
+            undo_txn(pager, wal, txid, lsn, lsn, todo!(), todo!());
+            wal.append(txid, None, WalRecord::End)?;
+        }
 
-        // TODO: maybe just create the DB, and let the DB handle the rollback
-        TxState::Committing(..) => todo!("just need to create txn-end record"),
+        TxState::Committing(txid) => {
+            wal.append(txid, None, WalRecord::End)?;
+        }
 
         // TODO: maybe just create the DB, and let the DB handle the rollback
         TxState::Aborting { txid, rollback } => {
-            undo_txn(todo!(), todo!(), txid, rollback, todo!(), todo!(), todo!());
+            undo_txn(pager, wal, txid, rollback, todo!(), todo!(), todo!());
             todo!(
                 "continue aborting, find the first non-CLR record and continue undo it from there"
             );

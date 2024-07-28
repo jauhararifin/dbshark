@@ -77,3 +77,23 @@ fn test_db_rollback() {
     let db = Db::open(Path::new("test2"), Setting::default()).unwrap();
     drop(db);
 }
+
+#[test]
+fn test_db_recovery1() {
+    setup();
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let db = Db::open(Path::new(dir.path()), Setting::default()).unwrap();
+    let mut tx = db.update().unwrap();
+    let mut bucket = tx.bucket("table1").unwrap();
+    bucket.put(b"key00001", b"val00001").unwrap();
+    db.force_checkpoint().unwrap();
+    let result = bucket.get(b"key00001").unwrap();
+    assert_eq!(Some(b"val00001".to_vec()), result);
+    drop(tx);
+    drop(db);
+
+    let db = Db::open(dir.path(), Setting::default()).unwrap();
+    drop(db);
+}
