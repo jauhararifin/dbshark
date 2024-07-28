@@ -1,7 +1,7 @@
 use crate::btree::BTree;
 use crate::pager::{PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
-use crate::wal::{TxId, TxIdExt, Wal, WalRecord};
+use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::fs::OpenOptions;
@@ -18,21 +18,21 @@ pub struct Db {
     pager: Arc<Pager>,
     wal: Arc<Wal>,
 
+    tx_state: Arc<RwLock<DbTxState>>,
+
     background_chan: Sender<()>,
     background_thread: JoinHandle<()>,
 }
 
 struct DbInternal {
-    next_txid: TxId,
-
     // TODO: maybe these two information should be managed by Pager
     root: Option<PageId>,
     freelist: Option<PageId>,
+}
 
-    // if the last txn is not committed or rollback, the next time
-    // a new transaction begins, we should rollback the last txn
-    // first.
-    last_unclosed_txn: Option<TxId>,
+struct DbTxState {
+    tx_state: TxState,
+    next_txid: TxId,
 }
 
 #[derive(Default)]
@@ -73,10 +73,23 @@ impl Db {
         let wal = recover(wal_file, &pager, page_size)?;
         let wal = Arc::new(wal);
 
+        let next_txid = if let Some(txid) = header.last_txid {
+            txid.next()
+        } else {
+            TxId::new(1).unwrap()
+        };
+
+        let tx_state = Arc::new(RwLock::new(DbTxState {
+            // at this point, the recovery is already finished, so there is no active transaction
+            tx_state: TxState::None,
+            next_txid,
+        }));
+
         let (sender, receiver) = channel();
         let background_thread = {
             let wal = wal.clone();
             let pager = pager.clone();
+            let tx_state = tx_state.clone();
             std::thread::spawn(move || loop {
                 let Err(err) = receiver.recv_timeout(Duration::from_secs(60 * 60)) else {
                     break;
@@ -84,25 +97,14 @@ impl Db {
                 if err != std::sync::mpsc::RecvTimeoutError::Timeout {
                     break;
                 }
-                if let Err(err) = pager.flush_dirty_pages(&wal) {
+
+                if let Err(err) = pager.checkpoint(tx_state.read().tx_state, &wal) {
                     // TODO: handle the error.
                     // Maybe we can send the error to the DB, so that any next operation in the DB
                     // will return an error. If we can't flush the dirty pages, we might not be
                     // able to do anything anyway.
                 }
-                if let Err(err) = pager.checkpoint(&wal) {
-                    // TODO: handle the error
-                    // Maybe we can send the error to the DB, so that any next operation in the DB
-                    // will return an error. If we can't flush the dirty pages, we might not be
-                    // able to do anything anyway.
-                }
             })
-        };
-
-        let next_txid = if let Some(txid) = header.last_txid {
-            txid.next()
-        } else {
-            TxId::new(1).unwrap()
         };
 
         // TODO: start a background thread for periodically flush dirty pages
@@ -114,12 +116,11 @@ impl Db {
             pager,
             wal,
             internal: RwLock::new(DbInternal {
-                next_txid,
                 root: None,
                 freelist: None,
-                last_unclosed_txn: None,
             }),
 
+            tx_state,
             background_chan: sender,
             background_thread,
         })
@@ -168,10 +169,13 @@ impl Db {
     }
 
     pub fn update(&self) -> anyhow::Result<Tx> {
-        let mut internal = self.internal.write();
-
-        if let Some(txid) = internal.last_unclosed_txn.take() {
+        let mut tx_state = self.tx_state.write();
+        if let TxState::Active(txid) = tx_state.tx_state {
             log::debug!("previous transaction {txid:?} is not closed yet");
+
+            tx_state.tx_state = TxState::Aborting(txid);
+
+            let mut internal = self.internal.write();
             let internal: &mut DbInternal = &mut internal;
             rollback_txn(
                 &self.wal,
@@ -180,17 +184,21 @@ impl Db {
                 &mut internal.freelist,
                 txid,
             )?;
+
+            tx_state.tx_state = TxState::None;
         }
 
-        let txid = internal.next_txid;
-        internal.next_txid = internal.next_txid.next();
-        internal.last_unclosed_txn = Some(txid);
+        let txid = tx_state.next_txid;
+        tx_state.next_txid = tx_state.next_txid.next();
+        tx_state.tx_state = TxState::Active(txid);
 
-        Tx::new(txid, self.wal.clone(), self.pager.clone(), internal)
+        Tx::new(txid, self)
     }
 
-    pub fn force_flush(&self) -> anyhow::Result<()> {
-        self.pager.flush_dirty_pages(&self.wal)?;
+    pub fn force_checkpoint(&self) -> anyhow::Result<()> {
+        let tx_state = self.tx_state.read();
+        self.pager.checkpoint(tx_state.tx_state, &self.wal)?;
+        drop(tx_state);
         Ok(())
     }
 
@@ -276,6 +284,8 @@ pub struct Tx<'db> {
     id: TxId,
     wal: Arc<Wal>,
     pager: Arc<Pager>,
+
+    tx_state: &'db RwLock<DbTxState>,
     db: RwLockWriteGuard<'db, DbInternal>,
 
     closed: bool,
@@ -290,17 +300,13 @@ impl<'db> Drop for Tx<'db> {
 }
 
 impl<'db> Tx<'db> {
-    fn new(
-        id: TxId,
-        wal: Arc<Wal>,
-        pager: Arc<Pager>,
-        db: RwLockWriteGuard<'db, DbInternal>,
-    ) -> anyhow::Result<Self> {
+    fn new(id: TxId, db: &'db Db) -> anyhow::Result<Self> {
         let tx = Self {
             id,
-            wal,
-            pager,
-            db,
+            wal: db.wal.clone(),
+            pager: db.pager.clone(),
+            tx_state: &db.tx_state,
+            db: db.internal.write(),
             closed: false,
         };
         tx.wal.append(tx.id, None, WalRecord::Begin)?;
@@ -368,17 +374,34 @@ impl<'db> Tx<'db> {
     }
 
     pub fn commit(mut self) -> anyhow::Result<()> {
+        {
+            let mut tx_state = self.tx_state.write();
+            assert_eq!(tx_state.tx_state, TxState::Active(self.id));
+            tx_state.tx_state = TxState::Committing(self.id);
+        }
+
         let commit_lsn = self.wal.append(self.id, None, WalRecord::Commit)?;
         self.wal.append(self.id, None, WalRecord::End)?;
         self.wal.sync(commit_lsn)?;
-
         self.closed = true;
-        self.db.last_unclosed_txn = None;
+
+        {
+            let mut tx_state = self.tx_state.write();
+            assert_eq!(tx_state.tx_state, TxState::Committing(self.id));
+            tx_state.tx_state = TxState::None;
+        }
+
         Ok(())
     }
 
     pub fn rollback(mut self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
+
+        {
+            let mut tx_state = self.tx_state.write();
+            assert_eq!(tx_state.tx_state, TxState::Active(self.id));
+            tx_state.tx_state = TxState::Aborting(self.id);
+        }
 
         let db: &mut DbInternal = &mut self.db;
         rollback_txn(
@@ -389,7 +412,12 @@ impl<'db> Tx<'db> {
             self.id,
         )?;
         self.closed = true;
-        self.db.last_unclosed_txn = None;
+
+        {
+            let mut tx_state = self.tx_state.write();
+            assert_eq!(tx_state.tx_state, TxState::Aborting(self.id));
+            tx_state.tx_state = TxState::None;
+        }
 
         Ok(())
     }

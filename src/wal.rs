@@ -8,11 +8,6 @@ use std::num::NonZeroU64;
 
 const MAX_DIRTY_PAGES_IN_CHECKPOINT_END: usize = (MINIMUM_PAGE_SIZE - 16) / 16;
 
-// TODO(important): the checkpoint-end record might have a huge number
-// of dirty pages and might not fit into a single page size. We can either
-// - increase the limit of wal entry size into u64
-// - or, split the checkpoint-end record into multiple entry
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TxId(NonZeroU64);
 
@@ -151,6 +146,8 @@ impl Wal {
         })
     }
 
+    // TODO: some entries like checkpoint begin and checkpoint end don't require transaction id
+    // since they are not associated with any transaction.
     pub(crate) fn append(
         &self,
         txid: TxId,
@@ -386,12 +383,7 @@ pub(crate) enum WalRecord<'a> {
 
     CheckpointBegin,
     CheckpointEnd {
-        // TODO: find a way to use slice reference to remove allocation.
-        dirty_pages: Vec<DirtyPage>,
-        // if the active_tx is None, it means this record is a partial checkpoint-end
-        // record. When active_tx is Some, this record is the last checkpoint-end
-        // indicating that the checkpoint-end is completed.
-        active_tx: Option<TxState>,
+        active_tx: TxState,
     },
 }
 
@@ -401,7 +393,7 @@ pub(crate) struct DirtyPage {
     pub(crate) rec_lsn: Lsn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxState {
     None,
     Active(TxId),
@@ -483,7 +475,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafUndoDelete { .. } => 10,
 
             WalRecord::CheckpointBegin => 0,
-            WalRecord::CheckpointEnd { dirty_pages, .. } => 16 + 16 * dirty_pages.len(),
+            WalRecord::CheckpointEnd { .. } => 9,
         }
     }
 
@@ -632,44 +624,24 @@ impl<'a> WalRecord<'a> {
             }
 
             WalRecord::CheckpointBegin => (),
-            WalRecord::CheckpointEnd {
-                dirty_pages,
-                active_tx,
-            } => {
-                assert!(dirty_pages.len() < MAX_DIRTY_PAGES_IN_CHECKPOINT_END);
-                buff[0..2].copy_from_slice(&(dirty_pages.len() as u16).to_be_bytes());
-                buff[2..8].fill(0);
-
-                if let Some(active_tx) = active_tx {
-                    match active_tx {
-                        TxState::None => {
-                            buff[2] = 1;
-                            buff[8..16].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-                        }
-                        TxState::Active(txid) => {
-                            buff[2] = 2;
-                            buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                        }
-                        TxState::Committing(txid) => {
-                            buff[2] = 3;
-                            buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                        }
-                        TxState::Aborting(txid) => {
-                            buff[2] = 4;
-                            buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                        }
-                    }
-                } else {
-                    buff[2] = 0;
+            WalRecord::CheckpointEnd { active_tx } => match active_tx {
+                TxState::None => {
+                    buff[8] = 1;
+                    buff[0..8].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
                 }
-
-                buff = &mut buff[16..];
-                for (i, pgid) in dirty_pages.iter().enumerate() {
-                    buff[0..8].copy_from_slice(&pgid.id.get().to_be_bytes());
-                    buff[8..16].copy_from_slice(&pgid.rec_lsn.get().to_be_bytes());
-                    buff = &mut buff[16..];
+                TxState::Active(txid) => {
+                    buff[8] = 2;
+                    buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 }
-            }
+                TxState::Committing(txid) => {
+                    buff[8] = 3;
+                    buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                }
+                TxState::Aborting(txid) => {
+                    buff[8] = 4;
+                    buff[0..8].copy_from_slice(&txid.to_be_bytes());
+                }
+            },
         }
     }
 
@@ -844,53 +816,27 @@ impl<'a> WalRecord<'a> {
 
             WAL_RECORD_CHECKPOINT_BEGIN_KIND => Ok(Self::CheckpointBegin),
             WAL_RECORD_CHECKPOINT_END_KIND => {
-                let dirty_pages_len = u16::from_be_bytes(buff[0..2].try_into().unwrap());
-                assert!((dirty_pages_len as usize) < MAX_DIRTY_PAGES_IN_CHECKPOINT_END);
-                let mut dirty_pages = Vec::with_capacity(dirty_pages_len as usize);
-
-                let active_tx = match buff[2] {
-                    0 => None,
-                    1 => Some(TxState::None),
+                let active_tx = match buff[8] {
+                    1 => TxState::None,
                     2 => {
-                        let Some(txid) = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
-                        else {
-                            return Err(anyhow!("found zero transaction id"));
-                        };
-                        Some(TxState::Active(txid))
+                        let txid = TxId::from_be_bytes(buff[0..8].try_into().unwrap())
+                            .ok_or(anyhow!("found zero transaction id"))?;
+                        TxState::Active(txid)
                     }
                     3 => {
-                        let Some(txid) = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
-                        else {
-                            return Err(anyhow!("found zero transaction id"));
-                        };
-                        Some(TxState::Committing(txid))
+                        let txid = TxId::from_be_bytes(buff[0..8].try_into().unwrap())
+                            .ok_or(anyhow!("found zero transaction id"))?;
+                        TxState::Committing(txid)
                     }
                     4 => {
-                        let Some(txid) = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
-                        else {
-                            return Err(anyhow!("found zero transaction id"));
-                        };
-                        Some(TxState::Aborting(txid))
+                        let txid = TxId::from_be_bytes(buff[0..8].try_into().unwrap())
+                            .ok_or(anyhow!("found zero transaction id"))?;
+                        TxState::Aborting(txid)
                     }
                     kind => return Err(anyhow!("invalid checkout end kind {kind}")),
                 };
 
-                buff = &buff[16..];
-                for i in 0..dirty_pages_len {
-                    let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                        return Err(anyhow!("zero page id"));
-                    };
-                    let Some(rec_lsn) = Lsn::from_be_bytes(buff[8..16].try_into().unwrap()) else {
-                        return Err(anyhow!("zero lsn"));
-                    };
-                    buff = &buff[16..];
-                    dirty_pages.push(DirtyPage { id: pgid, rec_lsn });
-                }
-
-                Ok(Self::CheckpointEnd {
-                    dirty_pages,
-                    active_tx,
-                })
+                Ok(Self::CheckpointEnd { active_tx })
             }
 
             _ => Err(anyhow!("invalid wal record kind {kind}")),
@@ -1266,59 +1212,28 @@ mod tests {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointEnd {
-                    dirty_pages: vec![],
-                    active_tx: Some(TxState::None),
+                    active_tx: TxState::None,
                 },
             },
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointEnd {
-                    dirty_pages: vec![
-                        DirtyPage {
-                            id: PageId::new(22).unwrap(),
-                            rec_lsn: Lsn::new(10).unwrap(),
-                        },
-                        DirtyPage {
-                            id: PageId::new(23).unwrap(),
-                            rec_lsn: Lsn::new(12).unwrap(),
-                        },
-                    ],
-                    active_tx: Some(TxState::Active(TxId::new(12).unwrap())),
+                    active_tx: TxState::Active(TxId::new(12).unwrap()),
                 },
             },
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointEnd {
-                    dirty_pages: vec![
-                        DirtyPage {
-                            id: PageId::new(22).unwrap(),
-                            rec_lsn: Lsn::new(10).unwrap(),
-                        },
-                        DirtyPage {
-                            id: PageId::new(23).unwrap(),
-                            rec_lsn: Lsn::new(12).unwrap(),
-                        },
-                    ],
-                    active_tx: Some(TxState::Committing(TxId::new(12).unwrap())),
+                    active_tx: TxState::Committing(TxId::new(12).unwrap()),
                 },
             },
             WalEntry {
                 txid: TxId::new(1011).unwrap(),
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointEnd {
-                    dirty_pages: vec![
-                        DirtyPage {
-                            id: PageId::new(22).unwrap(),
-                            rec_lsn: Lsn::new(10).unwrap(),
-                        },
-                        DirtyPage {
-                            id: PageId::new(23).unwrap(),
-                            rec_lsn: Lsn::new(12).unwrap(),
-                        },
-                    ],
-                    active_tx: Some(TxState::Aborting(TxId::new(12).unwrap())),
+                    active_tx: TxState::Aborting(TxId::new(12).unwrap()),
                 },
             },
         ];

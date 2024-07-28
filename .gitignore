@@ -1,6 +1,6 @@
 /target
 tarpaulin-report.html
 
-test.db
-test.dbuff
-test.wal
+test*.db
+test*.dbuff
+test*.wal

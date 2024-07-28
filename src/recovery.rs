@@ -241,33 +241,22 @@ fn analyze(
             WalRecord::CheckpointBegin => {
                 checkpoint_begin_found = true;
             }
-            WalRecord::CheckpointEnd {
-                active_tx,
-                dirty_pages: dp,
-            } => {
+            WalRecord::CheckpointEnd { active_tx } => {
                 if checkpoint_end_completed {
                     continue;
                 }
+                checkpoint_end_completed = true;
 
-                if let Some(active_tx) = active_tx {
-                    checkpoint_end_completed = true;
-                    match active_tx {
-                        TxState::None => (),
-                        TxState::Committing(txid)
-                        | TxState::Active(txid)
-                        | TxState::Aborting(txid) => {
-                            if let Some(last_txid) = last_txn {
-                                assert!(txid.get() <= last_txid.get());
-                            } else {
-                                assert_eq!(TxState::None, tx_state);
-                                tx_state = active_tx;
-                            }
+                match active_tx {
+                    TxState::None => (),
+                    TxState::Committing(txid) | TxState::Active(txid) | TxState::Aborting(txid) => {
+                        if let Some(last_txid) = last_txn {
+                            assert!(txid.get() <= last_txid.get());
+                        } else {
+                            assert_eq!(TxState::None, tx_state);
+                            tx_state = active_tx;
                         }
                     }
-                }
-
-                for dirty_page in dp {
-                    dirty_pages.insert(dirty_page.id, dirty_page.rec_lsn);
                 }
             }
 

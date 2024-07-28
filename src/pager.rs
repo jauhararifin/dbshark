@@ -1,5 +1,5 @@
 use crate::content::Content;
-use crate::wal::{Lsn, LsnExt, TxId, Wal, WalRecord};
+use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet};
@@ -537,7 +537,15 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn flush_dirty_pages(&self, wal: &Wal) -> anyhow::Result<()> {
+    // Note: unlike the original aries design where the flushing process and checkpoint are
+    // considered different component, this DB combines them together. During checkpoint, all
+    // dirty pages are flushed. This makes the checkpoint process longer, but simpler. The
+    // checkpoint-end record doesn't have to store all the dirty page tables since all of them
+    // should be fluhsed.
+    pub(crate) fn checkpoint(&self, active_tx: TxState, wal: &Wal) -> anyhow::Result<()> {
+        // TODO: Technically, this doesn't require transaction id
+        wal.append(TxId::new(1).unwrap(), None, WalRecord::CheckpointBegin)?;
+
         for frame_id in 0..self.n {
             let (meta, buffer) = {
                 let internal = self.internal.write();
@@ -573,11 +581,17 @@ impl Pager {
             }
         }
 
-        Ok(())
-    }
+        // TODO: Technically, this doesn't require transaction id
+        wal.append(
+            TxId::new(1).unwrap(),
+            None,
+            WalRecord::CheckpointEnd { active_tx },
+        )?;
 
-    pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
-        todo!();
+        // TODO: at this point, we need to update the master record in the wal to point into this
+        // record.
+
+        Ok(())
     }
 
     fn decode(&self, pgid: PageId, meta: &mut PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {

@@ -13,16 +13,16 @@ fn setup() {
 fn test_db_happy_path() {
     setup();
 
-    _ = std::fs::remove_file("test.db");
-    _ = std::fs::remove_file("test.dbuff");
-    _ = std::fs::remove_file("test.wal");
+    _ = std::fs::remove_file("test1.db");
+    _ = std::fs::remove_file("test1.dbuff");
+    _ = std::fs::remove_file("test1.wal");
 
-    let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
+    let db = Db::open(Path::new("test1.db"), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
 
     let mut bucket = tx.bucket("table1").unwrap();
     bucket.put(b"key00001", b"val00001").unwrap();
-    db.force_flush().unwrap();
+    db.force_checkpoint().unwrap();
     let result = bucket.get(b"key00001").unwrap();
     assert_eq!(Some(b"val00001".to_vec()), result);
 
@@ -37,11 +37,11 @@ fn test_db_happy_path() {
 fn test_db_rollback() {
     setup();
 
-    _ = std::fs::remove_file("test.db");
-    _ = std::fs::remove_file("test.dbuff");
-    _ = std::fs::remove_file("test.wal");
+    _ = std::fs::remove_file("test2.db");
+    _ = std::fs::remove_file("test2.dbuff");
+    _ = std::fs::remove_file("test2.wal");
 
-    let db = Db::open(Path::new("test.db"), Setting::default()).unwrap();
+    let db = Db::open(Path::new("test2.db"), Setting::default()).unwrap();
 
     // When a transaction is rollback, all the changes made in that
     // transaction will be undone and the next txn won't see them
