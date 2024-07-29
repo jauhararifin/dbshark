@@ -1155,6 +1155,28 @@ impl<'a> PageWrite<'a> {
         Ok(self.into_leaf())
     }
 
+    pub(crate) fn set_leaf(
+        mut self,
+        ctx: LogContext<'_>,
+        payload: &'a [u8],
+    ) -> anyhow::Result<LeafPageWrite<'a>> {
+        assert!(
+            matches!(self.meta.kind, PageKind::None),
+            "page is not empty"
+        );
+        let LogContext::Redo(lsn) = ctx else {
+            panic!("set_leaf only can be used for redo-ing wal");
+        };
+
+        let pgid = self.id();
+        record_redo_mutation(lsn, &mut self.meta);
+
+        self.meta.kind = Pager::decode_leaf_page(payload)?;
+        self.buffer.copy_from_slice(payload);
+
+        Ok(self.into_leaf().expect("the page should be a leaf now"))
+    }
+
     pub(crate) fn into_leaf(self) -> Option<LeafPageWrite<'a>> {
         if let PageKind::Leaf { .. } = &self.meta.kind {
             Some(LeafPageWrite(self))

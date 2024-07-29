@@ -105,7 +105,7 @@ impl Db {
                     // Maybe we can send the error to the DB, so that any next operation in the DB
                     // will return an error. If we can't flush the dirty pages, we might not be
                     // able to do anything anyway.
-                    todo!()
+                    log::error!("cannot perform checkpoint: {err}");
                 }
             })
         };
@@ -174,9 +174,17 @@ impl Db {
             tx_state.tx_state = TxState::Aborting {
                 txid,
                 rollback: lsn,
+                last_undone: lsn,
+            };
+            let TxState::Aborting {
+                ref mut last_undone,
+                ..
+            } = tx_state.tx_state
+            else {
+                unreachable!();
             };
 
-            undo_txn(&self.pager, &self.wal, txid, lsn, lsn)?;
+            undo_txn(&self.pager, &self.wal, txid, lsn, last_undone)?;
             self.wal.append(txid, None, WalRecord::End)?;
             tx_state.tx_state = TxState::None;
         }
@@ -220,7 +228,6 @@ struct Header {
     version: u32,
     page_size: u32,
     last_txid: Option<TxId>,
-    // root_pgid: Option<PageId>,
 }
 
 impl Header {
@@ -260,16 +267,6 @@ pub struct Tx<'db> {
     pager: Arc<Pager>,
 
     tx_state: &'db RwLock<DbTxState>,
-
-    closed: bool,
-}
-
-impl<'db> Drop for Tx<'db> {
-    fn drop(&mut self) {
-        if !self.closed {
-            // todo!("should we panic here?");
-        }
-    }
 }
 
 impl<'db> Tx<'db> {
@@ -279,7 +276,6 @@ impl<'db> Tx<'db> {
             wal: db.wal.clone(),
             pager: db.pager.clone(),
             tx_state: &db.tx_state,
-            closed: false,
         };
         tx.wal.append(tx.id, None, WalRecord::Begin)?;
         Ok(tx)
@@ -342,7 +338,6 @@ impl<'db> Tx<'db> {
         let commit_lsn = self.wal.append(self.id, None, WalRecord::Commit)?;
         self.wal.append(self.id, None, WalRecord::End)?;
         self.wal.sync(commit_lsn)?;
-        self.closed = true;
 
         {
             let mut tx_state = self.tx_state.write();
@@ -356,21 +351,23 @@ impl<'db> Tx<'db> {
     pub fn rollback(mut self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
-        let lsn = {
-            let lsn = self.wal.append(self.id, None, WalRecord::Rollback)?;
-            let mut tx_state = self.tx_state.write();
-            assert_eq!(tx_state.tx_state, TxState::Active(self.id));
-            tx_state.tx_state = TxState::Aborting {
-                txid: self.id,
-                rollback: lsn,
-            };
-            lsn
+        let lsn = self.wal.append(self.id, None, WalRecord::Rollback)?;
+        let mut tx_state = self.tx_state.write();
+        assert_eq!(tx_state.tx_state, TxState::Active(self.id));
+        tx_state.tx_state = TxState::Aborting {
+            txid: self.id,
+            rollback: lsn,
+            last_undone: lsn,
+        };
+        let TxState::Aborting {
+            ref mut last_undone,
+            ..
+        } = tx_state.tx_state
+        else {
+            unreachable!();
         };
 
-        undo_txn(&self.pager, &self.wal, self.id, lsn, lsn)?;
-        self.wal.append(self.id, None, WalRecord::End)?;
-        self.closed = true;
-        let mut tx_state = self.tx_state.write();
+        undo_txn(&self.pager, &self.wal, self.id, lsn, last_undone)?;
         tx_state.tx_state = TxState::None;
 
         Ok(())

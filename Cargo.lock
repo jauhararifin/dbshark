@@ -97,7 +97,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2707e3afba5e19b75d582d88bc79237418f2a2a2d673d01cf9b03633b46e98f3"
 
 [[package]]
-name = "dbest"
+name = "dbshark"
 version = "0.1.0"
 dependencies = [
  "anyhow",

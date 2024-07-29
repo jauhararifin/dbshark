@@ -166,6 +166,7 @@ fn analyze(
                 tx_state = TxState::Aborting {
                     txid: entry.txid,
                     rollback: lsn,
+                    last_undone: lsn,
                 };
             }
             WalRecord::End => {
@@ -400,25 +401,27 @@ fn redo_page(
 fn undo(analyze_result: &AriesAnalyzeResult, pager: &Pager, wal: &Wal) -> anyhow::Result<()> {
     log::debug!("aries undo started");
 
-    match analyze_result.active_tx {
+    let mut active_tx = analyze_result.active_tx;
+    match &mut active_tx {
         TxState::None => {}
 
         TxState::Active(txid) => {
-            let lsn = wal.append(txid, None, WalRecord::Rollback)?;
-            undo_txn(pager, wal, txid, lsn, lsn)?;
-            wal.append(txid, None, WalRecord::End)?;
+            let lsn = wal.append(*txid, None, WalRecord::Rollback)?;
+            let mut last_undone = lsn;
+            undo_txn(pager, wal, *txid, lsn, &mut last_undone)?;
+            wal.append(*txid, None, WalRecord::End)?;
         }
 
         TxState::Committing(txid) => {
-            wal.append(txid, None, WalRecord::End)?;
+            wal.append(*txid, None, WalRecord::End)?;
         }
 
-        // TODO: maybe just create the DB, and let the DB handle the rollback
-        TxState::Aborting { txid, rollback } => {
-            undo_txn(pager, wal, txid, rollback, todo!())?;
-            todo!(
-                "continue aborting, find the first non-CLR record and continue undo it from there"
-            );
+        TxState::Aborting {
+            txid,
+            rollback,
+            ref mut last_undone,
+        } => {
+            undo_txn(pager, wal, *txid, *rollback, last_undone)?;
         }
     }
 
@@ -434,12 +437,11 @@ pub(crate) fn undo_txn(
     wal: &Wal,
     txid: TxId,
     lsn: Lsn,
-    last_undone_clr: Lsn,
+    last_undone_clr: &mut Lsn,
 ) -> anyhow::Result<()> {
     log::debug!("undo txn started from={lsn:?} last_undone_clr={last_undone_clr:?}");
 
     let mut iterator = wal.iterate_back(lsn);
-    let mut last_clr = None;
     let mut is_ended = false;
 
     let ctx = LogContext::Undo(wal, lsn);
@@ -449,22 +451,15 @@ pub(crate) fn undo_txn(
         if entry.txid != txid {
             continue;
         }
-        if lsn >= last_undone_clr {
+        if lsn >= *last_undone_clr {
             continue;
         }
+        assert!(
+            entry.clr.is_none(),
+            "when iterating back from rollback, there shouldn't be any CLR logs"
+        );
 
-        if let Some(clr_lsn) = entry.clr {
-            if last_clr.is_none() {
-                last_clr = Some(clr_lsn);
-                continue;
-            }
-        } else if let Some(last_undone) = last_clr {
-            if lsn >= last_undone {
-                continue;
-            }
-        }
-
-        let clr = Some(lsn);
+        *last_undone_clr = lsn;
         match entry.record {
             WalRecord::Begin => break,
             WalRecord::Commit => {
@@ -544,8 +539,16 @@ pub(crate) fn undo_txn(
                 pgid,
                 page_version,
                 payload,
-            } => todo!(),
-            WalRecord::LeafUndoReset { pgid } => todo!(),
+            } => {
+                if page_version != 0 {
+                    return Err(anyhow!("page version {page_version} is not supported"));
+                }
+                let page = pager.write(txid, pgid)?;
+                page.set_leaf(ctx, payload)?;
+            }
+            WalRecord::LeafUndoReset { pgid } => {
+                unreachable!("LeafUndoReset only used for CLR which shouldn't be undone");
+            }
             WalRecord::LeafInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {

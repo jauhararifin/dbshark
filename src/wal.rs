@@ -428,7 +428,12 @@ pub(crate) enum TxState {
     None,
     Active(TxId),
     Committing(TxId),
-    Aborting { txid: TxId, rollback: Lsn },
+    // TODO: we may need to add last undone lsn here
+    Aborting {
+        txid: TxId,
+        rollback: Lsn,
+        last_undone: Lsn,
+    },
 }
 
 const WAL_RECORD_BEGIN_KIND: u8 = 1;
@@ -505,7 +510,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
             WalRecord::LeafUndoDelete { .. } => 10,
 
-            WalRecord::CheckpointBegin { .. } => 40,
+            WalRecord::CheckpointBegin { .. } => 48,
         }
     }
 
@@ -676,14 +681,19 @@ impl<'a> WalRecord<'a> {
                         buff[0] = 3;
                         buff[8..16].copy_from_slice(&txid.to_be_bytes());
                     }
-                    TxState::Aborting { txid, rollback } => {
+                    TxState::Aborting {
+                        txid,
+                        rollback,
+                        last_undone,
+                    } => {
                         buff[0] = 4;
                         buff[8..16].copy_from_slice(&txid.to_be_bytes());
                         buff[16..24].copy_from_slice(&rollback.to_be_bytes());
+                        buff[24..32].copy_from_slice(&last_undone.to_be_bytes());
                     }
                 }
-                buff[24..32].copy_from_slice(&root.to_be_bytes());
-                buff[32..40].copy_from_slice(&freelist.to_be_bytes());
+                buff[32..40].copy_from_slice(&root.to_be_bytes());
+                buff[40..48].copy_from_slice(&freelist.to_be_bytes());
             }
         }
     }
@@ -880,13 +890,19 @@ impl<'a> WalRecord<'a> {
                             .ok_or(anyhow!("found zero transaction id"))?;
                         let rollback = Lsn::from_be_bytes(buff[16..24].try_into().unwrap())
                             .ok_or(anyhow!("found zero lsn"))?;
-                        TxState::Aborting { txid, rollback }
+                        let last_undone = Lsn::from_be_bytes(buff[24..32].try_into().unwrap())
+                            .ok_or(anyhow!("found zero lsn"))?;
+                        TxState::Aborting {
+                            txid,
+                            rollback,
+                            last_undone,
+                        }
                     }
                     kind => return Err(anyhow!("invalid checkout end kind {kind}")),
                 };
 
-                let root = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let freelist = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
+                let root = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
+                let freelist = PageId::from_be_bytes(buff[40..48].try_into().unwrap());
                 Ok(Self::CheckpointBegin {
                     active_tx,
                     root,
@@ -1368,6 +1384,7 @@ mod tests {
                     active_tx: TxState::Aborting {
                         txid: TxId::new(12).unwrap(),
                         rollback: Lsn::new(10).unwrap(),
+                        last_undone: Lsn::new(11).unwrap(),
                     },
                     root: PageId::new(100),
                     freelist: PageId::new(200),
