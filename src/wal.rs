@@ -261,30 +261,40 @@ impl<'a> WalBackwardIterator<'a> {
             return Ok(None);
         }
 
-        if self.end_offset < 8 {
+        if self.end_offset < 16 {
             self.reset();
         }
 
         let buff = &self.buffer[self.start_offset..self.end_offset];
-        if buff.len() < 8 {
-            let s = 8 - buff.len();
+        if buff.len() < 16 {
+            let s = 16 - buff.len();
             let mut f = self.wal.f.lock();
-            f.seek(SeekFrom::Start(offset - 8))?;
+            f.seek(SeekFrom::Start(offset - 16))?;
             f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
             self.start_offset -= s;
         }
 
-        let buff = &self.buffer[self.start_offset..self.end_offset];
-        let rec_size =
-            u16::from_be_bytes(buff[buff.len() - 16..buff.len() - 14].try_into().unwrap());
-        let size = WalEntry::size_by_record_size(rec_size as usize);
+        let checksum = u64::from_be_bytes(
+            self.buffer[self.end_offset - 8..self.end_offset]
+                .try_into()
+                .unwrap(),
+        );
+        let rec_size = u16::from_be_bytes(
+            self.buffer[self.end_offset - 16..self.end_offset - 16 + 2]
+                .try_into()
+                .unwrap(),
+        );
+        let magic_buff = &self.buffer[self.end_offset - 16 + 2..self.end_offset - 8];
+        assert!(magic_buff == b"abcxyz");
 
+        let size = WalEntry::size_by_record_size(rec_size as usize);
         if self.end_offset < size {
             self.reset();
         }
 
-        if self.buffer.len() < size {
-            let s = size - self.buffer.len();
+        let buff_len = self.end_offset - self.start_offset;
+        if buff_len < size {
+            let s = size - buff_len;
             let mut f = self.wal.f.lock();
             f.seek(SeekFrom::Start(offset - size as u64))?;
             f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
@@ -329,6 +339,10 @@ pub(crate) enum WalRecord<'a> {
 
         freelist: Option<PageId>,
         old_freelist: Option<PageId>,
+    },
+    HeaderUndoSet {
+        root: Option<PageId>,
+        freelist: Option<PageId>,
     },
 
     InteriorReset {
@@ -398,6 +412,8 @@ pub(crate) enum WalRecord<'a> {
 
     CheckpointBegin {
         active_tx: TxState,
+        root: Option<PageId>,
+        freelist: Option<PageId>,
     },
 }
 
@@ -421,6 +437,7 @@ const WAL_RECORD_ROLLBACK_KIND: u8 = 3;
 const WAL_RECORD_END_KIND: u8 = 4;
 
 const WAL_RECORD_HEADER_SET_KIND: u8 = 10;
+const WAL_RECORD_HEADER_UNDO_SET_KIND: u8 = 11;
 
 const WAL_RECORD_INTERIOR_RESET_KIND: u8 = 20;
 const WAL_RECORD_INTERIOR_UNDO_RESET_KIND: u8 = 21;
@@ -447,6 +464,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::End => WAL_RECORD_END_KIND,
 
             WalRecord::HeaderSet { .. } => WAL_RECORD_HEADER_SET_KIND,
+            WalRecord::HeaderUndoSet { .. } => WAL_RECORD_HEADER_UNDO_SET_KIND,
 
             WalRecord::InteriorReset { .. } => WAL_RECORD_INTERIOR_RESET_KIND,
             WalRecord::InteriorUndoReset { .. } => WAL_RECORD_INTERIOR_UNDO_RESET_KIND,
@@ -471,6 +489,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => 0,
 
             WalRecord::HeaderSet { .. } => 32,
+            WalRecord::HeaderUndoSet { .. } => 16,
 
             WalRecord::InteriorReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::InteriorUndoReset { .. } => 8,
@@ -486,13 +505,14 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
             WalRecord::LeafUndoDelete { .. } => 10,
 
-            WalRecord::CheckpointBegin { .. } => 24,
+            WalRecord::CheckpointBegin { .. } => 40,
         }
     }
 
     fn encode(&self, mut buff: &mut [u8]) {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
+
             WalRecord::HeaderSet {
                 root,
                 old_root,
@@ -503,6 +523,10 @@ impl<'a> WalRecord<'a> {
                 buff[8..16].copy_from_slice(&old_root.to_be_bytes());
                 buff[16..24].copy_from_slice(&freelist.to_be_bytes());
                 buff[24..32].copy_from_slice(&old_freelist.to_be_bytes());
+            }
+            WalRecord::HeaderUndoSet { root, freelist } => {
+                buff[0..8].copy_from_slice(&root.to_be_bytes());
+                buff[8..16].copy_from_slice(&freelist.to_be_bytes());
             }
 
             WalRecord::InteriorReset {
@@ -634,25 +658,33 @@ impl<'a> WalRecord<'a> {
                 buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
             }
 
-            WalRecord::CheckpointBegin { active_tx } => match active_tx {
-                TxState::None => {
-                    buff[0] = 1;
-                    buff[8..16].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+            WalRecord::CheckpointBegin {
+                active_tx,
+                root,
+                freelist,
+            } => {
+                match active_tx {
+                    TxState::None => {
+                        buff[0] = 1;
+                        buff[8..16].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+                    }
+                    TxState::Active(txid) => {
+                        buff[0] = 2;
+                        buff[8..16].copy_from_slice(&txid.to_be_bytes());
+                    }
+                    TxState::Committing(txid) => {
+                        buff[0] = 3;
+                        buff[8..16].copy_from_slice(&txid.to_be_bytes());
+                    }
+                    TxState::Aborting { txid, rollback } => {
+                        buff[0] = 4;
+                        buff[8..16].copy_from_slice(&txid.to_be_bytes());
+                        buff[16..24].copy_from_slice(&rollback.to_be_bytes());
+                    }
                 }
-                TxState::Active(txid) => {
-                    buff[0] = 2;
-                    buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                }
-                TxState::Committing(txid) => {
-                    buff[0] = 3;
-                    buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                }
-                TxState::Aborting { txid, rollback } => {
-                    buff[0] = 4;
-                    buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                    buff[16..24].copy_from_slice(&rollback.to_be_bytes());
-                }
-            },
+                buff[24..32].copy_from_slice(&root.to_be_bytes());
+                buff[32..40].copy_from_slice(&freelist.to_be_bytes());
+            }
         }
     }
 
@@ -674,6 +706,11 @@ impl<'a> WalRecord<'a> {
                     freelist,
                     old_freelist,
                 })
+            }
+            WAL_RECORD_HEADER_UNDO_SET_KIND => {
+                let root = PageId::from_be_bytes(buff[0..8].try_into().unwrap());
+                let freelist = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                Ok(Self::HeaderUndoSet { root, freelist })
             }
 
             WAL_RECORD_INTERIOR_RESET_KIND => {
@@ -848,7 +885,13 @@ impl<'a> WalRecord<'a> {
                     kind => return Err(anyhow!("invalid checkout end kind {kind}")),
                 };
 
-                Ok(Self::CheckpointBegin { active_tx })
+                let root = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
+                let freelist = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
+                Ok(Self::CheckpointBegin {
+                    active_tx,
+                    root,
+                    freelist,
+                })
             }
             _ => Err(anyhow!("invalid wal record kind {kind}")),
         }
@@ -1296,6 +1339,8 @@ mod tests {
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointBegin {
                     active_tx: TxState::None,
+                    root: None,
+                    freelist: PageId::new(100),
                 },
             },
             WalEntry {
@@ -1303,6 +1348,8 @@ mod tests {
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointBegin {
                     active_tx: TxState::Active(TxId::new(12).unwrap()),
+                    root: PageId::new(100),
+                    freelist: None,
                 },
             },
             WalEntry {
@@ -1310,6 +1357,8 @@ mod tests {
                 clr: Lsn::new(99),
                 record: WalRecord::CheckpointBegin {
                     active_tx: TxState::Committing(TxId::new(12).unwrap()),
+                    root: PageId::new(100),
+                    freelist: PageId::new(200),
                 },
             },
             WalEntry {
@@ -1320,6 +1369,8 @@ mod tests {
                         txid: TxId::new(12).unwrap(),
                         rollback: Lsn::new(10).unwrap(),
                     },
+                    root: PageId::new(100),
+                    freelist: PageId::new(200),
                 },
             },
         ];

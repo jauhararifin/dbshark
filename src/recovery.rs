@@ -1,5 +1,5 @@
 use crate::content::Bytes;
-use crate::pager::{LogContext, PageId, PageIdExt, PageWrite, Pager};
+use crate::pager::{DbState, LogContext, PageId, PageIdExt, PageWrite, Pager};
 use crate::wal::{
     build_wal_header, load_wal_header, Lsn, LsnExt, TxId, TxState, Wal, WalDecodeResult, WalEntry,
     WalHeader, WalRecord, WAL_HEADER_SIZE,
@@ -17,7 +17,7 @@ pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::R
     let wal_header = get_wal_header(&mut f, page_size)?;
 
     let analyze_result = analyze(&mut f, &wal_header, page_size)?;
-    let redo_result = redo(&mut f, pager, &wal_header, &analyze_result, page_size)?;
+    redo(&mut f, pager, &wal_header, &analyze_result, page_size)?;
 
     let wal = Wal::new(
         f,
@@ -179,7 +179,7 @@ fn analyze(
                 tx_state = TxState::None;
             }
 
-            WalRecord::CheckpointBegin { active_tx } => {
+            WalRecord::CheckpointBegin { active_tx, .. } => {
                 tx_state = active_tx;
             }
 
@@ -218,22 +218,13 @@ fn analyze(
     })
 }
 
-struct RedoResult {
-    db_state: Option<DbState>,
-}
-
-struct DbState {
-    root: Option<PageId>,
-    freelist: Option<PageId>,
-}
-
 fn redo(
     f: &mut File,
     pager: &Pager,
     wal_header: &WalHeader,
     analyze_result: &AriesAnalyzeResult,
     page_size: usize,
-) -> anyhow::Result<RedoResult> {
+) -> anyhow::Result<()> {
     let mut iter = iterate_wal_forward(
         f,
         wal_header.relative_lsn_offset as usize,
@@ -241,21 +232,17 @@ fn redo(
         analyze_result.lsn_to_redo,
     )?;
 
-    let mut result = RedoResult { db_state: None };
-
     log::debug!("aries redo started");
 
     while let Some((lsn, entry)) = iter.next()? {
         log::debug!("aries redo item lsn={lsn:?} entry={entry:?}");
         match entry.record {
-            WalRecord::Begin
-            | WalRecord::Commit
-            | WalRecord::Rollback
-            | WalRecord::End
-            | WalRecord::CheckpointBegin { .. } => (),
+            WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
 
-            WalRecord::HeaderSet { root, freelist, .. } => {
-                result.db_state = Some(DbState { root, freelist });
+            WalRecord::CheckpointBegin { root, freelist, .. }
+            | WalRecord::HeaderSet { root, freelist, .. }
+            | WalRecord::HeaderUndoSet { root, freelist, .. } => {
+                pager.set_db_state(DbState { root, freelist });
             }
 
             WalRecord::InteriorReset { pgid, .. }
@@ -277,7 +264,7 @@ fn redo(
 
     log::debug!("aries redo finished");
 
-    Ok(result)
+    Ok(())
 }
 
 fn redo_page(
@@ -309,7 +296,10 @@ fn redo_page(
         | WalRecord::Rollback
         | WalRecord::End
         | WalRecord::CheckpointBegin { .. }
-        | WalRecord::HeaderSet { .. } => unreachable!(),
+        | WalRecord::HeaderSet { .. }
+        | WalRecord::HeaderUndoSet { .. } => {
+            unreachable!("this case should be filtered out by the caller")
+        }
 
         WalRecord::InteriorReset { pgid, .. } | WalRecord::InteriorUndoReset { pgid } => {
             let Some(mut page) = page.into_interior() else {
@@ -415,7 +405,7 @@ fn undo(analyze_result: &AriesAnalyzeResult, pager: &Pager, wal: &Wal) -> anyhow
 
         TxState::Active(txid) => {
             let lsn = wal.append(txid, None, WalRecord::Rollback)?;
-            undo_txn(pager, wal, txid, lsn, lsn, todo!(), todo!());
+            undo_txn(pager, wal, txid, lsn, lsn)?;
             wal.append(txid, None, WalRecord::End)?;
         }
 
@@ -425,7 +415,7 @@ fn undo(analyze_result: &AriesAnalyzeResult, pager: &Pager, wal: &Wal) -> anyhow
 
         // TODO: maybe just create the DB, and let the DB handle the rollback
         TxState::Aborting { txid, rollback } => {
-            undo_txn(pager, wal, txid, rollback, todo!(), todo!(), todo!());
+            undo_txn(pager, wal, txid, rollback, todo!())?;
             todo!(
                 "continue aborting, find the first non-CLR record and continue undo it from there"
             );
@@ -445,8 +435,6 @@ pub(crate) fn undo_txn(
     txid: TxId,
     lsn: Lsn,
     last_undone_clr: Lsn,
-    db_root: &mut Option<PageId>,
-    db_freelist: &mut Option<PageId>,
 ) -> anyhow::Result<()> {
     log::debug!("undo txn started from={lsn:?} last_undone_clr={last_undone_clr:?}");
 
@@ -490,8 +478,13 @@ pub(crate) fn undo_txn(
                 old_freelist,
                 ..
             } => {
-                *db_root = old_root;
-                *db_freelist = old_freelist;
+                pager.set_db_state(DbState {
+                    root: old_root,
+                    freelist: old_freelist,
+                });
+            }
+            WalRecord::HeaderUndoSet { .. } => {
+                unreachable!("HeaderUndoSet only used for CLR which shouldn't be undone");
             }
 
             WalRecord::InteriorReset {

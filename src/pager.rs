@@ -78,6 +78,13 @@ pub(crate) struct Pager {
 
     internal: RwLock<PagerInternal>,
     flush_internal: RwLock<PagerFlushInternal>,
+    db_state: RwLock<DbState>,
+}
+
+#[derive(Default)]
+pub(crate) struct DbState {
+    pub(crate) root: Option<PageId>,
+    pub(crate) freelist: Option<PageId>,
 }
 
 pub(crate) struct PagerInternal {
@@ -192,6 +199,7 @@ impl Pager {
                 flushing_pages,
                 flushing_pgids: vec![],
             }),
+            db_state: RwLock::new(DbState::default()),
         })
     }
 
@@ -255,6 +263,18 @@ impl Pager {
 
     pub(crate) fn page_count(&self) -> usize {
         self.internal.read().file_page_count
+    }
+
+    pub(crate) fn set_db_state(&self, db_state: DbState) {
+        *self.db_state.write() = db_state;
+    }
+
+    pub(crate) fn root(&self) -> Option<PageId> {
+        self.db_state.read().root
+    }
+
+    pub(crate) fn freelist(&self) -> Option<PageId> {
+        self.db_state.read().freelist
     }
 
     // TODO: consider using read lock for fast path. Most of the time, acquiring a page
@@ -541,7 +561,25 @@ impl Pager {
     // considered different component, this DB combines them together. During checkpoint, all
     // dirty pages are flushed. This makes the checkpoint process longer, but simpler. We also
     // don't need checkpoint-end log record.
-    pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
+    pub(crate) fn checkpoint(
+        &self,
+        wal: &Wal,
+        tx_state: impl std::ops::Deref<Target = TxState>,
+    ) -> anyhow::Result<()> {
+        let checkpoint_lsn = {
+            let db_state = self.db_state.read();
+            wal.append(
+                TxId::new(1).unwrap(),
+                None,
+                WalRecord::CheckpointBegin {
+                    active_tx: *tx_state.deref(),
+                    root: db_state.root,
+                    freelist: db_state.freelist,
+                },
+            )?
+        };
+        drop(tx_state);
+
         for frame_id in 0..self.n {
             let (meta, buffer) = {
                 let internal = self.internal.write();
@@ -576,6 +614,8 @@ impl Pager {
                 Self::flush_page(&self.f, &self.double_buff_f, frame.id, buffer)?;
             }
         }
+
+        wal.update_checkpoint(checkpoint_lsn)?;
 
         Ok(())
     }
@@ -1036,7 +1076,7 @@ impl<'a> PageWrite<'a> {
             record_mutation(
                 self.txid,
                 ctx,
-                &mut self.meta,
+                &mut self.meta.wal,
                 WalRecord::InteriorInit { pgid, last },
                 WalRecord::InteriorInit { pgid, last },
             )?;
@@ -1096,7 +1136,7 @@ impl<'a> PageWrite<'a> {
             record_mutation(
                 self.txid,
                 ctx,
-                &mut self.meta,
+                &mut self.meta.wal,
                 WalRecord::LeafInit { pgid },
                 WalRecord::LeafInit { pgid },
             )?;
@@ -1128,7 +1168,7 @@ impl<'a> PageWrite<'a> {
 fn record_mutation(
     txid: TxId,
     ctx: LogContext<'_>,
-    meta: &mut PageMeta,
+    meta_wal: &mut Option<PageWalInfo>,
     entry: WalRecord,
     compensation_entry: WalRecord,
 ) -> anyhow::Result<()> {
@@ -1144,10 +1184,10 @@ fn record_mutation(
         LogContext::Redo(lsn) => lsn,
     };
 
-    if let Some(ref mut wal_info) = meta.wal {
+    if let Some(ref mut wal_info) = meta_wal {
         wal_info.page = lsn;
     } else {
-        meta.wal = Some(PageWalInfo {
+        *meta_wal = Some(PageWalInfo {
             rec: lsn,
             page: lsn,
         });
@@ -1317,7 +1357,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta,
+            &mut self.0.meta.wal,
             WalRecord::InteriorReset {
                 pgid,
                 page_version: 0,
@@ -1368,7 +1408,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta,
+            &mut self.0.meta.wal,
             WalRecord::InteriorInsert {
                 pgid,
                 index: i,
@@ -1485,7 +1525,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta,
+            &mut self.0.meta.wal,
             WalRecord::InteriorDelete {
                 pgid,
                 index,
@@ -1615,7 +1655,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta,
+            &mut self.0.meta.wal,
             WalRecord::LeafReset {
                 pgid,
                 page_version: 0,
@@ -1637,7 +1677,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta,
+            &mut self.0.meta.wal,
             WalRecord::LeafDelete {
                 pgid,
                 index,
@@ -1710,7 +1750,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta,
+            &mut self.0.meta.wal,
             WalRecord::LeafInsert {
                 pgid,
                 index: i,

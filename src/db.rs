@@ -1,9 +1,9 @@
 use crate::btree::BTree;
-use crate::pager::{PageId, PageIdExt, Pager};
+use crate::pager::{DbState, PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
 use anyhow::anyhow;
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -14,7 +14,6 @@ use std::time::Duration;
 use std::{fs::File, path::Path};
 
 pub struct Db {
-    internal: RwLock<DbInternal>,
     pager: Arc<Pager>,
     wal: Arc<Wal>,
 
@@ -22,12 +21,6 @@ pub struct Db {
 
     background_chan: Sender<()>,
     background_thread: JoinHandle<()>,
-}
-
-struct DbInternal {
-    // TODO: maybe these two information should be managed by Pager
-    root: Option<PageId>,
-    freelist: Option<PageId>,
 }
 
 struct DbTxState {
@@ -120,11 +113,6 @@ impl Db {
         Ok(Self {
             pager,
             wal,
-            internal: RwLock::new(DbInternal {
-                root: None,
-                freelist: None,
-            }),
-
             tx_state,
             background_chan: sender,
             background_thread,
@@ -158,18 +146,7 @@ impl Db {
     }
 
     fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<DbTxState>) -> anyhow::Result<()> {
-        let checkpoint_lsn = {
-            let tx_state = tx_state.read();
-            wal.append(
-                TxId::new(1).unwrap(),
-                None,
-                WalRecord::CheckpointBegin {
-                    active_tx: tx_state.tx_state,
-                },
-            )?
-        };
-        pager.checkpoint(&wal)?;
-        wal.update_checkpoint(checkpoint_lsn)?;
+        pager.checkpoint(wal, RwLockReadGuard::map(tx_state.read(), |x| &x.tx_state));
         Ok(())
     }
 
@@ -178,7 +155,6 @@ impl Db {
             version: 0,
             page_size: DEFAULT_PAGE_SIZE as u32,
             last_txid: None,
-            root_pgid: None,
         };
 
         let mut buff = vec![0; 2 * DB_HEADER_SIZE];
@@ -200,21 +176,8 @@ impl Db {
                 rollback: lsn,
             };
 
-            {
-                let mut db = self.internal.write();
-                let mut db: &mut DbInternal = &mut db;
-                undo_txn(
-                    &self.pager,
-                    &self.wal,
-                    txid,
-                    lsn,
-                    lsn,
-                    &mut db.root,
-                    &mut db.freelist,
-                )?;
-                self.wal.append(txid, None, WalRecord::End)?;
-            }
-
+            undo_txn(&self.pager, &self.wal, txid, lsn, lsn)?;
+            self.wal.append(txid, None, WalRecord::End)?;
             tx_state.tx_state = TxState::None;
         }
 
@@ -231,7 +194,6 @@ impl Db {
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {
-        let internal = self.internal.into_inner();
         self.background_chan.send(())?;
         if self.background_thread.join().is_err() {
             return Err(anyhow!("cannot join background thread"));
@@ -250,7 +212,7 @@ impl Db {
     }
 }
 
-const DB_HEADER_SIZE: usize = 40;
+const DB_HEADER_SIZE: usize = 32;
 const DEFAULT_PAGE_SIZE: usize = 0x1000;
 const MAGIC_HEADER: &[u8] = b"dbest000";
 
@@ -258,7 +220,7 @@ struct Header {
     version: u32,
     page_size: u32,
     last_txid: Option<TxId>,
-    root_pgid: Option<PageId>,
+    // root_pgid: Option<PageId>,
 }
 
 impl Header {
@@ -267,14 +229,14 @@ impl Header {
         buff[8..12].copy_from_slice(&self.version.to_be_bytes());
         buff[12..16].copy_from_slice(&self.page_size.to_be_bytes());
         buff[16..24].copy_from_slice(&self.last_txid.to_be_bytes());
-        buff[24..32].copy_from_slice(&self.root_pgid.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..32]);
-        buff[32..40].copy_from_slice(&checksum.to_be_bytes());
+        let checksum = crc64::crc64(0, &buff[0..24]);
+        buff[24..32].copy_from_slice(&checksum.to_be_bytes());
     }
 
     fn decode(buff: &[u8]) -> Option<Self> {
-        let calculated_checksum = crc64::crc64(0, &buff[0..32]);
-        let checksum = u64::from_be_bytes(buff[32..40].try_into().unwrap());
+        let calculated_checksum = crc64::crc64(0, &buff[0..DB_HEADER_SIZE - 8]);
+        let checksum =
+            u64::from_be_bytes(buff[DB_HEADER_SIZE - 8..DB_HEADER_SIZE].try_into().unwrap());
 
         if calculated_checksum != checksum {
             return None;
@@ -283,13 +245,11 @@ impl Header {
         let version = u32::from_be_bytes(buff[8..12].try_into().unwrap());
         let page_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
         let last_txid = TxId::from_be_bytes(buff[16..24].try_into().unwrap());
-        let root_pgid = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
 
         Some(Self {
             version,
             page_size,
             last_txid,
-            root_pgid,
         })
     }
 }
@@ -300,7 +260,6 @@ pub struct Tx<'db> {
     pager: Arc<Pager>,
 
     tx_state: &'db RwLock<DbTxState>,
-    db: RwLockWriteGuard<'db, DbInternal>,
 
     closed: bool,
 }
@@ -320,7 +279,6 @@ impl<'db> Tx<'db> {
             wal: db.wal.clone(),
             pager: db.pager.clone(),
             tx_state: &db.tx_state,
-            db: db.internal.write(),
             closed: false,
         };
         tx.wal.append(tx.id, None, WalRecord::Begin)?;
@@ -330,7 +288,7 @@ impl<'db> Tx<'db> {
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
-        let mut btree = BTree::new(self.id, &self.pager, &self.wal, root_pgid, self.db.freelist);
+        let mut btree = BTree::new(self.id, &self.pager, &self.wal, root_pgid);
         let mut result = btree.seek(name.as_bytes())?;
         let bucket_pgid = if !result.found {
             drop(result);
@@ -355,34 +313,21 @@ impl<'db> Tx<'db> {
         };
 
         Ok(Bucket {
-            btree: BTree::new(
-                self.id,
-                &self.pager,
-                &self.wal,
-                bucket_pgid,
-                self.db.freelist,
-            ),
+            btree: BTree::new(self.id, &self.pager, &self.wal, bucket_pgid),
         })
     }
 
     fn init_root(&mut self) -> anyhow::Result<PageId> {
-        if let Some(pgid) = self.db.root {
+        if let Some(pgid) = self.pager.root() {
             Ok(pgid)
         } else {
             let page = self.pager.alloc(self.id)?;
             let pgid = page.id();
-            self.wal.append(
-                self.id,
-                None,
-                WalRecord::HeaderSet {
-                    root: Some(pgid),
-                    old_root: self.db.root,
-                    freelist: self.db.freelist,
-                    old_freelist: self.db.freelist,
-                },
-            )?;
+            self.pager.set_db_state(DbState {
+                root: Some(pgid),
+                freelist: self.pager.freelist(),
+            });
             drop(page);
-            self.db.root = Some(pgid);
             Ok(pgid)
         }
     }
@@ -422,23 +367,11 @@ impl<'db> Tx<'db> {
             lsn
         };
 
-        let db: &mut DbInternal = &mut self.db;
-        undo_txn(
-            &self.pager,
-            &self.wal,
-            self.id,
-            lsn,
-            lsn,
-            &mut db.root,
-            &mut db.freelist,
-        )?;
+        undo_txn(&self.pager, &self.wal, self.id, lsn, lsn)?;
         self.wal.append(self.id, None, WalRecord::End)?;
         self.closed = true;
-
-        {
-            let mut tx_state = self.tx_state.write();
-            tx_state.tx_state = TxState::None;
-        }
+        let mut tx_state = self.tx_state.write();
+        tx_state.tx_state = TxState::None;
 
         Ok(())
     }

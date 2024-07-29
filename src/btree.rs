@@ -11,7 +11,6 @@ pub(crate) struct BTree<'a> {
     pager: &'a Pager,
     ctx: LogContext<'a>,
     root: PageId,
-    freelist: Option<PageId>,
 }
 
 const MAX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
@@ -28,19 +27,12 @@ struct LookupHop<T> {
 }
 
 impl<'a> BTree<'a> {
-    pub(crate) fn new(
-        txid: TxId,
-        pager: &'a Pager,
-        wal: &'a Wal,
-        root: PageId,
-        freelist: Option<PageId>,
-    ) -> BTree<'a> {
+    pub(crate) fn new(txid: TxId, pager: &'a Pager, wal: &'a Wal, root: PageId) -> BTree<'a> {
         BTree {
             txid,
             pager,
             ctx: LogContext::Runtime(wal),
             root,
-            freelist,
         }
     }
 
