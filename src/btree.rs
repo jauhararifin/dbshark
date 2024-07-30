@@ -1,7 +1,7 @@
 use crate::content::{Bytes, Content};
 use crate::pager::{
     BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
-    OverflowPageRead, PageId, Pager,
+    OverflowPageRead, PageId, PageWrite, Pager,
 };
 use crate::wal::{TxId, Wal};
 use anyhow::anyhow;
@@ -60,16 +60,17 @@ impl<'a> BTree<'a> {
         let mut result = self.lookup_for_insert(key)?;
 
         if result.leaf.found {
-            todo!("delete the existing cell");
+            self.delete_leaf_cell(&mut result.leaf.node, result.leaf.index)?;
         }
 
         let keyval = KeyValContent::new(key, value);
-        if self.insert_content_to_leaf(
+        let inserted = self.insert_content_to_leaf(
             &mut result.leaf.node,
             result.leaf.index,
             keyval,
             key.len(),
-        )? {
+        )?;
+        if inserted {
             return Ok(());
         }
 
@@ -92,10 +93,7 @@ impl<'a> BTree<'a> {
             } else {
                 node.get(i).ptr()
             };
-            let next = self
-                .pager
-                .write(self.txid, next_pgid)
-                .expect("missing page");
+            let next = self.pager.write(self.txid, next_pgid)?;
 
             if !node.might_split() {
                 hops.clear();
@@ -150,6 +148,22 @@ impl<'a> BTree<'a> {
         Ok((i, found))
     }
 
+    fn delete_leaf_cell(&self, page: &mut LeafPageWrite, index: usize) -> anyhow::Result<()> {
+        let cell = page.get(index);
+        let mut overflow_pgid = cell.overflow();
+        while let Some(pgid) = overflow_pgid {
+            let Some(overflow) = self.pager.read(pgid)?.into_overflow() else {
+                return Err(anyhow!("expected an overflow page"));
+            };
+            overflow_pgid = overflow.next();
+            drop(overflow);
+            self.delete_page(pgid)?;
+        }
+
+        page.delete(self.ctx, index)?;
+        Ok(())
+    }
+
     fn insert_content_to_leaf(
         &self,
         node: &mut LeafPageWrite,
@@ -167,7 +181,26 @@ impl<'a> BTree<'a> {
             return Ok(true);
         }
 
-        todo!("insert the remaining content to overflow pages");
+        let next_page = self.new_page()?;
+        let mut overflow = next_page
+            .init_overflow(self.ctx)?
+            .expect("new page should always be convertible to overflow page");
+        let next_pgid = overflow.id();
+        node.set_cell_overflow(self.ctx, index, Some(next_pgid))?;
+        overflow.insert_content(self.ctx, &mut content, None)?;
+
+        while !content.is_finished() {
+            let next_page_2 = self.new_page()?;
+            let mut overflow_2 = next_page_2
+                .init_overflow(self.ctx)?
+                .expect("new page should always be convertible to overflow page");
+            let next_pgid_2 = overflow_2.id();
+            overflow.set_next(self.ctx, Some(next_pgid_2))?;
+            overflow_2.insert_content(self.ctx, &mut content, None)?;
+            overflow = overflow_2;
+        }
+
+        Ok(true)
     }
 
     pub(crate) fn seek(&self, key: &[u8]) -> anyhow::Result<LookupResult> {
@@ -211,6 +244,19 @@ impl<'a> BTree<'a> {
             },
             found,
         })
+    }
+
+    fn new_page(&self) -> anyhow::Result<PageWrite> {
+        let Some(freelist_pgid) = self.pager.freelist() else {
+            let page = self.pager.alloc(self.txid)?;
+            return Ok(page);
+        };
+
+        todo!("allocate new page from freelist");
+    }
+
+    fn delete_page(&self, pgid: PageId) -> anyhow::Result<()> {
+        todo!();
     }
 }
 
@@ -325,9 +371,11 @@ struct BTreeContent<'a> {
 
 impl<'a> BTreeContent<'a> {
     fn new(pager: &'a Pager, cell: &'a impl BTreeCell) -> Self {
+        let raw_size = std::cmp::min(cell.raw().len(), cell.key_size());
+        let raw = &cell.raw()[..raw_size];
         BTreeContent {
             pager,
-            raw: cell.raw(),
+            raw,
             overflow: cell.overflow(),
             remaining: cell.key_size(),
 
@@ -354,7 +402,7 @@ impl<'a> Content for BTreeContent<'a> {
         self.remaining
     }
 
-    fn put(&mut self, target: &mut [u8]) -> anyhow::Result<()> {
+    fn put(&mut self, mut target: &mut [u8]) -> anyhow::Result<()> {
         while !target.is_empty() && !self.is_finished() {
             if let Some(ref overflow_page) = self.overflow_page {
                 let data = overflow_page.content();
@@ -366,6 +414,7 @@ impl<'a> Content for BTreeContent<'a> {
                 let s = std::cmp::min(s, self.remaining);
 
                 target.copy_from_slice(&data[self.offset..self.offset + s]);
+                target = &mut target[s..];
                 self.remaining -= s;
                 self.offset += s;
                 if self.offset < data.len() {
@@ -381,18 +430,26 @@ impl<'a> Content for BTreeContent<'a> {
                     assert!(self.remaining == 0);
                 }
             } else {
-                if self.raw.is_empty() {
-                    return Err(anyhow!("the content is not finished but raw is empty"));
-                }
-
                 let s = std::cmp::min(self.raw.len(), target.len());
                 let s = std::cmp::min(s, self.remaining);
                 target[..s].copy_from_slice(&self.raw[..s]);
+                target = &mut target[s..];
                 self.remaining -= s;
                 self.raw = &self.raw[s..];
                 if !self.raw.is_empty() {
+                    assert!(target.is_empty());
                     return Ok(());
                 }
+
+                let Some(overflow_pgid) = self.overflow else {
+                    assert!(self.is_finished());
+                    break;
+                };
+
+                let Some(page) = self.pager.read(overflow_pgid)?.into_overflow() else {
+                    return Err(anyhow!("expected overflow page"));
+                };
+                self.overflow_page = Some(page);
             }
         }
 

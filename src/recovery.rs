@@ -257,7 +257,12 @@ fn redo(
             | WalRecord::LeafInit { pgid, .. }
             | WalRecord::LeafInsert { pgid, .. }
             | WalRecord::LeafDelete { pgid, .. }
-            | WalRecord::LeafUndoDelete { pgid, .. } => {
+            | WalRecord::LeafUndoDelete { pgid, .. }
+            | WalRecord::LeafSetOverflow { pgid, .. }
+            | WalRecord::OverflowReset { pgid, .. }
+            | WalRecord::OverflowUndoReset { pgid }
+            | WalRecord::OverflowInit { pgid, .. }
+            | WalRecord::OverflowInsert { pgid, .. } => {
                 redo_page(pager, analyze_result, lsn, &entry, pgid)?;
             }
         };
@@ -392,6 +397,41 @@ fn redo_page(
                 ));
             };
             page.delete(ctx, index)?;
+        }
+        WalRecord::LeafSetOverflow {
+            pgid,
+            index,
+            overflow,
+            ..
+        } => {
+            let Some(mut page) = page.into_leaf() else {
+                return Err(anyhow!(
+                    "redo failed on leaf set overflow because page is not a leaf"
+                ));
+            };
+            page.set_cell_overflow(ctx, index, overflow)?;
+        }
+
+        WalRecord::OverflowReset { pgid, .. } | WalRecord::OverflowUndoReset { pgid } => {
+            let Some(mut page) = page.into_overflow() else {
+                return Err(anyhow!(
+                    "redo failed on overflow reset because page is not an overflow"
+                ));
+            };
+            page.reset(ctx)?;
+        }
+        WalRecord::OverflowInit { pgid } => {
+            if page.init_overflow(ctx)?.is_none() {
+                return Err(anyhow!("redo failed on overflow init"));
+            };
+        }
+        WalRecord::OverflowInsert { pgid, next, raw } => {
+            let Some(mut page) = page.into_overflow() else {
+                return Err(anyhow!(
+                    "redo failed on overflow reset because page is not an overflow"
+                ));
+            };
+            page.insert_content(ctx, &mut Bytes::new(raw), next)?;
         }
     }
 
@@ -586,6 +626,47 @@ pub(crate) fn undo_txn(
             }
             WalRecord::LeafUndoDelete { pgid, index } => {
                 unreachable!("LeafUndoDelete only used for CLR which shouldn't be undone");
+            }
+            WalRecord::LeafSetOverflow {
+                pgid,
+                index,
+                old_overflow,
+                ..
+            } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_leaf() else {
+                    return Err(anyhow!("expected a leaf page for undo"));
+                };
+                page.set_cell_overflow(ctx, index, old_overflow)?;
+            }
+
+            WalRecord::OverflowReset {
+                pgid,
+                page_version,
+                payload,
+            } => {
+                if page_version != 0 {
+                    return Err(anyhow!("page version {page_version} is not supported"));
+                }
+                let page = pager.write(txid, pgid)?;
+                page.set_overflow(ctx, payload)?;
+            }
+            WalRecord::OverflowUndoReset { pgid } => {
+                unreachable!("OverflowUndoReset only used for CLR which shouldn't be undone");
+            }
+            WalRecord::OverflowInit { pgid } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_overflow() else {
+                    return Err(anyhow!("expected a overflow page for undo"));
+                };
+                page.reset(ctx)?;
+            }
+            WalRecord::OverflowInsert { pgid, .. } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_overflow() else {
+                    return Err(anyhow!("expected a overflow page for undo"));
+                };
+                page.clear(ctx);
             }
 
             WalRecord::CheckpointBegin { .. } => (),

@@ -245,6 +245,8 @@ impl Wal {
     }
 }
 
+// TODO: check if we handle incomplete write when iterating the wal backward.
+
 pub(crate) struct WalBackwardIterator<'a> {
     wal: &'a Wal,
 
@@ -409,6 +411,29 @@ pub(crate) enum WalRecord<'a> {
         pgid: PageId,
         index: usize,
     },
+    LeafSetOverflow {
+        pgid: PageId,
+        index: usize,
+        overflow: Option<PageId>,
+        old_overflow: Option<PageId>,
+    },
+
+    OverflowReset {
+        pgid: PageId,
+        page_version: u16,
+        payload: &'a [u8],
+    },
+    OverflowUndoReset {
+        pgid: PageId,
+    },
+    OverflowInit {
+        pgid: PageId,
+    },
+    OverflowInsert {
+        pgid: PageId,
+        raw: &'a [u8],
+        next: Option<PageId>,
+    },
 
     CheckpointBegin {
         active_tx: TxState,
@@ -457,6 +482,12 @@ const WAL_RECORD_LEAF_INIT_KIND: u8 = 32;
 const WAL_RECORD_LEAF_INSERT_KIND: u8 = 33;
 const WAL_RECORD_LEAF_DELETE_KIND: u8 = 34;
 const WAL_RECORD_LEAF_UNDO_DELETE_KIND: u8 = 35;
+const WAL_RECORD_LEAF_SET_OVERFLOW_KIND: u8 = 36;
+
+const WAL_RECORD_OVERFLOW_RESET_KIND: u8 = 40;
+const WAL_RECORD_OVERFLOW_UNDO_RESET_KIND: u8 = 41;
+const WAL_RECORD_OVERFLOW_INIT_KIND: u8 = 42;
+const WAL_RECORD_OVERFLOW_INSERT_KIND: u8 = 43;
 
 const WAL_RECORD_CHECKPOINT_BEGIN_KIND: u8 = 100;
 
@@ -484,6 +515,12 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafInsert { .. } => WAL_RECORD_LEAF_INSERT_KIND,
             WalRecord::LeafDelete { .. } => WAL_RECORD_LEAF_DELETE_KIND,
             WalRecord::LeafUndoDelete { .. } => WAL_RECORD_LEAF_UNDO_DELETE_KIND,
+            WalRecord::LeafSetOverflow { .. } => WAL_RECORD_LEAF_SET_OVERFLOW_KIND,
+
+            WalRecord::OverflowReset { .. } => WAL_RECORD_OVERFLOW_RESET_KIND,
+            WalRecord::OverflowUndoReset { .. } => WAL_RECORD_OVERFLOW_UNDO_RESET_KIND,
+            WalRecord::OverflowInit { .. } => WAL_RECORD_OVERFLOW_INIT_KIND,
+            WalRecord::OverflowInsert { .. } => WAL_RECORD_OVERFLOW_INSERT_KIND,
 
             WalRecord::CheckpointBegin { .. } => WAL_RECORD_CHECKPOINT_BEGIN_KIND,
         }
@@ -509,6 +546,12 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafInsert { raw, .. } => 28 + raw.len(),
             WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
             WalRecord::LeafUndoDelete { .. } => 10,
+            WalRecord::LeafSetOverflow { .. } => 26,
+
+            WalRecord::OverflowReset { payload, .. } => 8 + 2 + 2 + payload.len(),
+            WalRecord::OverflowUndoReset { .. } => 8,
+            WalRecord::OverflowInit { .. } => 8,
+            WalRecord::OverflowInsert { raw, .. } => 18 + raw.len(),
 
             WalRecord::CheckpointBegin { .. } => 48,
         }
@@ -661,6 +704,43 @@ impl<'a> WalRecord<'a> {
                 assert!(*index <= u16::MAX as usize);
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
                 buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
+            }
+            WalRecord::LeafSetOverflow {
+                pgid,
+                index,
+                overflow,
+                old_overflow,
+            } => {
+                assert!(*index <= u16::MAX as usize);
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..16].copy_from_slice(&overflow.to_be_bytes());
+                buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
+                buff[24..26].copy_from_slice(&(*index as u16).to_be_bytes());
+            }
+
+            WalRecord::OverflowReset {
+                pgid,
+                page_version,
+                payload,
+            } => {
+                assert!(payload.len() <= u16::MAX as usize);
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
+                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                buff[12..12 + payload.len()].copy_from_slice(payload);
+            }
+            WalRecord::OverflowUndoReset { pgid } => {
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+            }
+            WalRecord::OverflowInit { pgid } => {
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+            }
+            WalRecord::OverflowInsert { pgid, next, raw } => {
+                assert!(raw.len() <= u16::MAX as usize);
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..16].copy_from_slice(&next.to_be_bytes());
+                buff[16..18].copy_from_slice(&(raw.len() as u16).to_be_bytes());
+                buff[18..18 + raw.len()].copy_from_slice(&raw);
             }
 
             WalRecord::CheckpointBegin {
@@ -869,6 +949,57 @@ impl<'a> WalRecord<'a> {
                 Ok(Self::LeafUndoDelete {
                     pgid,
                     index: index as usize,
+                })
+            }
+            WAL_RECORD_LEAF_SET_OVERFLOW_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let overflow = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                let old_overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
+                let index = u16::from_be_bytes(buff[24..26].try_into().unwrap());
+                Ok(Self::LeafSetOverflow {
+                    pgid,
+                    index: index as usize,
+                    overflow,
+                    old_overflow,
+                })
+            }
+
+            WAL_RECORD_OVERFLOW_RESET_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
+                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
+                Ok(Self::OverflowReset {
+                    pgid,
+                    page_version,
+                    payload: &buff[12..12 + size as usize],
+                })
+            }
+            WAL_RECORD_OVERFLOW_UNDO_RESET_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                Ok(Self::OverflowUndoReset { pgid })
+            }
+            WAL_RECORD_OVERFLOW_INIT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                Ok(Self::OverflowInit { pgid })
+            }
+            WAL_RECORD_OVERFLOW_INSERT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let next = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                let size = u16::from_be_bytes(buff[16..18].try_into().unwrap());
+                Ok(Self::OverflowInsert {
+                    pgid,
+                    next,
+                    raw: &buff[18..18 + size as usize],
                 })
             }
 

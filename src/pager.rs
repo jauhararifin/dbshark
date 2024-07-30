@@ -1184,6 +1184,44 @@ impl<'a> PageWrite<'a> {
             None
         }
     }
+
+    pub(crate) fn init_overflow(
+        mut self,
+        ctx: LogContext<'_>,
+    ) -> anyhow::Result<Option<OverflowPageWrite<'a>>> {
+        if let PageKind::None = self.meta.kind {
+            let pgid = self.id();
+            record_mutation(
+                self.txid,
+                ctx,
+                &mut self.meta.wal,
+                WalRecord::OverflowInit { pgid },
+                WalRecord::OverflowInit { pgid },
+            )?;
+            self.meta.kind = PageKind::Overflow {
+                next: None,
+                size: 0,
+            };
+        }
+
+        Ok(self.into_overflow())
+    }
+
+    pub(crate) fn set_overflow(
+        mut self,
+        ctx: LogContext<'_>,
+        payload: &'a [u8],
+    ) -> anyhow::Result<OverflowPageWrite<'a>> {
+        todo!();
+    }
+
+    pub(crate) fn into_overflow(self) -> Option<OverflowPageWrite<'a>> {
+        if let PageKind::Overflow { .. } = &self.meta.kind {
+            Some(OverflowPageWrite(self))
+        } else {
+            None
+        }
+    }
 }
 
 // TODO: during recovery, we need to pass the LSN of the log to upadte this page's rec_lsn and page_lsn.
@@ -1737,6 +1775,44 @@ impl<'a> LeafPageWrite<'a> {
         Ok(())
     }
 
+    pub(crate) fn set_cell_overflow(
+        &mut self,
+        ctx: LogContext,
+        index: usize,
+        overflow_pgid: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        // TODO: refactor this. There are a multiple places where this logic is written.
+        // check the `get_leaf_cell` implementation.
+        let pgid = self.id();
+        let cell_offset = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_PAGE_CELL_SIZE * index;
+        let cell = &mut self.0.buffer[cell_offset..cell_offset + LEAF_PAGE_CELL_SIZE];
+        let old_overflow = PageId::from_be_bytes(cell[0..8].try_into().unwrap());
+        if old_overflow == overflow_pgid {
+            return Ok(());
+        }
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::LeafSetOverflow {
+                pgid,
+                index,
+                overflow: overflow_pgid,
+                old_overflow,
+            },
+            WalRecord::LeafSetOverflow {
+                pgid,
+                index,
+                overflow: overflow_pgid,
+                old_overflow,
+            },
+        )?;
+        cell[0..8].copy_from_slice(&overflow_pgid.to_be_bytes());
+
+        Ok(())
+    }
+
     pub(crate) fn insert_content(
         &mut self,
         ctx: LogContext<'_>,
@@ -1952,6 +2028,111 @@ impl<'a> OverflowPageRead<'a> {
 fn get_overflow_content(buff: &[u8], size: usize) -> &[u8] {
     let offset = PAGE_HEADER_SIZE + OVERFLOW_PAGE_HEADER_SIZE;
     &buff[offset..offset + size]
+}
+
+pub(crate) struct OverflowPageWrite<'a>(PageWrite<'a>);
+
+impl<'a> OverflowPageWrite<'a> {
+    pub(crate) fn id(&self) -> PageId {
+        self.0.meta.id
+    }
+
+    pub(crate) fn next(&self) -> Option<PageId> {
+        let PageKind::Overflow { next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        next
+    }
+
+    pub(crate) fn content(&self) -> &[u8] {
+        let PageKind::Overflow { size, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        get_overflow_content(self.0.buffer, size)
+    }
+
+    pub(crate) fn set_next(
+        &mut self,
+        ctx: LogContext,
+        new_next: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        todo!();
+    }
+
+    pub(crate) fn insert_content(
+        &mut self,
+        ctx: LogContext<'_>,
+        content: &mut impl Content,
+        next: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let max_size = self.0.pager.page_size
+            - PAGE_HEADER_SIZE
+            - PAGE_FOOTER_SIZE
+            - OVERFLOW_PAGE_HEADER_SIZE;
+
+        let PageKind::Overflow {
+            size: ref p_size,
+            next: ref p_next,
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+        if *p_size != 0 || p_next.is_some() {
+            return Err(anyhow!("overflow page is already filled"));
+        }
+
+        let inserted_size = std::cmp::min(content.remaining(), max_size);
+
+        let offset = PAGE_HEADER_SIZE + OVERFLOW_PAGE_HEADER_SIZE;
+        let raw = &mut self.0.buffer[offset..offset + inserted_size];
+        content.put(raw)?;
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::OverflowInsert { pgid, raw, next },
+            WalRecord::OverflowInsert { pgid, raw, next },
+        )?;
+
+        let PageKind::Overflow {
+            size: ref mut p_size,
+            next: ref mut p_next,
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+
+        *p_size = inserted_size;
+        *p_next = next;
+
+        Ok(())
+    }
+
+    pub(crate) fn clear(
+        &mut self,
+        ctx: LogContext<'_>,
+    ) -> anyhow::Result<()> {
+        todo!();
+    }
+
+    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
+        let pgid = self.id();
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::OverflowReset {
+                pgid,
+                page_version: 0,
+                payload: &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            },
+            WalRecord::OverflowUndoReset { pgid },
+        )?;
+
+        self.0.meta.kind = PageKind::None;
+        Ok(self.0)
+    }
 }
 
 #[cfg(test)]

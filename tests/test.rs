@@ -1,4 +1,4 @@
-use dbest::{Db, Setting};
+use dbshark::{Db, Setting};
 use std::path::Path;
 
 use std::sync::Once;
@@ -23,6 +23,15 @@ fn test_db_happy_path() {
     db.force_checkpoint().unwrap();
     let result = bucket.get(b"key00001").unwrap();
     assert_eq!(Some(b"val00001".to_vec()), result);
+
+    bucket.put(b"key00001", b"val00001_updated").unwrap();
+    let result = bucket.get(b"key00001").unwrap();
+    assert_eq!(Some(b"val00001_updated".to_vec()), result);
+
+    let long_content = (0..4000).map(|i| (i % 100) as u8).collect::<Vec<_>>();
+    bucket.put(b"key00001", &long_content).unwrap();
+    let result = bucket.get(b"key00001").unwrap();
+    assert_eq!(Some(long_content), result);
 
     tx.commit().expect("commit must succeed");
     drop(db);
@@ -95,5 +104,10 @@ fn test_db_recovery1() {
     drop(db);
 
     let db = Db::open(dir.path(), Setting::default()).unwrap();
+    let mut tx = db.update().unwrap();
+    let bucket = tx.bucket("table1").unwrap();
+    let result = bucket.get(b"key00001").unwrap();
+    assert_eq!(None, result);
+    drop(tx);
     drop(db);
 }

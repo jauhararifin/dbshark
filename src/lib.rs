@@ -1,5 +1,9 @@
 #![allow(unused)]
 
+// TODO: remove allow unused above
+// TODO: don't use anyhow for the error handling
+// TODO: setup CI
+
 mod btree;
 mod content;
 mod db;
