@@ -262,7 +262,9 @@ fn redo(
             | WalRecord::OverflowReset { pgid, .. }
             | WalRecord::OverflowUndoReset { pgid }
             | WalRecord::OverflowInit { pgid, .. }
-            | WalRecord::OverflowInsert { pgid, .. } => {
+            | WalRecord::OverflowSetContent { pgid, .. }
+            | WalRecord::OverflowUndoSetContent { pgid, .. }
+            | WalRecord::OverflowSetNext { pgid, .. } => {
                 redo_page(pager, analyze_result, lsn, &entry, pgid)?;
             }
         };
@@ -425,13 +427,29 @@ fn redo_page(
                 return Err(anyhow!("redo failed on overflow init"));
             };
         }
-        WalRecord::OverflowInsert { pgid, next, raw } => {
+        WalRecord::OverflowSetContent { pgid, next, raw } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
                     "redo failed on overflow reset because page is not an overflow"
                 ));
             };
-            page.insert_content(ctx, &mut Bytes::new(raw), next)?;
+            page.set_content(ctx, &mut Bytes::new(raw), next)?;
+        }
+        WalRecord::OverflowUndoSetContent { pgid, .. } => {
+            let Some(mut page) = page.into_overflow() else {
+                return Err(anyhow!(
+                    "redo failed on overflow reset because page is not an overflow"
+                ));
+            };
+            page.unset_content(ctx)?;
+        }
+        WalRecord::OverflowSetNext { pgid, next, .. } => {
+            let Some(mut page) = page.into_overflow() else {
+                return Err(anyhow!(
+                    "redo failed on overflow reset because page is not an overflow"
+                ));
+            };
+            page.set_next(ctx, next)?;
         }
     }
 
@@ -661,12 +679,22 @@ pub(crate) fn undo_txn(
                 };
                 page.reset(ctx)?;
             }
-            WalRecord::OverflowInsert { pgid, .. } => {
+            WalRecord::OverflowSetContent { pgid, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
-                page.clear(ctx);
+                page.unset_content(ctx);
+            }
+            WalRecord::OverflowUndoSetContent { pgid } => {
+                unreachable!("OverflowUndoSetContent only used for CLR which shouldn't be undone");
+            }
+            WalRecord::OverflowSetNext { pgid, old_next, .. } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_overflow() else {
+                    return Err(anyhow!("expected a overflow page for undo"));
+                };
+                page.set_next(ctx, old_next)?;
             }
 
             WalRecord::CheckpointBegin { .. } => (),

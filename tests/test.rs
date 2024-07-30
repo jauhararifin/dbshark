@@ -28,10 +28,14 @@ fn test_db_happy_path() {
     let result = bucket.get(b"key00001").unwrap();
     assert_eq!(Some(b"val00001_updated".to_vec()), result);
 
-    let long_content = (0..4000).map(|i| (i % 100) as u8).collect::<Vec<_>>();
+    let long_content = (0..16000).map(|i| (i % 100) as u8).collect::<Vec<_>>();
     bucket.put(b"key00001", &long_content).unwrap();
     let result = bucket.get(b"key00001").unwrap();
     assert_eq!(Some(long_content), result);
+
+    bucket.put(b"key00001", b"val00001").unwrap();
+    let result = bucket.get(b"key00001").unwrap();
+    assert_eq!(Some(b"val00001".to_vec()), result);
 
     tx.commit().expect("commit must succeed");
     drop(db);

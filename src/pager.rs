@@ -1185,6 +1185,8 @@ impl<'a> PageWrite<'a> {
         }
     }
 
+    // TODO: consider merging `init_overflow` and `OverflowPageWrite::insert_content` into a single
+    // `init_overflow` method with a single WAL entry for optimization.
     pub(crate) fn init_overflow(
         mut self,
         ctx: LogContext<'_>,
@@ -1212,7 +1214,23 @@ impl<'a> PageWrite<'a> {
         ctx: LogContext<'_>,
         payload: &'a [u8],
     ) -> anyhow::Result<OverflowPageWrite<'a>> {
-        todo!();
+        assert!(
+            matches!(self.meta.kind, PageKind::None),
+            "page is not empty"
+        );
+        let LogContext::Redo(lsn) = ctx else {
+            panic!("set_leaf only can be used for redo-ing wal");
+        };
+
+        let pgid = self.id();
+        record_redo_mutation(lsn, &mut self.meta);
+
+        self.meta.kind = Pager::decode_overflow_page(payload)?;
+        self.buffer.copy_from_slice(payload);
+
+        Ok(self
+            .into_overflow()
+            .expect("the page should be an overflow page now"))
     }
 
     pub(crate) fn into_overflow(self) -> Option<OverflowPageWrite<'a>> {
@@ -2056,10 +2074,34 @@ impl<'a> OverflowPageWrite<'a> {
         ctx: LogContext,
         new_next: Option<PageId>,
     ) -> anyhow::Result<()> {
-        todo!();
+        let pgid = self.id();
+        let PageKind::Overflow { ref next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        let old_next = *next;
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::OverflowSetNext {
+                pgid,
+                next: new_next,
+                old_next,
+            },
+            WalRecord::OverflowSetNext {
+                pgid,
+                next: new_next,
+                old_next,
+            },
+        )?;
+        let PageKind::Overflow { ref mut next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        *next = new_next;
+        Ok(())
     }
 
-    pub(crate) fn insert_content(
+    pub(crate) fn set_content(
         &mut self,
         ctx: LogContext<'_>,
         content: &mut impl Content,
@@ -2091,8 +2133,8 @@ impl<'a> OverflowPageWrite<'a> {
             self.0.txid,
             ctx,
             &mut self.0.meta.wal,
-            WalRecord::OverflowInsert { pgid, raw, next },
-            WalRecord::OverflowInsert { pgid, raw, next },
+            WalRecord::OverflowSetContent { pgid, raw, next },
+            WalRecord::OverflowSetContent { pgid, raw, next },
         )?;
 
         let PageKind::Overflow {
@@ -2109,11 +2151,29 @@ impl<'a> OverflowPageWrite<'a> {
         Ok(())
     }
 
-    pub(crate) fn clear(
-        &mut self,
-        ctx: LogContext<'_>,
-    ) -> anyhow::Result<()> {
-        todo!();
+    pub(crate) fn unset_content(&mut self, ctx: LogContext<'_>) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let PageKind::Overflow { size, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        if size == 0 {
+            return Ok(());
+        }
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::OverflowUndoSetContent { pgid },
+            WalRecord::OverflowUndoSetContent { pgid },
+        )?;
+
+        let PageKind::Overflow { ref mut size, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        *size = 0;
+
+        Ok(())
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {

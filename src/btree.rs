@@ -187,7 +187,7 @@ impl<'a> BTree<'a> {
             .expect("new page should always be convertible to overflow page");
         let next_pgid = overflow.id();
         node.set_cell_overflow(self.ctx, index, Some(next_pgid))?;
-        overflow.insert_content(self.ctx, &mut content, None)?;
+        overflow.set_content(self.ctx, &mut content, None)?;
 
         while !content.is_finished() {
             let next_page_2 = self.new_page()?;
@@ -196,7 +196,7 @@ impl<'a> BTree<'a> {
                 .expect("new page should always be convertible to overflow page");
             let next_pgid_2 = overflow_2.id();
             overflow.set_next(self.ctx, Some(next_pgid_2))?;
-            overflow_2.insert_content(self.ctx, &mut content, None)?;
+            overflow_2.set_content(self.ctx, &mut content, None)?;
             overflow = overflow_2;
         }
 
@@ -256,7 +256,12 @@ impl<'a> BTree<'a> {
     }
 
     fn delete_page(&self, pgid: PageId) -> anyhow::Result<()> {
-        todo!();
+        // TODO: consider batch deletion after the end of transaction so that
+        // if in a single transaction we delete a page and then allocate a page,
+        // we don't have to write the freelist page twice.
+
+        // TODO: put the page into freelist
+        Ok(())
     }
 }
 
@@ -385,6 +390,8 @@ impl<'a> BTreeContent<'a> {
     }
 
     fn from_leaf_content(pager: &'a Pager, cell: &'a LeafCell) -> Self {
+        let raw_size = std::cmp::min(cell.raw().len(), cell.key_size() + cell.val_size());
+        let raw = &cell.raw()[..raw_size];
         BTreeContent {
             pager,
             raw: cell.raw(),
@@ -413,12 +420,13 @@ impl<'a> Content for BTreeContent<'a> {
                 let s = std::cmp::min(data.len() - self.offset, target.len());
                 let s = std::cmp::min(s, self.remaining);
 
-                target.copy_from_slice(&data[self.offset..self.offset + s]);
+                target[..s].copy_from_slice(&data[self.offset..self.offset + s]);
                 target = &mut target[s..];
                 self.remaining -= s;
                 self.offset += s;
                 if self.offset < data.len() {
-                    return Ok(());
+                    assert!(target.is_empty());
+                    break;
                 }
 
                 if let Some(pgid) = overflow_page.next() {
@@ -426,8 +434,9 @@ impl<'a> Content for BTreeContent<'a> {
                         return Err(anyhow!("expected overflow page"));
                     };
                     self.overflow_page = Some(page);
+                    self.offset = 0;
                 } else {
-                    assert!(self.remaining == 0);
+                    assert!(self.is_finished());
                 }
             } else {
                 let s = std::cmp::min(self.raw.len(), target.len());
