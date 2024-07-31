@@ -379,6 +379,12 @@ pub(crate) enum WalRecord<'a> {
         pgid: PageId,
         index: usize,
     },
+    InteriorSetOverflow {
+        pgid: PageId,
+        index: usize,
+        overflow: Option<PageId>,
+        old_overflow: Option<PageId>,
+    },
 
     LeafReset {
         pgid: PageId,
@@ -416,6 +422,11 @@ pub(crate) enum WalRecord<'a> {
         index: usize,
         overflow: Option<PageId>,
         old_overflow: Option<PageId>,
+    },
+    LeafSetNext {
+        pgid: PageId,
+        next: Option<PageId>,
+        old_next: Option<PageId>,
     },
 
     OverflowReset {
@@ -483,6 +494,7 @@ const WAL_RECORD_INTERIOR_INIT_KIND: u8 = 22;
 const WAL_RECORD_INTERIOR_INSERT_KIND: u8 = 23;
 const WAL_RECORD_INTERIOR_DELETE_KIND: u8 = 24;
 const WAL_RECORD_INTERIOR_UNDO_DELETE_KIND: u8 = 25;
+const WAL_RECORD_INTERIOR_SET_OVERFLOW_KIND: u8 = 26;
 
 const WAL_RECORD_LEAF_RESET_KIND: u8 = 30;
 const WAL_RECORD_LEAF_UNDO_RESET_KIND: u8 = 31;
@@ -491,6 +503,7 @@ const WAL_RECORD_LEAF_INSERT_KIND: u8 = 33;
 const WAL_RECORD_LEAF_DELETE_KIND: u8 = 34;
 const WAL_RECORD_LEAF_UNDO_DELETE_KIND: u8 = 35;
 const WAL_RECORD_LEAF_SET_OVERFLOW_KIND: u8 = 36;
+const WAL_RECORD_LEAF_SET_NEXT_KIND: u8 = 37;
 
 const WAL_RECORD_OVERFLOW_RESET_KIND: u8 = 40;
 const WAL_RECORD_OVERFLOW_UNDO_RESET_KIND: u8 = 41;
@@ -518,6 +531,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::InteriorInsert { .. } => WAL_RECORD_INTERIOR_INSERT_KIND,
             WalRecord::InteriorDelete { .. } => WAL_RECORD_INTERIOR_DELETE_KIND,
             WalRecord::InteriorUndoDelete { .. } => WAL_RECORD_INTERIOR_UNDO_DELETE_KIND,
+            WalRecord::InteriorSetOverflow { .. } => WAL_RECORD_INTERIOR_SET_OVERFLOW_KIND,
 
             WalRecord::LeafReset { .. } => WAL_RECORD_LEAF_RESET_KIND,
             WalRecord::LeafUndoReset { .. } => WAL_RECORD_LEAF_UNDO_RESET_KIND,
@@ -526,6 +540,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafDelete { .. } => WAL_RECORD_LEAF_DELETE_KIND,
             WalRecord::LeafUndoDelete { .. } => WAL_RECORD_LEAF_UNDO_DELETE_KIND,
             WalRecord::LeafSetOverflow { .. } => WAL_RECORD_LEAF_SET_OVERFLOW_KIND,
+            WalRecord::LeafSetNext { .. } => WAL_RECORD_LEAF_SET_NEXT_KIND,
 
             WalRecord::OverflowReset { .. } => WAL_RECORD_OVERFLOW_RESET_KIND,
             WalRecord::OverflowUndoReset { .. } => WAL_RECORD_OVERFLOW_UNDO_RESET_KIND,
@@ -551,6 +566,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::InteriorInsert { raw, .. } => 32 + raw.len(),
             WalRecord::InteriorDelete { old_raw, .. } => 32 + old_raw.len(),
             WalRecord::InteriorUndoDelete { .. } => 10,
+            WalRecord::InteriorSetOverflow { .. } => 26,
 
             WalRecord::LeafReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::LeafUndoReset { .. } => 8,
@@ -559,6 +575,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
             WalRecord::LeafUndoDelete { .. } => 10,
             WalRecord::LeafSetOverflow { .. } => 26,
+            WalRecord::LeafSetNext { .. } => 24,
 
             WalRecord::OverflowReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::OverflowUndoReset { .. } => 8,
@@ -654,6 +671,18 @@ impl<'a> WalRecord<'a> {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
                 buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
             }
+            WalRecord::InteriorSetOverflow {
+                pgid,
+                index,
+                overflow,
+                old_overflow,
+            } => {
+                assert!(*index <= u16::MAX as usize);
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..16].copy_from_slice(&overflow.to_be_bytes());
+                buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
+                buff[24..26].copy_from_slice(&(*index as u16).to_be_bytes());
+            }
 
             WalRecord::LeafReset {
                 pgid,
@@ -731,6 +760,15 @@ impl<'a> WalRecord<'a> {
                 buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
                 buff[24..26].copy_from_slice(&(*index as u16).to_be_bytes());
             }
+            WalRecord::LeafSetNext {
+                pgid,
+                next,
+                old_next,
+            } => {
+                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
+                buff[8..16].copy_from_slice(&next.to_be_bytes());
+                buff[16..24].copy_from_slice(&old_next.to_be_bytes());
+            }
 
             WalRecord::OverflowReset {
                 pgid,
@@ -754,7 +792,7 @@ impl<'a> WalRecord<'a> {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
                 buff[8..16].copy_from_slice(&next.to_be_bytes());
                 buff[16..18].copy_from_slice(&(raw.len() as u16).to_be_bytes());
-                buff[18..18 + raw.len()].copy_from_slice(&raw);
+                buff[18..18 + raw.len()].copy_from_slice(raw);
             }
             WalRecord::OverflowUndoSetContent { pgid } => {
                 buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
@@ -906,6 +944,20 @@ impl<'a> WalRecord<'a> {
                     index: index as usize,
                 })
             }
+            WAL_RECORD_INTERIOR_SET_OVERFLOW_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let overflow = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                let old_overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
+                let index = u16::from_be_bytes(buff[24..26].try_into().unwrap());
+                Ok(Self::InteriorSetOverflow {
+                    pgid,
+                    index: index as usize,
+                    overflow,
+                    old_overflow,
+                })
+            }
 
             WAL_RECORD_LEAF_RESET_KIND => {
                 let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
@@ -989,6 +1041,18 @@ impl<'a> WalRecord<'a> {
                     index: index as usize,
                     overflow,
                     old_overflow,
+                })
+            }
+            WAL_RECORD_LEAF_SET_NEXT_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                let next = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                let old_next = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
+                Ok(Self::LeafSetNext {
+                    pgid,
+                    next,
+                    old_next,
                 })
             }
 

@@ -74,7 +74,31 @@ impl<'a> BTree<'a> {
             return Ok(());
         }
 
-        todo!();
+        let new_right_page = self.new_page()?;
+        let mut new_right_leaf = new_right_page
+            .init_leaf(self.ctx)?
+            .expect("new page should always be convertible to leaf page");
+        let new_right_pgid = new_right_leaf.id();
+        let pivot = self.leaf_split_and_insert(
+            &mut result.leaf.node,
+            &mut new_right_leaf,
+            result.leaf.index,
+            key,
+            value,
+        )?;
+
+        let is_root_leaf = result.leaf.node.id() == self.root;
+        if is_root_leaf {
+            let new_left_leaf = self
+                .new_page()?
+                .init_leaf(self.ctx)?
+                .expect("new page should always be convertible to leaf page");
+            self.split_root_leaf(result.leaf.node, new_left_leaf, new_right_pgid, pivot)?;
+        } else {
+            self.propagate_interior_splitting(result.interiors, new_right_pgid, pivot)?;
+        }
+
+        Ok(())
     }
 
     fn lookup_for_insert(&self, key: &[u8]) -> anyhow::Result<LookupForUpdateResult<'a>> {
@@ -124,9 +148,9 @@ impl<'a> BTree<'a> {
         })
     }
 
-    fn search_key_in_node<'b>(
+    fn search_key_in_node(
         &self,
-        node: &'b impl BTreePage<'b>,
+        node: &'a impl BTreePage<'a>,
         key: &[u8],
     ) -> anyhow::Result<(usize, bool)> {
         // TODO: use binary search instead
@@ -136,7 +160,7 @@ impl<'a> BTree<'a> {
         while i < node.count() {
             let cell = node.get(i);
             let mut a = Bytes::new(key);
-            let mut b = BTreeContent::new(self.pager, &cell);
+            let mut b = BTreeContent::new(self.pager, cell);
             let ord = a.compare(b)?;
             found = ord.is_eq();
             if ord.is_le() {
@@ -201,6 +225,127 @@ impl<'a> BTree<'a> {
         }
 
         Ok(true)
+    }
+
+    // TODO: maybe can combine this to insert_content_to_leaf.
+    fn insert_content_to_interior(
+        &self,
+        node: &mut InteriorPageWrite,
+        index: usize,
+        mut content: impl Content,
+        ptr: PageId,
+        key_size: usize,
+    ) -> anyhow::Result<bool> {
+        let value_size = content.remaining() - key_size;
+        let ok = node.insert_content(self.ctx, index, &mut content, key_size, ptr, None)?;
+        if !ok {
+            return Ok(false);
+        }
+
+        if content.is_finished() {
+            return Ok(true);
+        }
+
+        let next_page = self.new_page()?;
+        let mut overflow = next_page
+            .init_overflow(self.ctx)?
+            .expect("new page should always be convertible to overflow page");
+        let next_pgid = overflow.id();
+        node.set_cell_overflow(self.ctx, index, Some(next_pgid))?;
+        overflow.set_content(self.ctx, &mut content, None)?;
+
+        while !content.is_finished() {
+            let next_page_2 = self.new_page()?;
+            let mut overflow_2 = next_page_2
+                .init_overflow(self.ctx)?
+                .expect("new page should always be convertible to overflow page");
+            let next_pgid_2 = overflow_2.id();
+            overflow.set_next(self.ctx, Some(next_pgid_2))?;
+            overflow_2.set_content(self.ctx, &mut content, None)?;
+            overflow = overflow_2;
+        }
+
+        Ok(true)
+    }
+
+    fn leaf_split_and_insert<'b>(
+        &self,
+        left_leaf: &mut LeafPageWrite,
+        new_right_leaf: &'b mut LeafPageWrite,
+        index: usize,
+        key: &[u8],
+        value: &[u8],
+    ) -> anyhow::Result<BTreeContent<'b>>
+    where
+        'a: 'b,
+    {
+        let split = left_leaf.split(self.ctx)?;
+        let n_cells_to_keep = split.n;
+        for (i, cell) in split.enumerate() {
+            new_right_leaf.insert_cell(self.ctx, i, cell)?;
+        }
+        new_right_leaf.set_next(self.ctx, left_leaf.next())?;
+        left_leaf.set_next(self.ctx, Some(new_right_leaf.id()));
+
+        let mut keyval = KeyValContent::new(key, value);
+        if index < n_cells_to_keep {
+            self.insert_content_to_leaf(left_leaf, index, keyval, key.len())?;
+        } else {
+            self.insert_content_to_leaf(
+                new_right_leaf,
+                index - n_cells_to_keep,
+                keyval,
+                key.len(),
+            )?;
+        };
+
+        let pivot_cell = new_right_leaf.get(0);
+        Ok(BTreeContent::new(self.pager, pivot_cell))
+    }
+
+    // initial state, A is the root and a leaf node, and the only node.
+    //  [A]
+    //
+    // if we insert a new item to A, and A split:
+    // phase 1:
+    //  [A]->[C]  - The first half of A's items are moved to to C.
+    //            - The new item is inserted to either A or C.
+    // phase 2:
+    //    [A]     - A is still a root node, but now it's an interior node, its items are moved to B
+    //    / \
+    //   v   v    - The first half of A's initial items will be moved to B
+    //  [B]->[C]  - The other half of A's initial items will be moved to C
+    fn split_root_leaf(
+        &self,
+        a: LeafPageWrite,
+        mut b: LeafPageWrite,
+        c: PageId,
+        mut pivot: impl Content,
+    ) -> anyhow::Result<()> {
+        for i in 0..a.count() {
+            let cell = a.get(i);
+            b.insert_cell(self.ctx, i, cell)?;
+        }
+        let a = a.reset(self.ctx)?;
+        b.set_next(self.ctx, Some(c))?;
+
+        let mut a = a
+            .init_interior(self.ctx, c)?
+            .expect("resetted page should always be convertible to an interior page");
+
+        let key_size = pivot.remaining();
+        self.insert_content_to_interior(&mut a, 0, pivot, b.id(), key_size)?;
+
+        Ok(())
+    }
+
+    fn propagate_interior_splitting(
+        &self,
+        interiors: Vec<LookupHop<InteriorPageWrite>>,
+        right_pgid: PageId,
+        pivot: impl Content,
+    ) -> anyhow::Result<()> {
+        todo!();
     }
 
     pub(crate) fn seek(&self, key: &[u8]) -> anyhow::Result<LookupResult> {
@@ -375,7 +520,7 @@ struct BTreeContent<'a> {
 }
 
 impl<'a> BTreeContent<'a> {
-    fn new(pager: &'a Pager, cell: &'a impl BTreeCell) -> Self {
+    fn new(pager: &'a Pager, cell: impl BTreeCell<'a>) -> Self {
         let raw_size = std::cmp::min(cell.raw().len(), cell.key_size());
         let raw = &cell.raw()[..raw_size];
         BTreeContent {

@@ -1,4 +1,4 @@
-use crate::content::Content;
+use crate::content::{Bytes, Content};
 use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -1219,7 +1219,7 @@ impl<'a> PageWrite<'a> {
             "page is not empty"
         );
         let LogContext::Redo(lsn) = ctx else {
-            panic!("set_leaf only can be used for redo-ing wal");
+            panic!("set_overflow only can be used for redo-ing wal");
         };
 
         let pgid = self.id();
@@ -1286,8 +1286,8 @@ fn record_redo_mutation(lsn: Lsn, meta: &mut PageMeta) {
 }
 
 pub(crate) trait BTreePage<'a> {
-    type Cell: BTreeCell;
-    fn count(&'a self) -> usize;
+    type Cell: BTreeCell<'a>;
+    fn count(&self) -> usize;
     fn get(&'a self, index: usize) -> Self::Cell;
 }
 
@@ -1296,7 +1296,7 @@ pub(crate) struct InteriorPageRead<'a>(PageRead<'a>);
 impl<'a, 'b> BTreePage<'b> for InteriorPageRead<'a> {
     type Cell = InteriorCell<'b>;
 
-    fn count(&'b self) -> usize {
+    fn count(&self) -> usize {
         let PageKind::Interior { count, .. } = self.0.meta.kind else {
             unreachable!();
         };
@@ -1358,14 +1358,14 @@ pub(crate) struct InteriorCell<'a> {
     raw: &'a [u8],
 }
 
-pub(crate) trait BTreeCell {
-    fn raw(&self) -> &[u8];
+pub(crate) trait BTreeCell<'a> {
+    fn raw(&self) -> &'a [u8];
     fn key_size(&self) -> usize;
     fn overflow(&self) -> Option<PageId>;
 }
 
-impl BTreeCell for InteriorCell<'_> {
-    fn raw(&self) -> &[u8] {
+impl<'a> BTreeCell<'a> for InteriorCell<'a> {
+    fn raw(&self) -> &'a [u8] {
         self.raw
     }
 
@@ -1389,7 +1389,7 @@ pub(crate) struct InteriorPageWrite<'a>(PageWrite<'a>);
 impl<'a, 'b> BTreePage<'b> for InteriorPageWrite<'a> {
     type Cell = InteriorCell<'b>;
 
-    fn count(&'b self) -> usize {
+    fn count(&self) -> usize {
         let PageKind::Interior { count, .. } = self.0.meta.kind else {
             unreachable!();
         };
@@ -1446,6 +1446,45 @@ impl<'a> InteriorPageWrite<'a> {
 
         self.0.meta.kind = PageKind::None;
         Ok(self.0)
+    }
+
+    pub(crate) fn set_cell_overflow(
+        &mut self,
+        ctx: LogContext,
+        index: usize,
+        overflow_pgid: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        // TODO: refactor this. There are a multiple places where this logic is written.
+        // check the `get_interior_cell` implementation.
+        let pgid = self.id();
+        let cell_offset =
+            PAGE_HEADER_SIZE + INTERIOR_PAGE_HEADER_SIZE + INTERIOR_PAGE_CELL_SIZE * index;
+        let cell = &mut self.0.buffer[cell_offset..cell_offset + INTERIOR_PAGE_CELL_SIZE];
+        let old_overflow = PageId::from_be_bytes(cell[8..16].try_into().unwrap());
+        if old_overflow == overflow_pgid {
+            return Ok(());
+        }
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::InteriorSetOverflow {
+                pgid,
+                index,
+                overflow: overflow_pgid,
+                old_overflow,
+            },
+            WalRecord::InteriorSetOverflow {
+                pgid,
+                index,
+                overflow: overflow_pgid,
+                old_overflow,
+            },
+        )?;
+        cell[8..16].copy_from_slice(&overflow_pgid.to_be_bytes());
+
+        Ok(())
     }
 
     pub(crate) fn insert_content(
@@ -1652,7 +1691,7 @@ pub(crate) struct LeafPageRead<'a>(PageRead<'a>);
 
 impl<'a, 'b> BTreePage<'b> for LeafPageRead<'a> {
     type Cell = LeafCell<'b>;
-    fn count(&'b self) -> usize {
+    fn count(&self) -> usize {
         let PageKind::Leaf { count, .. } = self.0.meta.kind else {
             unreachable!();
         };
@@ -1692,7 +1731,7 @@ pub(crate) struct LeafPageWrite<'a>(PageWrite<'a>);
 
 impl<'a, 'b> BTreePage<'b> for LeafPageWrite<'a> {
     type Cell = LeafCell<'b>;
-    fn count(&'b self) -> usize {
+    fn count(&self) -> usize {
         let PageKind::Leaf { count, .. } = self.0.meta.kind else {
             unreachable!();
         };
@@ -1793,6 +1832,41 @@ impl<'a> LeafPageWrite<'a> {
         Ok(())
     }
 
+    pub(crate) fn set_next(
+        &mut self,
+        ctx: LogContext,
+        new_next: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let PageKind::Leaf { next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        let old_next = next;
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::LeafSetNext {
+                pgid,
+                next: new_next,
+                old_next,
+            },
+            WalRecord::LeafSetNext {
+                pgid,
+                next: new_next,
+                old_next,
+            },
+        )?;
+
+        let PageKind::Leaf { ref mut next, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        *next = new_next;
+
+        Ok(())
+    }
+
     pub(crate) fn set_cell_overflow(
         &mut self,
         ctx: LogContext,
@@ -1827,6 +1901,59 @@ impl<'a> LeafPageWrite<'a> {
             },
         )?;
         cell[0..8].copy_from_slice(&overflow_pgid.to_be_bytes());
+
+        Ok(())
+    }
+
+    pub(crate) fn insert_cell(
+        &mut self,
+        ctx: LogContext<'_>,
+        i: usize,
+        cell: LeafCell,
+    ) -> anyhow::Result<()> {
+        let PageKind::Leaf { remaining, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        let raw = cell.raw();
+        assert!(
+            raw.len() + LEAF_PAGE_CELL_SIZE <= remaining,
+            "insert cell only called in the context of moving a splitted page to a new page, so it should always fit",
+        );
+
+        let reserved_offset = self.reserve_cell(i, cell.key_size(), cell.val_size(), raw.len());
+        Bytes::new(cell.raw)
+            .put(&mut self.0.buffer[reserved_offset..reserved_offset + raw.len()])?;
+
+        let pgid = self.id();
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::LeafInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                overflow: cell.overflow(),
+                key_size: cell.key_size(),
+                value_size: cell.val_size(),
+            },
+            WalRecord::LeafInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                overflow: cell.overflow(),
+                key_size: cell.key_size(),
+                value_size: cell.val_size(),
+            },
+        )?;
+
+        self.insert_cell_meta(
+            i,
+            cell.overflow(),
+            cell.key_size(),
+            cell.val_size(),
+            raw.len(),
+        );
 
         Ok(())
     }
@@ -1985,6 +2112,71 @@ impl<'a> LeafPageWrite<'a> {
         };
         *offset = new_offset;
     }
+
+    pub(crate) fn split(&mut self, ctx: LogContext<'_>) -> anyhow::Result<LeafPageSplit> {
+        let pgid = self.id();
+        let payload_size =
+            self.0.pager.page_size - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+        let half_payload = payload_size / 2;
+        let PageKind::Leaf { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+
+        let mut cummulative_size = 0;
+        let mut n_cells_to_keep = 0;
+
+        for i in 0..count {
+            let cell = get_leaf_cell(self.0.buffer, i);
+            cummulative_size += cell.raw.len() + LEAF_PAGE_CELL_SIZE;
+            if cummulative_size >= half_payload {
+                n_cells_to_keep = i;
+                break;
+            }
+        }
+        assert!(
+            n_cells_to_keep < count,
+            "there is no point splitting the page if it doesn't move any entries"
+        );
+
+        // TODO: we can reduce the wal entry size by merging all of these mutations together.
+        for i in n_cells_to_keep..count {
+            let cell = get_leaf_cell(self.0.buffer, i);
+            record_mutation(
+                self.0.txid,
+                ctx,
+                &mut self.0.meta.wal,
+                WalRecord::LeafDelete {
+                    pgid,
+                    index: i,
+                    old_raw: cell.raw(),
+                    old_overflow: cell.overflow(),
+                    old_key_size: cell.key_size(),
+                    old_val_size: cell.val_size(),
+                },
+                WalRecord::LeafUndoDelete { pgid, index: i },
+            )?;
+        }
+
+        let original_count = count;
+        let PageKind::Leaf {
+            ref mut count,
+            ref mut remaining,
+            ..
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+        *count = n_cells_to_keep;
+        *remaining = payload_size - cummulative_size;
+
+        Ok(LeafPageSplit {
+            n: n_cells_to_keep,
+
+            buff: self.0.buffer,
+            i: n_cells_to_keep,
+            end: original_count,
+        })
+    }
 }
 
 fn get_leaf_cell(buff: &[u8], index: usize) -> LeafCell<'_> {
@@ -2001,7 +2193,7 @@ pub(crate) struct LeafCell<'a> {
     raw: &'a [u8],
 }
 
-impl<'a> BTreeCell for LeafCell<'a> {
+impl<'a> BTreeCell<'a> for LeafCell<'a> {
     fn raw(&self) -> &'a [u8] {
         self.raw
     }
@@ -2018,6 +2210,26 @@ impl<'a> BTreeCell for LeafCell<'a> {
 impl<'a> LeafCell<'a> {
     pub(crate) fn val_size(&self) -> usize {
         u32::from_be_bytes(self.cell[12..16].try_into().unwrap()) as usize
+    }
+}
+
+pub(crate) struct LeafPageSplit<'a> {
+    pub(crate) n: usize,
+    buff: &'a [u8],
+    i: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for LeafPageSplit<'a> {
+    type Item = LeafCell<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.end {
+            return None;
+        }
+
+        let cell = get_leaf_cell(self.buff, self.i);
+        self.i += 1;
+        Some(cell)
     }
 }
 
