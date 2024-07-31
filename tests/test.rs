@@ -54,14 +54,22 @@ fn test_db_btree() {
     let mut tx = db.update().unwrap();
 
     let mut bucket = tx.bucket("table1").unwrap();
-    for i in 0..150 {
+    for i in 0..102 {
         let key = format!("key{i:05}");
         let val = format!("val{i:05}");
         bucket.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
 
-    let val = bucket.get(b"key00050").unwrap();
-    assert_eq!(Some(b"val00050".to_vec()), val);
+    for i in 0..102 {
+        let key = format!("key{i:05}");
+        let val = format!("val{i:05}");
+        let val_get = bucket.get(key.as_bytes()).unwrap();
+        assert_eq!(
+            val,
+            String::from_utf8(val_get.unwrap()).unwrap(),
+            "failed at {i}"
+        );
+    }
 
     tx.commit().unwrap();
     db.shutdown().unwrap();

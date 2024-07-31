@@ -111,7 +111,7 @@ impl<'a> BTree<'a> {
             }
             let node = current.into_interior().unwrap();
 
-            let (i, found) = self.search_key_in_node(&node, key)?;
+            let (i, found) = self.search_key_in_interior(&node, key)?;
             let next_pgid = if i == node.count() {
                 node.last()
             } else {
@@ -137,7 +137,7 @@ impl<'a> BTree<'a> {
             ));
         };
 
-        let (i, found) = self.search_key_in_node(&node, key)?;
+        let (i, found) = self.search_key_in_leaf(&node, key)?;
         Ok(LookupForUpdateResult {
             interiors: hops,
             leaf: LookupHop {
@@ -148,7 +148,31 @@ impl<'a> BTree<'a> {
         })
     }
 
-    fn search_key_in_node(
+    fn search_key_in_interior(
+        &self,
+        node: &'a impl BTreePage<'a>,
+        key: &[u8],
+    ) -> anyhow::Result<(usize, bool)> {
+        // TODO: use binary search instead
+        let mut i = 0;
+        let mut found = false;
+
+        while i < node.count() {
+            let cell = node.get(i);
+            let mut a = Bytes::new(key);
+            let mut b = BTreeContent::new(self.pager, cell);
+            let ord = a.compare(b)?;
+            found = ord.is_eq();
+            if ord.is_lt() {
+                break;
+            }
+            i += 1;
+        }
+
+        Ok((i, found))
+    }
+
+    fn search_key_in_leaf(
         &self,
         node: &'a impl BTreePage<'a>,
         key: &[u8],
@@ -356,7 +380,7 @@ impl<'a> BTree<'a> {
             }
             let node = current.into_interior().unwrap();
 
-            let (i, _) = self.search_key_in_node(&node, key)?;
+            let (i, _) = self.search_key_in_interior(&node, key)?;
             let next_pgid = if i == node.count() {
                 node.last()
             } else {
@@ -379,7 +403,8 @@ impl<'a> BTree<'a> {
         }
 
         let leaf = page.into_leaf().expect("not a leaf page");
-        let (i, found) = self.search_key_in_node(&leaf, key)?;
+
+        let (i, found) = self.search_key_in_leaf(&leaf, key)?;
         let is_finished = i >= leaf.count();
         Ok(LookupResult {
             cursor: Cursor {
