@@ -1,4 +1,6 @@
 use dbshark::{Db, Setting};
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use std::path::Path;
 
 use std::sync::Once;
@@ -50,24 +52,29 @@ fn test_db_btree() {
 
     _ = std::fs::remove_dir_all("test_btree");
 
+    let mut items = Vec::new();
+    for i in 0..183 {
+        let key = format!("key{i:05}");
+        let val = format!("val{i:05}");
+        items.push((key, val));
+    }
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+    items.shuffle(&mut rng);
+
     let db = Db::open(Path::new("test_btree"), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
 
     let mut bucket = tx.bucket("table1").unwrap();
-    for i in 0..102 {
-        let key = format!("key{i:05}");
-        let val = format!("val{i:05}");
+    for (key, val) in &items {
         bucket.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
 
-    for i in 0..102 {
-        let key = format!("key{i:05}");
-        let val = format!("val{i:05}");
+    for (key, val) in &items {
         let val_get = bucket.get(key.as_bytes()).unwrap();
         assert_eq!(
             val,
-            String::from_utf8(val_get.unwrap()).unwrap(),
-            "failed at {i}"
+            &String::from_utf8(val_get.unwrap()).unwrap(),
+            "failed at {key}-{val}"
         );
     }
 
