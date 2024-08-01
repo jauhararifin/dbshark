@@ -53,9 +53,9 @@ fn test_db_btree() {
     _ = std::fs::remove_dir_all("test_btree");
 
     let mut items = Vec::new();
-    for i in 0..183 {
+    for i in 0..1000 {
         let key = format!("key{i:05}");
-        let val = format!("val{i:05}");
+        let val = format!("val{i:0900}");
         items.push((key, val));
     }
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);

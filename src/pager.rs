@@ -1448,6 +1448,76 @@ impl<'a> InteriorPageWrite<'a> {
         Ok(self.0)
     }
 
+    pub(crate) fn set_last(&mut self, ctx: LogContext, new_last: PageId) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let PageKind::Interior { last, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        let old_last = last;
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::InteriorSetLast {
+                pgid,
+                last: new_last,
+                old_last,
+            },
+            WalRecord::InteriorSetLast {
+                pgid,
+                last: new_last,
+                old_last,
+            },
+        )?;
+
+        let PageKind::Interior { ref mut last, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        *last = new_last;
+
+        Ok(())
+    }
+
+    pub(crate) fn set_cell_ptr(
+        &mut self,
+        ctx: LogContext,
+        index: usize,
+        ptr: PageId,
+    ) -> anyhow::Result<()> {
+        // TODO: refactor this. There are a multiple places where this logic is written.
+        // check the `get_interior_cell` implementation.
+        let pgid = self.id();
+        let cell_offset =
+            PAGE_HEADER_SIZE + INTERIOR_PAGE_HEADER_SIZE + INTERIOR_PAGE_CELL_SIZE * index;
+        let cell = &mut self.0.buffer[cell_offset..cell_offset + INTERIOR_PAGE_CELL_SIZE];
+        let old_ptr = PageId::from_be_bytes(cell[0..8].try_into().unwrap()).unwrap();
+        if old_ptr == ptr {
+            return Ok(());
+        }
+
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::InteriorSetCellPtr {
+                pgid,
+                index,
+                ptr,
+                old_ptr,
+            },
+            WalRecord::InteriorSetCellPtr {
+                pgid,
+                index,
+                ptr,
+                old_ptr,
+            },
+        )?;
+        cell[0..8].copy_from_slice(&ptr.to_be_bytes());
+
+        Ok(())
+    }
+
     pub(crate) fn set_cell_overflow(
         &mut self,
         ctx: LogContext,
@@ -1469,13 +1539,13 @@ impl<'a> InteriorPageWrite<'a> {
             self.0.txid,
             ctx,
             &mut self.0.meta.wal,
-            WalRecord::InteriorSetOverflow {
+            WalRecord::InteriorSetCellOverflow {
                 pgid,
                 index,
                 overflow: overflow_pgid,
                 old_overflow,
             },
-            WalRecord::InteriorSetOverflow {
+            WalRecord::InteriorSetCellOverflow {
                 pgid,
                 index,
                 overflow: overflow_pgid,
@@ -1483,6 +1553,59 @@ impl<'a> InteriorPageWrite<'a> {
             },
         )?;
         cell[8..16].copy_from_slice(&overflow_pgid.to_be_bytes());
+
+        Ok(())
+    }
+
+    pub(crate) fn insert_cell(
+        &mut self,
+        ctx: LogContext<'_>,
+        i: usize,
+        cell: InteriorCell,
+    ) -> anyhow::Result<()> {
+        let PageKind::Interior { remaining, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+        let raw = cell.raw();
+        assert!(
+            raw.len() + INTERIOR_PAGE_CELL_SIZE <= remaining,
+            "insert cell only called in the context of moving a splitted page to a new page, so it should always fit",
+        );
+
+        // TODO: insert after the wal is recorded, and also just follow leaf page way to reserve
+        // page.
+        let reserved_offset = self.insert_cell_meta(
+            i,
+            cell.ptr(),
+            cell.overflow(),
+            cell.key_size(),
+            cell.raw().len(),
+        );
+        Bytes::new(cell.raw())
+            .put(&mut self.0.buffer[reserved_offset..reserved_offset + raw.len()])?;
+
+        let pgid = self.id();
+        record_mutation(
+            self.0.txid,
+            ctx,
+            &mut self.0.meta.wal,
+            WalRecord::InteriorInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                ptr: cell.ptr(),
+                overflow: cell.overflow(),
+                key_size: cell.key_size(),
+            },
+            WalRecord::InteriorInsert {
+                pgid,
+                index: i,
+                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                ptr: cell.ptr(),
+                overflow: cell.overflow(),
+                key_size: cell.key_size(),
+            },
+        )?;
 
         Ok(())
     }
@@ -1515,7 +1638,7 @@ impl<'a> InteriorPageWrite<'a> {
         let raw_size = std::cmp::min(max_before_overflow, total_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let content_offset = self.insert_cell(i, ptr, overflow, key_size, raw_size);
+        let content_offset = self.insert_cell_meta(i, ptr, overflow, key_size, raw_size);
         content.put(&mut self.0.buffer[content_offset..content_offset + raw_size])?;
         let pgid = self.id();
 
@@ -1547,7 +1670,7 @@ impl<'a> InteriorPageWrite<'a> {
         Ok(true)
     }
 
-    fn insert_cell(
+    fn insert_cell_meta(
         &mut self,
         index: usize,
         ptr: PageId,
@@ -1628,6 +1751,73 @@ impl<'a> InteriorPageWrite<'a> {
         *offset = new_offset;
     }
 
+    pub(crate) fn split(&mut self, ctx: LogContext<'_>) -> anyhow::Result<InteriorPageSplit> {
+        let pgid = self.id();
+        let payload_size = self.0.pager.page_size
+            - PAGE_HEADER_SIZE
+            - INTERIOR_PAGE_HEADER_SIZE
+            - PAGE_FOOTER_SIZE;
+        let half_payload = payload_size / 2;
+        let PageKind::Interior { count, .. } = self.0.meta.kind else {
+            unreachable!();
+        };
+
+        let mut cummulative_size = 0;
+        let mut n_cells_to_keep = 0;
+
+        for i in 0..count {
+            let cell = get_interior_cell(&self.0.buffer[PAGE_HEADER_SIZE..], i);
+            cummulative_size += cell.raw.len() + INTERIOR_PAGE_CELL_SIZE;
+            if cummulative_size >= half_payload {
+                n_cells_to_keep = i;
+                break;
+            }
+        }
+        assert!(
+            n_cells_to_keep < count,
+            "there is no point splitting the page if it doesn't move any entries"
+        );
+
+        // TODO: we can reduce the wal entry size by merging all of these mutations together.
+        for i in n_cells_to_keep..count {
+            let cell = get_interior_cell(&self.0.buffer[PAGE_HEADER_SIZE..], i);
+            record_mutation(
+                self.0.txid,
+                ctx,
+                &mut self.0.meta.wal,
+                WalRecord::InteriorDelete {
+                    pgid,
+                    index: i,
+                    old_raw: cell.raw(),
+                    old_ptr: cell.ptr(),
+                    old_overflow: cell.overflow(),
+                    old_key_size: cell.key_size(),
+                },
+                WalRecord::InteriorUndoDelete { pgid, index: i },
+            )?;
+        }
+
+        let original_count = count;
+        let PageKind::Interior {
+            ref mut count,
+            ref mut remaining,
+            ..
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+        *count = n_cells_to_keep;
+        *remaining = payload_size - cummulative_size;
+
+        Ok(InteriorPageSplit {
+            n: n_cells_to_keep,
+
+            buff: &self.0.buffer[PAGE_HEADER_SIZE..],
+            i: n_cells_to_keep,
+            end: original_count,
+        })
+    }
+
     pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
         let id = self.0.meta.id;
 
@@ -1684,6 +1874,28 @@ impl<'a> InteriorPageWrite<'a> {
             unreachable!();
         };
         interior_might_split(self.0.pager.page_size, remaining)
+    }
+}
+
+pub(crate) struct InteriorPageSplit<'a> {
+    pub(crate) n: usize,
+
+    buff: &'a [u8],
+    i: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for InteriorPageSplit<'a> {
+    type Item = InteriorCell<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.end {
+            return None;
+        }
+
+        let cell = get_interior_cell(self.buff, self.i);
+        self.i += 1;
+        Some(cell)
     }
 }
 

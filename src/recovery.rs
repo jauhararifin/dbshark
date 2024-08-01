@@ -252,7 +252,9 @@ fn redo(
             | WalRecord::InteriorInsert { pgid, .. }
             | WalRecord::InteriorDelete { pgid, .. }
             | WalRecord::InteriorUndoDelete { pgid, .. }
-            | WalRecord::InteriorSetOverflow { pgid, .. }
+            | WalRecord::InteriorSetCellOverflow { pgid, .. }
+            | WalRecord::InteriorSetCellPtr { pgid, .. }
+            | WalRecord::InteriorSetLast { pgid, .. }
             | WalRecord::LeafReset { pgid, .. }
             | WalRecord::LeafUndoReset { pgid }
             | WalRecord::LeafInit { pgid, .. }
@@ -353,7 +355,7 @@ fn redo_page(
             };
             page.delete(ctx, index)?;
         }
-        WalRecord::InteriorSetOverflow {
+        WalRecord::InteriorSetCellOverflow {
             pgid,
             index,
             overflow,
@@ -365,6 +367,24 @@ fn redo_page(
                 ));
             };
             page.set_cell_overflow(ctx, index, overflow)?;
+        }
+        WalRecord::InteriorSetCellPtr {
+            pgid, index, ptr, ..
+        } => {
+            let Some(mut page) = page.into_interior() else {
+                return Err(anyhow!(
+                    "redo failed on interior set ptr because page is not an interior"
+                ));
+            };
+            page.set_cell_ptr(ctx, index, ptr)?;
+        }
+        WalRecord::InteriorSetLast { pgid, last, .. } => {
+            let Some(mut page) = page.into_interior() else {
+                return Err(anyhow!(
+                    "redo failed on interior set ptr because page is not an interior"
+                ));
+            };
+            page.set_last(ctx, last)?;
         }
 
         WalRecord::LeafReset { pgid, .. } | WalRecord::LeafUndoReset { pgid } => {
@@ -615,7 +635,7 @@ pub(crate) fn undo_txn(
             WalRecord::InteriorUndoDelete { pgid, index } => {
                 unreachable!("InteriorUndoDelete only used for CLR which shouldn't be undone");
             }
-            WalRecord::InteriorSetOverflow {
+            WalRecord::InteriorSetCellOverflow {
                 pgid,
                 index,
                 old_overflow,
@@ -626,6 +646,25 @@ pub(crate) fn undo_txn(
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.set_cell_overflow(ctx, index, old_overflow)?;
+            }
+            WalRecord::InteriorSetCellPtr {
+                pgid,
+                index,
+                old_ptr,
+                ..
+            } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_interior() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.set_cell_ptr(ctx, index, old_ptr)?;
+            }
+            WalRecord::InteriorSetLast { pgid, old_last, .. } => {
+                let page = pager.write(txid, pgid)?;
+                let Some(mut page) = page.into_interior() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.set_last(ctx, old_last)?;
             }
 
             WalRecord::LeafReset {
