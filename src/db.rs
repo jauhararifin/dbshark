@@ -1,4 +1,4 @@
-use crate::btree::BTree;
+use crate::btree::{BTree, Cursor};
 use crate::pager::{DbState, PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
@@ -6,6 +6,8 @@ use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::iter::Iterator;
+use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -285,8 +287,19 @@ impl<'db> Tx<'db> {
         let root_pgid = self.init_root()?;
 
         let mut btree = BTree::new(self.id, &self.pager, &self.wal, root_pgid);
-        let mut result = btree.seek(name.as_bytes())?;
-        let bucket_pgid = if !result.found {
+        let result = btree.get(name.as_bytes())?;
+
+        let bucket_pgid = if let Some(result) = result {
+            let result = result.get()?;
+            let pgid_buff = result.value();
+            let Ok(pgid) = pgid_buff.try_into() else {
+                return Err(anyhow!("invalid bucket root pgid"));
+            };
+            let Some(pgid) = PageId::from_be_bytes(pgid) else {
+                return Err(anyhow!("invalid bucket root pgid"));
+            };
+            pgid
+        } else {
             drop(result);
             let bucket_root = self.pager.alloc(self.id)?;
             let bucket_root_id = bucket_root.id();
@@ -296,16 +309,6 @@ impl<'db> Tx<'db> {
 
             btree.put(name.as_bytes(), &b)?;
             bucket_root_id
-        } else {
-            let item = result.cursor.next()?.unwrap();
-            let pgid_buff = item.value();
-            let Ok(pgid) = pgid_buff.try_into() else {
-                return Err(anyhow!("invalid bucket root pgid"));
-            };
-            let Some(pgid) = PageId::from_be_bytes(pgid) else {
-                return Err(anyhow!("invalid bucket root pgid"));
-            };
-            pgid
         };
 
         Ok(Bucket {
@@ -385,11 +388,54 @@ impl<'a> Bucket<'a> {
     }
 
     pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        let mut result = self.btree.seek(key)?;
-        if !result.found {
+        let mut result = self.btree.get(key)?;
+        let Some(result) = result else {
             return Ok(None);
-        }
-        let value = result.cursor.next()?.map(|item| item.value().to_vec());
-        Ok(value)
+        };
+        let value = result.get()?.value().to_vec();
+        Ok(Some(value))
     }
+
+    pub fn range<R>(&'a self, range: R) -> anyhow::Result<Range<'a>>
+    where
+        R: RangeBounds<[u8]> + 'static,
+    {
+        let cursor = self.btree.range(range)?;
+        Ok(Range {
+            error: false,
+            cursor,
+        })
+    }
+}
+
+pub struct Range<'a> {
+    error: bool,
+    cursor: Cursor<'a>,
+}
+
+impl<'a> Iterator for Range<'a> {
+    type Item = anyhow::Result<KeyValue>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.error {
+            return None;
+        }
+
+        match self.cursor.next() {
+            Ok(item) => item.map(|item| {
+                Ok(KeyValue {
+                    key: item.key().to_vec().into_boxed_slice(),
+                    value: item.value().to_vec().into_boxed_slice(),
+                })
+            }),
+            Err(err) => {
+                self.error = true;
+                None
+            }
+        }
+    }
+}
+
+pub struct KeyValue {
+    pub key: Box<[u8]>,
+    pub value: Box<[u8]>,
 }

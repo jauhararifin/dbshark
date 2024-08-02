@@ -1,11 +1,12 @@
 use crate::content::{Bytes, Content};
 use crate::pager::{
     BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
-    OverflowPageRead, PageId, PageWrite, Pager,
+    OverflowPageRead, PageId, PageRead, PageWrite, Pager,
 };
 use crate::wal::{TxId, Wal};
 use anyhow::anyhow;
 use std::cmp::Ordering;
+use std::ops::{Bound, RangeBounds};
 
 pub(crate) struct BTree<'a> {
     txid: TxId,
@@ -173,6 +174,14 @@ impl<'a> BTree<'a> {
         Ok((i, found))
     }
 
+    fn search_key_in_interior_v2(
+        &self,
+        node: &'a impl BTreePage<'a>,
+        key: Bound<&[u8]>,
+    ) -> anyhow::Result<(usize, bool)> {
+        todo!();
+    }
+
     fn search_key_in_leaf(
         &self,
         node: &'a impl BTreePage<'a>,
@@ -195,6 +204,14 @@ impl<'a> BTree<'a> {
         }
 
         Ok((i, found))
+    }
+
+    fn search_key_in_leaf_v2(
+        &self,
+        node: &'a impl BTreePage<'a>,
+        key: Bound<&[u8]>,
+    ) -> anyhow::Result<(usize, bool)> {
+        todo!();
     }
 
     fn delete_leaf_cell(&self, page: &mut LeafPageWrite, index: usize) -> anyhow::Result<()> {
@@ -524,7 +541,7 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    pub(crate) fn seek(&self, key: &[u8]) -> anyhow::Result<LookupResult> {
+    pub(crate) fn get(&self, key: &[u8]) -> anyhow::Result<Option<GetResult>> {
         let mut current = self.pager.read(self.root)?;
         let page = loop {
             if !current.is_interior() {
@@ -544,28 +561,83 @@ impl<'a> BTree<'a> {
         };
 
         if page.is_none() {
-            return Ok(LookupResult {
-                cursor: Cursor {
-                    pager: self.pager,
-                    page: None,
-                    index: 0,
-                },
-                found: false,
-            });
+            return Ok(None);
         }
 
         let leaf = page.into_leaf().expect("not a leaf page");
 
         let (i, found) = self.search_key_in_leaf(&leaf, key)?;
-        let is_finished = i >= leaf.count();
-        Ok(LookupResult {
-            cursor: Cursor {
-                pager: self.pager,
-                page: if is_finished { None } else { Some(leaf) },
-                index: i,
-            },
-            found,
+        if !found {
+            return Ok(None);
+        }
+        Ok(Some(GetResult {
+            pager: self.pager,
+            page: leaf,
+            index: i,
+        }))
+    }
+
+    pub(crate) fn range(&self, range: impl RangeBounds<[u8]>) -> anyhow::Result<Cursor> {
+        let (start, skip_first) = match range.start_bound() {
+            Bound::Included(key) => (self.find_position(key)?, false),
+            Bound::Excluded(key) => (self.find_position(key)?, true),
+            Bound::Unbounded => (self.find_position(&[])?, false),
+        };
+        let Some((page, i)) = start else {
+            return Ok(Cursor::Empty);
+        };
+
+        let end = match range.end_bound() {
+            Bound::Included(key) => {
+                let Some((page, i)) = self.find_position(key)? else {
+                    return Ok(Cursor::Empty);
+                };
+                Bound::Included((page.id(), i))
+            }
+            Bound::Excluded(key) => {
+                let Some((page, i)) = self.find_position(key)? else {
+                    return Ok(Cursor::Empty);
+                };
+                Bound::Excluded((page.id(), i))
+            }
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        Ok(Cursor::Leaf {
+            pager: self.pager,
+            skip_current: skip_first,
+            current_page: Some(page),
+            current_index: i,
+            end,
         })
+    }
+
+    fn find_position(&self, key: &[u8]) -> anyhow::Result<Option<(LeafPageRead, usize)>> {
+        let mut current = self.pager.read(self.root)?;
+        let page = loop {
+            if !current.is_interior() {
+                break current;
+            }
+            let node = current.into_interior().unwrap();
+
+            let (i, _) = self.search_key_in_interior(&node, key)?;
+            let next_pgid = if i == node.count() {
+                node.last()
+            } else {
+                node.get(i).ptr()
+            };
+            let next = self.pager.read(next_pgid)?;
+
+            current = next;
+        };
+
+        let Some(leaf) = page.into_leaf() else {
+            return Ok(None);
+        };
+
+        let (i, found) = self.search_key_in_leaf(&leaf, key)?;
+        let is_finished = i >= leaf.count();
+        Ok(Some((leaf, i)))
     }
 
     fn new_page(&self) -> anyhow::Result<PageWrite<'a>> {
@@ -587,15 +659,25 @@ impl<'a> BTree<'a> {
     }
 }
 
-pub(crate) struct LookupResult<'a> {
-    pub(crate) cursor: Cursor<'a>,
-    pub(crate) found: bool,
+pub(crate) struct GetResult<'a> {
+    pager: &'a Pager,
+    page: LeafPageRead<'a>,
+    index: usize,
 }
 
-pub(crate) struct Cursor<'a> {
-    pager: &'a Pager,
-    page: Option<LeafPageRead<'a>>,
-    index: usize,
+impl GetResult<'_> {
+    pub(crate) fn get(self) -> anyhow::Result<KVItem> {
+        let cell = self.page.get(self.index);
+        let total_size = cell.key_size() + cell.val_size();
+        let mut raw = vec![0u8; total_size];
+        let mut content = BTreeContent::from_leaf_content(self.pager, &cell);
+        content.put(&mut raw)?;
+
+        Ok(KVItem {
+            content: raw.into_boxed_slice(),
+            key_size: cell.key_size(),
+        })
+    }
 }
 
 pub(crate) struct KVItem {
@@ -613,20 +695,65 @@ impl KVItem {
     }
 }
 
+pub(crate) enum Cursor<'a> {
+    Empty,
+    Leaf {
+        pager: &'a Pager,
+        skip_current: bool,
+
+        current_page: Option<LeafPageRead<'a>>,
+        current_index: usize,
+
+        end: Bound<(PageId, usize)>,
+    },
+}
+
 impl<'a> Cursor<'a> {
     pub(crate) fn next(&mut self) -> anyhow::Result<Option<KVItem>> {
-        let Some(ref leaf_page) = self.page else {
-            return Ok(None);
+        if let Self::Leaf { skip_current, .. } = self {
+            if *skip_current {
+                *skip_current = false;
+                self.next()?;
+            }
         };
 
-        let item = if self.index < leaf_page.count() {
-            let cell = leaf_page.get(self.index);
+        let Self::Leaf {
+            pager,
+            skip_current,
+            current_page,
+            current_index,
+            end,
+        } = self
+        else {
+            return Ok(None);
+        };
+        assert!(!*skip_current);
+
+        let Some(ref leaf_page) = current_page else {
+            return Ok(None);
+        };
+        match end {
+            Bound::Included(end) => {
+                if leaf_page.id() == end.0 && *current_index > end.1 {
+                    return Ok(None);
+                }
+            }
+            Bound::Excluded(end) => {
+                if leaf_page.id() == end.0 && *current_index >= end.1 {
+                    return Ok(None);
+                }
+            }
+            Bound::Unbounded => (),
+        }
+
+        let item = if *current_index < leaf_page.count() {
+            let cell = leaf_page.get(*current_index);
             let total_size = cell.key_size() + cell.val_size();
             let mut raw = vec![0u8; total_size];
-            let mut content = BTreeContent::from_leaf_content(self.pager, &cell);
+            let mut content = BTreeContent::from_leaf_content(pager, &cell);
             content.put(&mut raw)?;
 
-            self.index += 1;
+            *current_index += 1;
             Some(KVItem {
                 content: raw.into_boxed_slice(),
                 key_size: cell.key_size(),
@@ -635,15 +762,15 @@ impl<'a> Cursor<'a> {
             None
         };
 
-        if self.index >= leaf_page.count() {
+        if *current_index >= leaf_page.count() {
             if let Some(next_pgid) = leaf_page.next() {
-                let Some(page) = self.pager.read(next_pgid)?.into_leaf() else {
+                let Some(page) = pager.read(next_pgid)?.into_leaf() else {
                     return Err(anyhow!("expected a leaf page"));
                 };
-                self.page = Some(page);
-                self.index = 0;
+                *current_page = Some(page);
+                *current_index = 0;
             } else {
-                self.page = None;
+                *current_page = None;
             }
         }
 

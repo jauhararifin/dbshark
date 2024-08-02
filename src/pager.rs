@@ -2400,6 +2400,8 @@ fn get_leaf_cell(buff: &[u8], index: usize) -> LeafCell<'_> {
     LeafCell { cell, raw }
 }
 
+// TODO: maybe it's a good idea to store the pointer to the value directly in the cell.
+// This is because we often want to redirected to the value instead of just the key.
 pub(crate) struct LeafCell<'a> {
     cell: &'a [u8],
     raw: &'a [u8],

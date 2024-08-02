@@ -78,6 +78,18 @@ fn test_db_btree() {
         );
     }
 
+    for (i, item) in bucket.range(..).unwrap().enumerate() {
+        let item = item.unwrap();
+        let key = String::from_utf8(item.key.to_vec()).unwrap();
+        let val = String::from_utf8(item.value.to_vec()).unwrap();
+
+        let expected_key = format!("key{i:05}");
+        let expected_val = format!("val{i:0900}");
+
+        assert_eq!(expected_key, key);
+        assert_eq!(expected_val, val);
+    }
+
     tx.commit().unwrap();
     db.shutdown().unwrap();
 }
