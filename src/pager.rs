@@ -261,10 +261,6 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn page_count(&self) -> usize {
-        self.internal.read().file_page_count
-    }
-
     pub(crate) fn set_db_state(&self, db_state: DbState) {
         *self.db_state.write() = db_state;
     }
@@ -1002,10 +998,6 @@ impl<'a> Drop for PageRead<'a> {
 }
 
 impl<'a> PageRead<'a> {
-    pub(crate) fn id(&self) -> PageId {
-        self.meta.id
-    }
-
     pub(crate) fn is_none(&self) -> bool {
         matches!(&self.meta.kind, PageKind::None)
     }
@@ -1108,7 +1100,6 @@ impl<'a> PageWrite<'a> {
             panic!("set_interior only can be used for redo-ing wal");
         };
 
-        let pgid = self.id();
         record_redo_mutation(lsn, &mut self.meta);
 
         self.meta.kind = Pager::decode_interior_page(payload)?;
@@ -1168,7 +1159,6 @@ impl<'a> PageWrite<'a> {
             panic!("set_leaf only can be used for redo-ing wal");
         };
 
-        let pgid = self.id();
         record_redo_mutation(lsn, &mut self.meta);
 
         self.meta.kind = Pager::decode_leaf_page(payload)?;
@@ -1222,7 +1212,6 @@ impl<'a> PageWrite<'a> {
             panic!("set_overflow only can be used for redo-ing wal");
         };
 
-        let pgid = self.id();
         record_redo_mutation(lsn, &mut self.meta);
 
         self.meta.kind = Pager::decode_overflow_page(payload)?;
@@ -1312,22 +1301,11 @@ impl<'a, 'b> BTreePage<'b> for InteriorPageRead<'a> {
 }
 
 impl<'a> InteriorPageRead<'a> {
-    fn id(&self) -> PageId {
-        self.0.meta.id
-    }
-
     pub(crate) fn last(&self) -> PageId {
         let PageKind::Interior { last, .. } = self.0.meta.kind else {
             unreachable!();
         };
         last
-    }
-
-    pub(crate) fn might_split(&self) -> bool {
-        let PageKind::Interior { remaining, .. } = self.0.meta.kind else {
-            unreachable!();
-        };
-        interior_might_split(self.0.pager.page_size, remaining)
     }
 }
 
@@ -1819,8 +1797,6 @@ impl<'a> InteriorPageWrite<'a> {
     }
 
     pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
-        let id = self.0.meta.id;
-
         let cell = get_interior_cell(
             &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
             index,
@@ -2132,7 +2108,7 @@ impl<'a> LeafPageWrite<'a> {
             "insert cell only called in the context of moving a splitted page to a new page, so it should always fit",
         );
 
-        let reserved_offset = self.reserve_cell(i, cell.key_size(), cell.val_size(), raw.len());
+        let reserved_offset = self.reserve_cell(raw.len());
         Bytes::new(cell.raw)
             .put(&mut self.0.buffer[reserved_offset..reserved_offset + raw.len()])?;
 
@@ -2198,7 +2174,7 @@ impl<'a> LeafPageWrite<'a> {
         let raw_size = std::cmp::min(max_before_overflow, content_size);
         let raw_size = std::cmp::min(raw_size, remaining);
 
-        let reserved_offset = self.reserve_cell(i, key_size, value_size, raw_size);
+        let reserved_offset = self.reserve_cell(raw_size);
         content.put(&mut self.0.buffer[reserved_offset..reserved_offset + raw_size])?;
 
         let pgid = self.id();
@@ -2228,13 +2204,7 @@ impl<'a> LeafPageWrite<'a> {
         Ok(true)
     }
 
-    fn reserve_cell(
-        &mut self,
-        index: usize,
-        key_size: usize,
-        val_size: usize,
-        raw_size: usize,
-    ) -> usize {
+    fn reserve_cell(&mut self, raw_size: usize) -> usize {
         let added = LEAF_PAGE_CELL_SIZE + raw_size;
         let PageKind::Leaf { offset, count, .. } = self.0.meta.kind else {
             unreachable!();
@@ -2245,13 +2215,7 @@ impl<'a> LeafPageWrite<'a> {
             self.rearrange();
         }
 
-        let PageKind::Leaf {
-            ref mut offset,
-            ref mut remaining,
-            ref mut count,
-            ..
-        } = self.0.meta.kind
-        else {
+        let PageKind::Leaf { ref mut offset, .. } = self.0.meta.kind else {
             unreachable!();
         };
         assert!(current_cell_size + added <= *offset);
@@ -2450,10 +2414,6 @@ impl<'a> Iterator for LeafPageSplit<'a> {
 pub(crate) struct OverflowPageRead<'a>(PageRead<'a>);
 
 impl<'a> OverflowPageRead<'a> {
-    pub(crate) fn id(&self) -> PageId {
-        self.0.meta.id
-    }
-
     pub(crate) fn next(&self) -> Option<PageId> {
         let PageKind::Overflow { next, .. } = self.0.meta.kind else {
             unreachable!();
@@ -2479,20 +2439,6 @@ pub(crate) struct OverflowPageWrite<'a>(PageWrite<'a>);
 impl<'a> OverflowPageWrite<'a> {
     pub(crate) fn id(&self) -> PageId {
         self.0.meta.id
-    }
-
-    pub(crate) fn next(&self) -> Option<PageId> {
-        let PageKind::Overflow { next, .. } = self.0.meta.kind else {
-            unreachable!();
-        };
-        next
-    }
-
-    pub(crate) fn content(&self) -> &[u8] {
-        let PageKind::Overflow { size, .. } = self.0.meta.kind else {
-            unreachable!();
-        };
-        get_overflow_content(self.0.buffer, size)
     }
 
     pub(crate) fn set_next(
@@ -2624,7 +2570,6 @@ impl<'a> OverflowPageWrite<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::Bytes;
     use std::sync::Arc;
 
     #[test]
@@ -2633,19 +2578,19 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.wal");
-        let mut file = File::create(file_path).unwrap();
+        let file = File::create(file_path).unwrap();
 
         let double_buff_file_path = dir.path().join("test.wal");
-        let mut double_buff_file = File::create(double_buff_file_path).unwrap();
+        let double_buff_file = File::create(double_buff_file_path).unwrap();
 
         let wal_path = dir.path().join("test.wal");
-        let mut wal_file = File::create(wal_path).unwrap();
+        let wal_file = File::create(wal_path).unwrap();
         let wal = Arc::new(Wal::new(wal_file, 0, Lsn::new(64).unwrap(), page_size).unwrap());
 
         let pager = Pager::new(file, double_buff_file, page_size, 10).unwrap();
         let txid = TxId::new(1).unwrap();
 
-        let mut page1 = pager.alloc(txid).unwrap();
+        let page1 = pager.alloc(txid).unwrap();
         let pgid_last = PageId::new(7).unwrap();
         let mut page1 = page1
             .init_interior(LogContext::Runtime(&wal), pgid_last)

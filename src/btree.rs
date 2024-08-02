@@ -1,7 +1,7 @@
 use crate::content::{Bytes, Content};
 use crate::pager::{
     BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
-    OverflowPageRead, PageId, PageRead, PageWrite, Pager,
+    OverflowPageRead, PageId, PageWrite, Pager,
 };
 use crate::wal::{TxId, Wal};
 use anyhow::anyhow;
@@ -162,7 +162,7 @@ impl<'a> BTree<'a> {
         while i < node.count() {
             let cell = node.get(i);
             let mut a = Bytes::new(key);
-            let mut b = BTreeContent::from_cell(self.pager, cell);
+            let b = BTreeContent::from_cell(self.pager, cell);
             let ord = a.compare(b)?;
             found = ord.is_eq();
             if ord.is_lt() {
@@ -172,14 +172,6 @@ impl<'a> BTree<'a> {
         }
 
         Ok((i, found))
-    }
-
-    fn search_key_in_interior_v2(
-        &self,
-        node: &'a impl BTreePage<'a>,
-        key: Bound<&[u8]>,
-    ) -> anyhow::Result<(usize, bool)> {
-        todo!();
     }
 
     fn search_key_in_leaf(
@@ -194,7 +186,7 @@ impl<'a> BTree<'a> {
         while i < node.count() {
             let cell = node.get(i);
             let mut a = Bytes::new(key);
-            let mut b = BTreeContent::from_cell(self.pager, cell);
+            let b = BTreeContent::from_cell(self.pager, cell);
             let ord = a.compare(b)?;
             found = ord.is_eq();
             if ord.is_le() {
@@ -204,14 +196,6 @@ impl<'a> BTree<'a> {
         }
 
         Ok((i, found))
-    }
-
-    fn search_key_in_leaf_v2(
-        &self,
-        node: &'a impl BTreePage<'a>,
-        key: Bound<&[u8]>,
-    ) -> anyhow::Result<(usize, bool)> {
-        todo!();
     }
 
     fn delete_leaf_cell(&self, page: &mut LeafPageWrite, index: usize) -> anyhow::Result<()> {
@@ -274,11 +258,10 @@ impl<'a> BTree<'a> {
         &self,
         node: &mut InteriorPageWrite,
         index: usize,
-        mut content: &mut impl Content,
+        content: &mut impl Content,
         ptr: PageId,
         key_size: usize,
     ) -> anyhow::Result<bool> {
-        let value_size = content.remaining() - key_size;
         let ok = node.insert_content(self.ctx, index, content, key_size, ptr, None)?;
         if !ok {
             return Ok(false);
@@ -327,9 +310,9 @@ impl<'a> BTree<'a> {
             new_right_leaf.insert_cell(self.ctx, i, cell)?;
         }
         new_right_leaf.set_next(self.ctx, left_leaf.next())?;
-        left_leaf.set_next(self.ctx, Some(new_right_leaf.id()));
+        left_leaf.set_next(self.ctx, Some(new_right_leaf.id()))?;
 
-        let mut keyval = KeyValContent::new(key, value);
+        let keyval = KeyValContent::new(key, value);
         if index < n_cells_to_keep {
             self.insert_content_to_leaf(left_leaf, index, keyval, key.len())?;
         } else {
@@ -362,7 +345,7 @@ impl<'a> BTree<'a> {
         a: LeafPageWrite,
         mut b: LeafPageWrite,
         c: PageId,
-        mut pivot: &mut impl Content,
+        pivot: &mut impl Content,
     ) -> anyhow::Result<()> {
         for i in 0..a.count() {
             let cell = a.get(i);
@@ -515,9 +498,9 @@ impl<'a> BTree<'a> {
     fn split_interior_root(
         &self,
         a: InteriorPageWrite,
-        mut b: PageWrite,
+        b: PageWrite,
         c: PageId,
-        mut pivot: &mut impl Content,
+        pivot: &mut impl Content,
     ) -> anyhow::Result<()> {
         let a_last = a.last();
         let mut b = b
@@ -534,7 +517,6 @@ impl<'a> BTree<'a> {
             .expect("resetted page should always be convertible to an interior page");
 
         let key_size = pivot.remaining();
-        let a_id = a.id();
         let ok = self.insert_content_to_interior(&mut a, 0, pivot, b.id(), key_size)?;
         assert!(ok);
 
@@ -635,13 +617,12 @@ impl<'a> BTree<'a> {
             return Ok(None);
         };
 
-        let (i, found) = self.search_key_in_leaf(&leaf, key)?;
-        let is_finished = i >= leaf.count();
+        let (i, _) = self.search_key_in_leaf(&leaf, key)?;
         Ok(Some((leaf, i)))
     }
 
     fn new_page(&self) -> anyhow::Result<PageWrite<'a>> {
-        let Some(freelist_pgid) = self.pager.freelist() else {
+        let Some(_freelist_pgid) = self.pager.freelist() else {
             let page = self.pager.alloc(self.txid)?;
             return Ok(page);
         };
@@ -649,7 +630,7 @@ impl<'a> BTree<'a> {
         todo!("allocate new page from freelist");
     }
 
-    fn delete_page(&self, pgid: PageId) -> anyhow::Result<()> {
+    fn delete_page(&self, _pgid: PageId) -> anyhow::Result<()> {
         // TODO: consider batch deletion after the end of transaction so that
         // if in a single transaction we delete a page and then allocate a page,
         // we don't have to write the freelist page twice.
@@ -803,12 +784,14 @@ impl Content for KeyValContent<'_> {
         }
 
         if !target.is_empty() {
+            assert!(self.key.is_empty());
             let s = std::cmp::min(self.value.len(), target.len());
             target[..s].copy_from_slice(&self.value[..s]);
             self.value = &self.value[s..];
             target = &mut target[s..];
         }
 
+        assert!(target.is_empty() || self.remaining() == 0);
         Ok(())
     }
 }
@@ -864,8 +847,6 @@ impl<'a> BTreeContent<'a> {
     }
 
     fn from_leaf_content(pager: &'a Pager, cell: &'a LeafCell) -> Self {
-        let raw_size = std::cmp::min(cell.raw().len(), cell.key_size() + cell.val_size());
-        let raw = &cell.raw()[..raw_size];
         BTreeContent {
             pager,
             remaining: cell.key_size() + cell.val_size(),

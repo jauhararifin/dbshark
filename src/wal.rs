@@ -1,11 +1,9 @@
-use crate::pager::{PageId, PageIdExt, MINIMUM_PAGE_SIZE};
+use crate::pager::{PageId, PageIdExt};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
-
-const MAX_DIRTY_PAGES_IN_CHECKPOINT_END: usize = (MINIMUM_PAGE_SIZE - 16) / 16;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TxId(NonZeroU64);
@@ -71,17 +69,11 @@ impl Lsn {
 
 pub(crate) trait LsnExt {
     fn to_be_bytes(&self) -> [u8; 8];
-    fn add(&self, offset: usize) -> Lsn;
 }
 
 impl LsnExt for Lsn {
     fn to_be_bytes(&self) -> [u8; 8] {
         self.0.get().to_be_bytes()
-    }
-
-    fn add(&self, offset: usize) -> Lsn {
-        let v = self.0.get() + offset as u64;
-        Self::new(v).expect("should not overflow")
     }
 }
 
@@ -92,11 +84,6 @@ impl LsnExt for Option<Lsn> {
         } else {
             0u64.to_be_bytes()
         }
-    }
-
-    fn add(&self, offset: usize) -> Lsn {
-        let v = self.as_ref().map(Lsn::get).unwrap_or(0) + offset as u64;
-        Lsn::new(v).unwrap()
     }
 }
 
@@ -122,7 +109,7 @@ struct WalInternal {
 
 impl Wal {
     pub(crate) fn new(
-        mut f: File,
+        f: File,
         relative_lsn_offset: u64,
         next_lsn: Lsn,
         page_size: usize,
@@ -191,7 +178,8 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
+    pub(crate) fn sync(&self, _lsn: Lsn) -> anyhow::Result<()> {
+        // TODO: improve this to only flush necessary buffer that contains targetted lsn
         let mut internal = self.internal.write();
         Self::flush(&mut self.f.lock(), &mut internal)
     }
@@ -276,7 +264,7 @@ impl<'a> WalBackwardIterator<'a> {
             self.start_offset -= s;
         }
 
-        let checksum = u64::from_be_bytes(
+        let recorded_checksum = u64::from_be_bytes(
             self.buffer[self.end_offset - 8..self.end_offset]
                 .try_into()
                 .unwrap(),
@@ -301,6 +289,15 @@ impl<'a> WalBackwardIterator<'a> {
             f.seek(SeekFrom::Start(offset - size as u64))?;
             f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
             self.start_offset -= s;
+        }
+
+        let calculated_checksum =
+            crc64::crc64(0, &self.buffer[self.end_offset - size..self.end_offset - 8]);
+        if recorded_checksum != calculated_checksum {
+            // TODO: maybe we can consider this entry as "uncompleted" and then skip it? but if
+            // it's in the middle of the WAL, this entry should be considered broken.
+            // We might also need to consider double buffering for wal entries though.
+            todo!("mismatch checksum recorded_checksum:{recorded_checksum} calculated_checksum:{calculated_checksum}");
         }
 
         match WalEntry::decode(&self.buffer[self.end_offset - size..self.end_offset]) {
@@ -472,12 +469,6 @@ pub(crate) enum WalRecord<'a> {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DirtyPage {
-    pub(crate) id: PageId,
-    pub(crate) rec_lsn: Lsn,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxState {
     None,
@@ -605,7 +596,7 @@ impl<'a> WalRecord<'a> {
         }
     }
 
-    fn encode(&self, mut buff: &mut [u8]) {
+    fn encode(&self, buff: &mut [u8]) {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
 
@@ -880,7 +871,7 @@ impl<'a> WalRecord<'a> {
         }
     }
 
-    fn decode(mut buff: &'a [u8], kind: u8) -> anyhow::Result<Self> {
+    fn decode(buff: &'a [u8], kind: u8) -> anyhow::Result<Self> {
         match kind {
             WAL_RECORD_BEGIN_KIND => Ok(Self::Begin),
             WAL_RECORD_COMMIT_KIND => Ok(Self::Commit),
@@ -1054,7 +1045,7 @@ impl<'a> WalRecord<'a> {
                     old_raw: &buff[28..28 + raw_size as usize],
                     old_overflow,
                     old_key_size: old_key_size as usize,
-                    old_val_size: old_key_size as usize,
+                    old_val_size: old_val_size as usize,
                 })
             }
             WAL_RECORD_LEAF_UNDO_DELETE_KIND => {
@@ -1199,10 +1190,6 @@ pub(crate) struct WalEntry<'a> {
 }
 
 impl<'a> WalEntry<'a> {
-    fn new(txid: TxId, clr: Option<Lsn>, record: WalRecord<'a>) -> Self {
-        Self { txid, clr, record }
-    }
-
     pub(crate) fn size(&self) -> usize {
         Self::size_by_record_size(self.record.size())
     }
@@ -1297,6 +1284,7 @@ pub(crate) enum WalDecodeResult<'a> {
 }
 
 impl<'a> WalDecodeResult<'a> {
+    #[cfg(test)]
     pub(crate) fn unwrap(self) -> WalEntry<'a> {
         if let Self::Ok(entry) = self {
             entry
@@ -1682,7 +1670,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let file_path = dir.path().join("test.wal");
-        let mut file = File::create(file_path).unwrap();
+        let file = File::create(file_path).unwrap();
 
         let page_size = 256;
         let wal = Wal::new(file, 0, Lsn::new(64).unwrap(), page_size).unwrap();

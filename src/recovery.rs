@@ -1,20 +1,17 @@
 use crate::content::Bytes;
-use crate::pager::{DbState, LogContext, PageId, PageIdExt, PageWrite, Pager};
+use crate::pager::{DbState, LogContext, PageId, Pager};
 use crate::wal::{
-    build_wal_header, load_wal_header, Lsn, LsnExt, TxId, TxState, Wal, WalDecodeResult, WalEntry,
+    build_wal_header, load_wal_header, Lsn, TxId, TxState, Wal, WalDecodeResult, WalEntry,
     WalHeader, WalRecord, WAL_HEADER_SIZE,
 };
 use anyhow::anyhow;
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::num::NonZeroU64;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
-use std::slice::SliceIndex;
 
 pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::Result<Wal> {
-    let wal_header = get_wal_header(&mut f, page_size)?;
+    let wal_header = get_wal_header(&mut f)?;
 
     let analyze_result = analyze(&mut f, &wal_header, page_size)?;
     redo(&mut f, pager, &wal_header, &analyze_result, page_size)?;
@@ -31,7 +28,7 @@ pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::R
     Ok(wal)
 }
 
-fn get_wal_header(f: &mut File, page_size: usize) -> anyhow::Result<WalHeader> {
+fn get_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
     if f.metadata()?.size() < 2 * WAL_HEADER_SIZE as u64 {
         build_wal_header(f)
     } else {
@@ -313,15 +310,15 @@ fn redo_page(
             unreachable!("this case should be filtered out by the caller")
         }
 
-        WalRecord::InteriorReset { pgid, .. } | WalRecord::InteriorUndoReset { pgid } => {
-            let Some(mut page) = page.into_interior() else {
+        WalRecord::InteriorReset { .. } | WalRecord::InteriorUndoReset { .. } => {
+            let Some(page) = page.into_interior() else {
                 return Err(anyhow!(
                     "redo failed on interior reset because page is not an interior"
                 ));
             };
             page.reset(ctx)?;
         }
-        WalRecord::InteriorInit { pgid, last } => {
+        WalRecord::InteriorInit { last, .. } => {
             if page.init_interior(ctx, last)?.is_none() {
                 return Err(anyhow!("redo failed on interior init"));
             }
@@ -356,10 +353,7 @@ fn redo_page(
             page.delete(ctx, index)?;
         }
         WalRecord::InteriorSetCellOverflow {
-            pgid,
-            index,
-            overflow,
-            ..
+            index, overflow, ..
         } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
@@ -368,9 +362,7 @@ fn redo_page(
             };
             page.set_cell_overflow(ctx, index, overflow)?;
         }
-        WalRecord::InteriorSetCellPtr {
-            pgid, index, ptr, ..
-        } => {
+        WalRecord::InteriorSetCellPtr { index, ptr, .. } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
                     "redo failed on interior set ptr because page is not an interior"
@@ -378,7 +370,7 @@ fn redo_page(
             };
             page.set_cell_ptr(ctx, index, ptr)?;
         }
-        WalRecord::InteriorSetLast { pgid, last, .. } => {
+        WalRecord::InteriorSetLast { last, .. } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
                     "redo failed on interior set ptr because page is not an interior"
@@ -387,15 +379,15 @@ fn redo_page(
             page.set_last(ctx, last)?;
         }
 
-        WalRecord::LeafReset { pgid, .. } | WalRecord::LeafUndoReset { pgid } => {
-            let Some(mut page) = page.into_leaf() else {
+        WalRecord::LeafReset { .. } | WalRecord::LeafUndoReset { .. } => {
+            let Some(page) = page.into_leaf() else {
                 return Err(anyhow!(
                     "redo failed on leaf reset because page is not a leaf"
                 ));
             };
             page.reset(ctx)?;
         }
-        WalRecord::LeafInit { pgid } => {
+        WalRecord::LeafInit { .. } => {
             if page.init_leaf(ctx)?.is_none() {
                 return Err(anyhow!("redo failed on leaf init"));
             };
@@ -436,10 +428,7 @@ fn redo_page(
             page.delete(ctx, index)?;
         }
         WalRecord::LeafSetOverflow {
-            pgid,
-            index,
-            overflow,
-            ..
+            index, overflow, ..
         } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
@@ -448,7 +437,7 @@ fn redo_page(
             };
             page.set_cell_overflow(ctx, index, overflow)?;
         }
-        WalRecord::LeafSetNext { pgid, next, .. } => {
+        WalRecord::LeafSetNext { next, .. } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
                     "redo failed on leaf set overflow because page is not a leaf"
@@ -457,20 +446,20 @@ fn redo_page(
             page.set_next(ctx, next)?;
         }
 
-        WalRecord::OverflowReset { pgid, .. } | WalRecord::OverflowUndoReset { pgid } => {
-            let Some(mut page) = page.into_overflow() else {
+        WalRecord::OverflowReset { .. } | WalRecord::OverflowUndoReset { .. } => {
+            let Some(page) = page.into_overflow() else {
                 return Err(anyhow!(
                     "redo failed on overflow reset because page is not an overflow"
                 ));
             };
             page.reset(ctx)?;
         }
-        WalRecord::OverflowInit { pgid } => {
+        WalRecord::OverflowInit { .. } => {
             if page.init_overflow(ctx)?.is_none() {
                 return Err(anyhow!("redo failed on overflow init"));
             };
         }
-        WalRecord::OverflowSetContent { pgid, next, raw } => {
+        WalRecord::OverflowSetContent { next, raw, .. } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
                     "redo failed on overflow reset because page is not an overflow"
@@ -478,7 +467,7 @@ fn redo_page(
             };
             page.set_content(ctx, &mut Bytes::new(raw), next)?;
         }
-        WalRecord::OverflowUndoSetContent { pgid, .. } => {
+        WalRecord::OverflowUndoSetContent { .. } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
                     "redo failed on overflow reset because page is not an overflow"
@@ -486,7 +475,7 @@ fn redo_page(
             };
             page.unset_content(ctx)?;
         }
-        WalRecord::OverflowSetNext { pgid, next, .. } => {
+        WalRecord::OverflowSetNext { next, .. } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
                     "redo failed on overflow reset because page is not an overflow"
@@ -594,12 +583,12 @@ pub(crate) fn undo_txn(
                 let page = pager.write(txid, pgid)?;
                 page.set_interior(ctx, payload)?;
             }
-            WalRecord::InteriorUndoReset { pgid } => {
+            WalRecord::InteriorUndoReset { .. } => {
                 unreachable!("InteriorUndoReset only used for CLR which shouldn't be undone");
             }
             WalRecord::InteriorInit { pgid, .. } => {
                 let page = pager.write(txid, pgid)?;
-                let Some(mut page) = page.into_interior() else {
+                let Some(page) = page.into_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.reset(ctx)?;
@@ -632,7 +621,7 @@ pub(crate) fn undo_txn(
                     old_overflow,
                 )?;
             }
-            WalRecord::InteriorUndoDelete { pgid, index } => {
+            WalRecord::InteriorUndoDelete { .. } => {
                 unreachable!("InteriorUndoDelete only used for CLR which shouldn't be undone");
             }
             WalRecord::InteriorSetCellOverflow {
@@ -678,12 +667,12 @@ pub(crate) fn undo_txn(
                 let page = pager.write(txid, pgid)?;
                 page.set_leaf(ctx, payload)?;
             }
-            WalRecord::LeafUndoReset { pgid } => {
+            WalRecord::LeafUndoReset { .. } => {
                 unreachable!("LeafUndoReset only used for CLR which shouldn't be undone");
             }
             WalRecord::LeafInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
-                let Some(mut page) = page.into_leaf() else {
+                let Some(page) = page.into_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo"));
                 };
                 page.reset(ctx)?;
@@ -716,7 +705,7 @@ pub(crate) fn undo_txn(
                     old_overflow,
                 )?;
             }
-            WalRecord::LeafUndoDelete { pgid, index } => {
+            WalRecord::LeafUndoDelete { .. } => {
                 unreachable!("LeafUndoDelete only used for CLR which shouldn't be undone");
             }
             WalRecord::LeafSetOverflow {
@@ -750,12 +739,12 @@ pub(crate) fn undo_txn(
                 let page = pager.write(txid, pgid)?;
                 page.set_overflow(ctx, payload)?;
             }
-            WalRecord::OverflowUndoReset { pgid } => {
+            WalRecord::OverflowUndoReset { .. } => {
                 unreachable!("OverflowUndoReset only used for CLR which shouldn't be undone");
             }
             WalRecord::OverflowInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
-                let Some(mut page) = page.into_overflow() else {
+                let Some(page) = page.into_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
                 page.reset(ctx)?;
@@ -765,9 +754,9 @@ pub(crate) fn undo_txn(
                 let Some(mut page) = page.into_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
-                page.unset_content(ctx);
+                page.unset_content(ctx)?;
             }
-            WalRecord::OverflowUndoSetContent { pgid } => {
+            WalRecord::OverflowUndoSetContent { .. } => {
                 unreachable!("OverflowUndoSetContent only used for CLR which shouldn't be undone");
             }
             WalRecord::OverflowSetNext { pgid, old_next, .. } => {

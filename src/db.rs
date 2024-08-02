@@ -3,11 +3,10 @@ use crate::pager::{DbState, PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
 use anyhow::anyhow;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::iter::Iterator;
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -34,7 +33,7 @@ struct DbTxState {
 pub struct Setting {}
 
 impl Db {
-    pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
+    pub fn open(path: &Path, _setting: Setting) -> anyhow::Result<Self> {
         if !path.exists() {
             std::fs::create_dir_all(path)?;
         }
@@ -148,7 +147,7 @@ impl Db {
     }
 
     fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<DbTxState>) -> anyhow::Result<()> {
-        pager.checkpoint(wal, RwLockReadGuard::map(tx_state.read(), |x| &x.tx_state));
+        pager.checkpoint(wal, RwLockReadGuard::map(tx_state.read(), |x| &x.tx_state))?;
         Ok(())
     }
 
@@ -208,6 +207,11 @@ impl Db {
         if self.background_thread.join().is_err() {
             return Err(anyhow!("cannot join background thread"));
         }
+
+        // Since the background thread is finished, it means it doesn't hold the WAL anymore and
+        // we can take the wal from Arc
+        let wal = Arc::into_inner(self.wal).unwrap();
+        wal.shutdown()?;
 
         // Since we own self, it means there are no active transaction since active transaction
         // borrows the db. And there are no ongoing flush and checkpoint since they also borrow
@@ -331,7 +335,7 @@ impl<'db> Tx<'db> {
         }
     }
 
-    pub fn commit(mut self) -> anyhow::Result<()> {
+    pub fn commit(self) -> anyhow::Result<()> {
         {
             let mut tx_state = self.tx_state.write();
             assert_eq!(tx_state.tx_state, TxState::Active(self.id));
@@ -351,7 +355,7 @@ impl<'db> Tx<'db> {
         Ok(())
     }
 
-    pub fn rollback(mut self) -> anyhow::Result<()> {
+    pub fn rollback(self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
         let lsn = self.wal.append(self.id, None, WalRecord::Rollback)?;
@@ -388,7 +392,7 @@ impl<'a> Bucket<'a> {
     }
 
     pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        let mut result = self.btree.get(key)?;
+        let result = self.btree.get(key)?;
         let Some(result) = result else {
             return Ok(None);
         };
@@ -429,7 +433,7 @@ impl<'a> Iterator for Range<'a> {
             }),
             Err(err) => {
                 self.error = true;
-                None
+                Some(Err(err))
             }
         }
     }
