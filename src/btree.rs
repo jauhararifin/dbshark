@@ -8,10 +8,10 @@ use anyhow::anyhow;
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 
-pub(crate) struct BTree<'a> {
+pub(crate) struct BTree<'a, T> {
     txid: TxId,
     pager: &'a Pager,
-    ctx: LogContext<'a>,
+    ctx: T,
     root: PageId,
 }
 
@@ -28,16 +28,33 @@ struct LookupHop<T> {
     found: bool,
 }
 
-impl<'a> BTree<'a> {
-    pub(crate) fn new(txid: TxId, pager: &'a Pager, wal: &'a Wal, root: PageId) -> BTree<'a> {
-        BTree {
-            txid,
-            pager,
-            ctx: LogContext::Runtime(wal),
-            root,
-        }
-    }
+pub(crate) type BTreeWrite<'a> = BTree<'a, LogContext<'a>>;
+pub(crate) type BTreeRead<'a> = BTree<'a, ()>;
 
+pub(crate) fn new<'a>(
+    txid: TxId,
+    pager: &'a Pager,
+    wal: &'a Wal,
+    root: PageId,
+) -> BTree<'a, LogContext<'a>> {
+    BTree {
+        txid,
+        pager,
+        ctx: LogContext::Runtime(wal),
+        root,
+    }
+}
+
+pub(crate) fn read_only(txid: TxId, pager: &Pager, root: PageId) -> BTree<()> {
+    BTree {
+        txid,
+        pager,
+        ctx: (),
+        root,
+    }
+}
+
+impl<'a> BTree<'a, LogContext<'a>> {
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         if key.len() + value.len() > MAX_ENTRY_SIZE {
             return Err(anyhow!("key-value pair is too large"));
@@ -148,54 +165,6 @@ impl<'a> BTree<'a> {
                 found,
             },
         })
-    }
-
-    fn search_key_in_interior(
-        &self,
-        node: &'a impl BTreePage<'a>,
-        key: &[u8],
-    ) -> anyhow::Result<(usize, bool)> {
-        // TODO: use binary search instead
-        let mut i = 0;
-        let mut found = false;
-
-        while i < node.count() {
-            let cell = node.get(i);
-            let mut a = Bytes::new(key);
-            let b = BTreeContent::from_cell(self.pager, cell);
-            let ord = a.compare(b)?;
-            found = ord.is_eq();
-            if ord.is_lt() {
-                break;
-            }
-            i += 1;
-        }
-
-        Ok((i, found))
-    }
-
-    fn search_key_in_leaf(
-        &self,
-        node: &'a impl BTreePage<'a>,
-        key: &[u8],
-    ) -> anyhow::Result<(usize, bool)> {
-        // TODO: use binary search instead
-        let mut i = 0;
-        let mut found = false;
-
-        while i < node.count() {
-            let cell = node.get(i);
-            let mut a = Bytes::new(key);
-            let b = BTreeContent::from_cell(self.pager, cell);
-            let ord = a.compare(b)?;
-            found = ord.is_eq();
-            if ord.is_le() {
-                break;
-            }
-            i += 1;
-        }
-
-        Ok((i, found))
     }
 
     fn delete_leaf_cell(&self, page: &mut LeafPageWrite, index: usize) -> anyhow::Result<()> {
@@ -522,7 +491,9 @@ impl<'a> BTree<'a> {
 
         Ok(())
     }
+}
 
+impl<'a, T> BTree<'a, T> {
     pub(crate) fn get(&self, key: &[u8]) -> anyhow::Result<Option<GetResult>> {
         let mut current = self.pager.read(self.root)?;
         let page = loop {
@@ -557,6 +528,54 @@ impl<'a> BTree<'a> {
             page: leaf,
             index: i,
         }))
+    }
+
+    fn search_key_in_interior(
+        &self,
+        node: &'a impl BTreePage<'a>,
+        key: &[u8],
+    ) -> anyhow::Result<(usize, bool)> {
+        // TODO: use binary search instead
+        let mut i = 0;
+        let mut found = false;
+
+        while i < node.count() {
+            let cell = node.get(i);
+            let mut a = Bytes::new(key);
+            let b = BTreeContent::from_cell(self.pager, cell);
+            let ord = a.compare(b)?;
+            found = ord.is_eq();
+            if ord.is_lt() {
+                break;
+            }
+            i += 1;
+        }
+
+        Ok((i, found))
+    }
+
+    fn search_key_in_leaf(
+        &self,
+        node: &'a impl BTreePage<'a>,
+        key: &[u8],
+    ) -> anyhow::Result<(usize, bool)> {
+        // TODO: use binary search instead
+        let mut i = 0;
+        let mut found = false;
+
+        while i < node.count() {
+            let cell = node.get(i);
+            let mut a = Bytes::new(key);
+            let b = BTreeContent::from_cell(self.pager, cell);
+            let ord = a.compare(b)?;
+            found = ord.is_eq();
+            if ord.is_le() {
+                break;
+            }
+            i += 1;
+        }
+
+        Ok((i, found))
     }
 
     pub(crate) fn range(&self, range: impl RangeBounds<[u8]>) -> anyhow::Result<Cursor> {

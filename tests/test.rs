@@ -46,6 +46,10 @@ fn test_db_happy_path() {
     drop(db);
 }
 
+// TODO: test concurrent transaction. Concurrent write txns should not be allowed.
+// concurrent read txns should be allowed. All dropped write txn should be undone
+// in the next transaction (actually it's preferrable to undo it right away).
+
 #[test]
 fn test_db_btree() {
     setup();
@@ -91,6 +95,33 @@ fn test_db_btree() {
     }
 
     tx.commit().unwrap();
+
+    {
+        let tx = db.read().unwrap();
+        let bucket = tx.bucket("table1").unwrap().unwrap();
+
+        for (key, val) in &items {
+            let val_get = bucket.get(key.as_bytes()).unwrap();
+            assert_eq!(
+                val,
+                &String::from_utf8(val_get.unwrap()).unwrap(),
+                "failed at {key}-{val}"
+            );
+        }
+
+        for (i, item) in bucket.range(..).unwrap().enumerate() {
+            let item = item.unwrap();
+            let key = String::from_utf8(item.key.to_vec()).unwrap();
+            let val = String::from_utf8(item.value.to_vec()).unwrap();
+
+            let expected_key = format!("key{i:05}");
+            let expected_val = format!("val{i:0900}");
+
+            assert_eq!(expected_key, key);
+            assert_eq!(expected_val, val);
+        }
+    }
+
     db.shutdown().unwrap();
 }
 

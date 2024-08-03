@@ -1,13 +1,14 @@
-use crate::btree::{BTree, Cursor};
+use crate::btree::{BTreeRead, BTreeWrite, Cursor};
 use crate::pager::{DbState, PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
 use anyhow::anyhow;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::ops::RangeBounds;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -18,15 +19,12 @@ pub struct Db {
     pager: Arc<Pager>,
     wal: Arc<Wal>,
 
-    tx_state: Arc<RwLock<DbTxState>>,
+    tx_lock: RwLock<()>,
+    next_txid: AtomicU64,
+    tx_state: Arc<RwLock<TxState>>,
 
     background_chan: Sender<()>,
     background_thread: JoinHandle<()>,
-}
-
-struct DbTxState {
-    tx_state: TxState,
-    next_txid: TxId,
 }
 
 #[derive(Default)]
@@ -77,16 +75,14 @@ impl Db {
         let wal = Arc::new(wal);
 
         let next_txid = if let Some(txid) = header.last_txid {
-            txid.next()
+            txid.next().get()
         } else {
-            TxId::new(1).unwrap()
+            1
         };
+        let next_txid = AtomicU64::new(next_txid);
 
-        let tx_state = Arc::new(RwLock::new(DbTxState {
-            // at this point, the recovery is already finished, so there is no active transaction
-            tx_state: TxState::None,
-            next_txid,
-        }));
+        // at this point, the recovery is already finished, so there is no active transaction
+        let tx_state = Arc::new(RwLock::new(TxState::None));
 
         let (sender, receiver) = channel();
         let background_thread = {
@@ -114,6 +110,8 @@ impl Db {
         Ok(Self {
             pager,
             wal,
+            tx_lock: RwLock::new(()),
+            next_txid,
             tx_state,
             background_chan: sender,
             background_thread,
@@ -146,8 +144,8 @@ impl Db {
         Err(anyhow!("database is corrupted, both db header are broken"))
     }
 
-    fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<DbTxState>) -> anyhow::Result<()> {
-        pager.checkpoint(wal, RwLockReadGuard::map(tx_state.read(), |x| &x.tx_state))?;
+    fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<TxState>) -> anyhow::Result<()> {
+        pager.checkpoint(wal, tx_state.read())?;
         Ok(())
     }
 
@@ -167,34 +165,57 @@ impl Db {
     }
 
     pub fn update(&self) -> anyhow::Result<Tx> {
+        let tx_guard = self.tx_lock.write();
+
         let mut tx_state = self.tx_state.write();
-        if let TxState::Active(txid) = tx_state.tx_state {
-            log::debug!("previous transaction {txid:?} is not closed yet");
+        self.undo_dangling_tx(&mut tx_state)?;
 
-            let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
-            tx_state.tx_state = TxState::Aborting {
-                txid,
-                rollback: lsn,
-                last_undone: lsn,
-            };
-            let TxState::Aborting {
-                ref mut last_undone,
-                ..
-            } = tx_state.tx_state
-            else {
-                unreachable!();
-            };
+        let txid = self.next_txid.fetch_add(1, Ordering::SeqCst);
+        let txid = TxId::new(txid).unwrap();
+        *tx_state = TxState::Active(txid);
 
-            undo_txn(&self.pager, &self.wal, txid, lsn, last_undone)?;
-            self.wal.append(txid, None, WalRecord::End)?;
-            tx_state.tx_state = TxState::None;
-        }
+        Tx::new(txid, self, tx_guard)
+    }
 
-        let txid = tx_state.next_txid;
-        tx_state.next_txid = tx_state.next_txid.next();
-        tx_state.tx_state = TxState::Active(txid);
+    fn undo_dangling_tx(&self, tx_state: &mut TxState) -> anyhow::Result<()> {
+        let TxState::Active(txid) = *tx_state else {
+            return Ok(());
+        };
 
-        Tx::new(txid, self)
+        log::debug!("previous transaction {txid:?} is not closed yet");
+
+        let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
+        *tx_state = TxState::Aborting {
+            txid,
+            rollback: lsn,
+            last_undone: lsn,
+        };
+        let TxState::Aborting {
+            ref mut last_undone,
+            ..
+        } = &mut *tx_state
+        else {
+            unreachable!();
+        };
+
+        undo_txn(&self.pager, &self.wal, txid, lsn, last_undone)?;
+        self.wal.append(txid, None, WalRecord::End)?;
+        *tx_state = TxState::None;
+
+        Ok(())
+    }
+
+    pub fn read(&self) -> anyhow::Result<ReadTx> {
+        let tx_guard = self.tx_lock.read();
+
+        let mut tx_state = self.tx_state.write();
+        self.undo_dangling_tx(&mut tx_state)?;
+
+        let txid = self.next_txid.fetch_add(1, Ordering::SeqCst);
+        let txid = TxId::new(txid).unwrap();
+
+        let tx = ReadTx::new(txid, self, tx_guard)?;
+        Ok(tx)
     }
 
     pub fn force_checkpoint(&self) -> anyhow::Result<()> {
@@ -272,15 +293,18 @@ pub struct Tx<'db> {
     wal: Arc<Wal>,
     pager: Arc<Pager>,
 
-    tx_state: &'db RwLock<DbTxState>,
+    _tx_guard: RwLockWriteGuard<'db, ()>,
+
+    tx_state: &'db RwLock<TxState>,
 }
 
 impl<'db> Tx<'db> {
-    fn new(id: TxId, db: &'db Db) -> anyhow::Result<Self> {
+    fn new(id: TxId, db: &'db Db, tx_guard: RwLockWriteGuard<'db, ()>) -> anyhow::Result<Self> {
         let tx = Self {
             id,
             wal: db.wal.clone(),
             pager: db.pager.clone(),
+            _tx_guard: tx_guard,
             tx_state: &db.tx_state,
         };
         tx.wal.append(tx.id, None, WalRecord::Begin)?;
@@ -290,7 +314,7 @@ impl<'db> Tx<'db> {
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
-        let mut btree = BTree::new(self.id, &self.pager, &self.wal, root_pgid);
+        let mut btree = crate::btree::new(self.id, &self.pager, &self.wal, root_pgid);
         let result = btree.get(name.as_bytes())?;
 
         let bucket_pgid = if let Some(result) = result {
@@ -316,7 +340,7 @@ impl<'db> Tx<'db> {
         };
 
         Ok(Bucket {
-            btree: BTree::new(self.id, &self.pager, &self.wal, bucket_pgid),
+            btree: crate::btree::new(self.id, &self.pager, &self.wal, bucket_pgid),
         })
     }
 
@@ -338,8 +362,8 @@ impl<'db> Tx<'db> {
     pub fn commit(self) -> anyhow::Result<()> {
         {
             let mut tx_state = self.tx_state.write();
-            assert_eq!(tx_state.tx_state, TxState::Active(self.id));
-            tx_state.tx_state = TxState::Committing(self.id);
+            assert_eq!(*tx_state, TxState::Active(self.id));
+            *tx_state = TxState::Committing(self.id);
         }
 
         let commit_lsn = self.wal.append(self.id, None, WalRecord::Commit)?;
@@ -348,8 +372,8 @@ impl<'db> Tx<'db> {
 
         {
             let mut tx_state = self.tx_state.write();
-            assert_eq!(tx_state.tx_state, TxState::Committing(self.id));
-            tx_state.tx_state = TxState::None;
+            assert_eq!(*tx_state, TxState::Committing(self.id));
+            *tx_state = TxState::None;
         }
 
         Ok(())
@@ -360,8 +384,8 @@ impl<'db> Tx<'db> {
 
         let lsn = self.wal.append(self.id, None, WalRecord::Rollback)?;
         let mut tx_state = self.tx_state.write();
-        assert_eq!(tx_state.tx_state, TxState::Active(self.id));
-        tx_state.tx_state = TxState::Aborting {
+        assert_eq!(*tx_state, TxState::Active(self.id));
+        *tx_state = TxState::Aborting {
             txid: self.id,
             rollback: lsn,
             last_undone: lsn,
@@ -369,20 +393,20 @@ impl<'db> Tx<'db> {
         let TxState::Aborting {
             ref mut last_undone,
             ..
-        } = tx_state.tx_state
+        } = &mut *tx_state
         else {
             unreachable!();
         };
 
         undo_txn(&self.pager, &self.wal, self.id, lsn, last_undone)?;
-        tx_state.tx_state = TxState::None;
+        *tx_state = TxState::None;
 
         Ok(())
     }
 }
 
 pub struct Bucket<'a> {
-    btree: BTree<'a>,
+    btree: BTreeWrite<'a>,
 }
 
 impl<'a> Bucket<'a> {
@@ -442,4 +466,74 @@ impl<'a> Iterator for Range<'a> {
 pub struct KeyValue {
     pub key: Box<[u8]>,
     pub value: Box<[u8]>,
+}
+
+pub struct ReadTx<'db> {
+    txid: TxId,
+    pager: Arc<Pager>,
+
+    _tx_guard: RwLockReadGuard<'db, ()>,
+}
+
+impl<'db> ReadTx<'db> {
+    fn new(txid: TxId, db: &Db, tx_guard: RwLockReadGuard<'db, ()>) -> anyhow::Result<Self> {
+        let tx = Self {
+            txid,
+            pager: db.pager.clone(),
+            _tx_guard: tx_guard,
+        };
+        Ok(tx)
+    }
+
+    pub fn bucket(&self, name: &str) -> anyhow::Result<Option<ReadBucket>> {
+        let Some(root_pgid) = self.pager.root() else {
+            return Ok(None);
+        };
+
+        let btree = crate::btree::read_only(self.txid, &self.pager, root_pgid);
+        let result = btree.get(name.as_bytes())?;
+
+        let Some(result) = result else {
+            return Ok(None);
+        };
+
+        let result = result.get()?;
+        let pgid_buff = result.value();
+        let Ok(pgid) = pgid_buff.try_into() else {
+            return Err(anyhow!("invalid bucket root pgid"));
+        };
+        let Some(pgid) = PageId::from_be_bytes(pgid) else {
+            return Err(anyhow!("invalid bucket root pgid"));
+        };
+
+        Ok(Some(ReadBucket {
+            btree: crate::btree::read_only(self.txid, &self.pager, pgid),
+        }))
+    }
+}
+
+pub struct ReadBucket<'a> {
+    btree: BTreeRead<'a>,
+}
+
+impl<'a> ReadBucket<'a> {
+    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let result = self.btree.get(key)?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let value = result.get()?.value().to_vec();
+        Ok(Some(value))
+    }
+
+    pub fn range<R>(&'a self, range: R) -> anyhow::Result<Range<'a>>
+    where
+        R: RangeBounds<[u8]> + 'static,
+    {
+        let cursor = self.btree.range(range)?;
+        Ok(Range {
+            error: false,
+            cursor,
+        })
+    }
 }

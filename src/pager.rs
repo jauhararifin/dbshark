@@ -564,6 +564,8 @@ impl Pager {
     ) -> anyhow::Result<()> {
         let checkpoint_lsn = {
             let db_state = self.db_state.read();
+            // It's ok to append WAL while holding tx_state's lock since it's unlikely that the WAL
+            // will block.
             wal.append(
                 TxId::new(1).unwrap(),
                 None,
