@@ -65,6 +65,8 @@ impl Db {
         let wal_path = path.join("wal");
         let double_buff_path = path.join("dbuff");
 
+        // TODO(important): The files here are not locked. In order to prevent corruption, only
+        // one database instance can exist at a time. We should lock the file for this.
         let mut db_file = OpenOptions::new()
             .read(true)
             .write(true)

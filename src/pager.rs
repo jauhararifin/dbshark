@@ -1,6 +1,7 @@
 use crate::content::{Bytes, Content};
 use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalRecord};
 use anyhow::anyhow;
+use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -103,7 +104,7 @@ struct PagerFlushInternal {
     // TODO: maybe add assert to check if it's not possible that a same page
     // is stored in both flushing_pages and buffer pool.
     flushing_pages: Box<[u8]>,
-    flushing_pgids: Vec<PageId>,
+    flushing_pgids: IndexSet<PageId>,
 }
 
 const PAGE_HEADER_SIZE: usize = 32;
@@ -197,7 +198,7 @@ impl Pager {
             }),
             flush_internal: RwLock::new(PagerFlushInternal {
                 flushing_pages,
-                flushing_pgids: vec![],
+                flushing_pgids: IndexSet::default(),
             }),
             db_state: RwLock::new(DbState::default()),
         })
@@ -442,7 +443,7 @@ impl Pager {
                     &self.f,
                     &self.double_buff_f,
                     self.page_size,
-                    pgid,
+                    old_pgid,
                     buffer,
                 )?;
                 drop(flush_internal);
@@ -507,7 +508,7 @@ impl Pager {
         pgid: PageId,
         buffer: &[u8],
     ) -> anyhow::Result<()> {
-        if let Some(i) = internal.flushing_pgids.iter().position(|p| p == &pgid) {
+        if let Some((i, _)) = internal.flushing_pgids.get_full(&pgid) {
             internal.flushing_pages[i * page_size..(i + 1) * page_size].copy_from_slice(buffer);
         } else {
             let is_full =
@@ -517,7 +518,7 @@ impl Pager {
             }
 
             let i = internal.flushing_pgids.len();
-            internal.flushing_pgids.push(pgid);
+            internal.flushing_pgids.insert(pgid);
             internal.flushing_pages[i * page_size..(i + 1) * page_size].copy_from_slice(buffer);
         }
 
@@ -623,10 +624,18 @@ impl Pager {
         meta.id = pgid;
 
         {
-            let mut f = self.f.lock();
-            // TODO: try to seek and read using a single syscall
-            f.seek(SeekFrom::Start(pgid.get() * self.page_size as u64))?;
-            f.read_exact(buff)?;
+            let flush_internal = self.flush_internal.read();
+            if let Some((i, _)) = flush_internal.flushing_pgids.get_full(&pgid) {
+                buff.copy_from_slice(
+                    &flush_internal.flushing_pages[i * self.page_size..(i + 1) * self.page_size],
+                );
+            } else {
+                drop(flush_internal);
+                let mut f = self.f.lock();
+                // TODO: try to seek and read using a single syscall
+                f.seek(SeekFrom::Start(pgid.get() * self.page_size as u64))?;
+                f.read_exact(buff)?;
+            }
         }
 
         let ok = Self::decode_internal(self.page_size, meta, buff)?;
