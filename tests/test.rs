@@ -173,6 +173,26 @@ fn test_db_rollback() {
 }
 
 #[test]
+fn test_crash_after_commit() {
+    setup();
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let db = Db::open(Path::new(dir.path()), Setting::default()).unwrap();
+    let mut tx = db.update().unwrap();
+    let mut bucket = tx.bucket("table1").unwrap();
+    bucket.put(b"key00001", b"val00001").unwrap();
+    tx.commit().unwrap();
+    drop(db);
+
+    let db = Db::open(dir.path(), Setting::default()).unwrap();
+    let tx = db.read().unwrap();
+    let bucket = tx.bucket("table1").unwrap().unwrap();
+    let result = bucket.get(b"key00001").unwrap().unwrap();
+    assert_eq!("val00001", String::from_utf8(result).unwrap());
+}
+
+#[test]
 fn test_db_recovery1() {
     setup();
 

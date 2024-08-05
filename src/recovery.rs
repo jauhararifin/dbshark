@@ -240,7 +240,11 @@ fn redo(
             WalRecord::CheckpointBegin { root, freelist, .. }
             | WalRecord::HeaderSet { root, freelist, .. }
             | WalRecord::HeaderUndoSet { root, freelist, .. } => {
-                pager.set_db_state(DbState { root, freelist });
+                pager.set_db_state(
+                    entry.txid,
+                    LogContext::Redo(lsn),
+                    DbState { root, freelist },
+                )?;
             }
 
             WalRecord::InteriorReset { pgid, .. }
@@ -563,10 +567,14 @@ pub(crate) fn undo_txn(
                 old_freelist,
                 ..
             } => {
-                pager.set_db_state(DbState {
-                    root: old_root,
-                    freelist: old_freelist,
-                });
+                pager.set_db_state(
+                    txid,
+                    ctx,
+                    DbState {
+                        root: old_root,
+                        freelist: old_freelist,
+                    },
+                )?;
             }
             WalRecord::HeaderUndoSet { .. } => {
                 unreachable!("HeaderUndoSet only used for CLR which shouldn't be undone");

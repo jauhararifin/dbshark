@@ -1,5 +1,5 @@
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
-use crate::pager::{DbState, PageId, PageIdExt, Pager};
+use crate::pager::{DbState, LogContext, PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
 use anyhow::anyhow;
@@ -379,10 +379,14 @@ impl<'db> Tx<'db> {
         } else {
             let page = self.pager.alloc(self.id)?;
             let pgid = page.id();
-            self.pager.set_db_state(DbState {
-                root: Some(pgid),
-                freelist: self.pager.freelist(),
-            });
+            self.pager.set_db_state(
+                self.id,
+                LogContext::Runtime(&self.wal),
+                DbState {
+                    root: Some(pgid),
+                    freelist: self.pager.freelist(),
+                },
+            )?;
             drop(page);
             Ok(pgid)
         }

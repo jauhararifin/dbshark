@@ -262,8 +262,39 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn set_db_state(&self, db_state: DbState) {
+    pub(crate) fn set_db_state(
+        &self,
+        txid: TxId,
+        ctx: LogContext<'_>,
+        db_state: DbState,
+    ) -> anyhow::Result<()> {
+        let (old_root, old_freelist) = {
+            let old_db_state = self.db_state.read();
+            (old_db_state.root, old_db_state.freelist)
+        };
+
+        let mut temp = None;
+        record_mutation(
+            txid,
+            ctx,
+            &mut temp,
+            WalRecord::HeaderSet {
+                root: db_state.root,
+                freelist: db_state.freelist,
+                old_root,
+                old_freelist,
+            },
+            WalRecord::HeaderSet {
+                root: db_state.root,
+                freelist: db_state.freelist,
+                old_root,
+                old_freelist,
+            },
+        )?;
+
         *self.db_state.write() = db_state;
+
+        Ok(())
     }
 
     pub(crate) fn root(&self) -> Option<PageId> {
