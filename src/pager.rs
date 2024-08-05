@@ -986,14 +986,6 @@ impl Pager {
 struct PageMeta {
     id: PageId,
     kind: PageKind,
-
-    // TODO: maybe we don't need to `is_mutated` field. We can
-    // infer it from the `rec_lsn` and `page_lsn` fields. If
-    // they are None, then it's a clean page, otherwise it's
-    // a dirty page.
-    // is_mutated: bool,
-    // rec_lsn: Option<Lsn>,
-    // page_lsn: Option<Lsn>,
     wal: Option<PageWalInfo>,
 }
 
