@@ -1,6 +1,9 @@
 # DBShark
 
-DBShark is an embedded key-value B+tree-based database inspired by [boltdb](https://github.com/boltdb/bolt). This project is work-in-progress.
+DBShark is an embedded key-value B+tree-based database inspired by [boltdb](https://github.com/boltdb/bolt).
+
+> [!WARNING]
+> This project is a work-in-progress.
 
 Some of key features are:
 - Embedded

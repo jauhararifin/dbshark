@@ -49,6 +49,7 @@ fn test_db_happy_path() {
 // TODO: test concurrent transaction. Concurrent write txns should not be allowed.
 // concurrent read txns should be allowed. All dropped write txn should be undone
 // in the next transaction (actually it's preferrable to undo it right away).
+// TODO: also make sure that txn and bucket are not Sync.
 
 #[test]
 fn test_db_btree() {
