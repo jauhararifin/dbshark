@@ -94,9 +94,7 @@ impl<'a> BTree<'a, LogContext<'a>> {
         }
 
         let new_right_page = self.new_page()?;
-        let mut new_right_leaf = new_right_page
-            .init_leaf(self.ctx)?
-            .expect("new page should always be convertible to leaf page");
+        let mut new_right_leaf = new_right_page.init_leaf(self.ctx)?;
         let new_right_pgid = new_right_leaf.id();
         let mut pivot = self.leaf_split_and_insert(
             &mut result.leaf.node,
@@ -108,10 +106,7 @@ impl<'a> BTree<'a, LogContext<'a>> {
 
         let is_root_leaf = result.leaf.node.id() == self.root;
         if is_root_leaf {
-            let new_left_leaf = self
-                .new_page()?
-                .init_leaf(self.ctx)?
-                .expect("new page should always be convertible to leaf page");
+            let new_left_leaf = self.new_page()?.init_leaf(self.ctx)?;
             self.split_root_leaf(result.leaf.node, new_left_leaf, new_right_pgid, &mut pivot)?;
         } else {
             self.propagate_interior_splitting(result.interiors, new_right_pgid, pivot)?;
@@ -150,11 +145,7 @@ impl<'a> BTree<'a, LogContext<'a>> {
             current = next;
         };
 
-        let Some(node) = page.init_leaf(self.ctx)? else {
-            return Err(anyhow!(
-                "invalid state, btree contain non-interior and non-leaf page"
-            ));
-        };
+        let node = page.init_leaf(self.ctx)?;
 
         let (i, found) = self.search_key_in_leaf(&node, key)?;
         Ok(LookupForUpdateResult {

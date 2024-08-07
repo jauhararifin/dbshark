@@ -100,12 +100,11 @@ struct PagerFlushInternal {
 
 const MINIMUM_PAGE_SIZE: usize = 256;
 
-const PAGE_HEADER_SIZE: usize = 32;
+const PAGE_HEADER_SIZE: usize = 24;
 const PAGE_HEADER_VERSION_RANGE: Range<usize> = 0..2;
 const PAGE_HEADER_KIND_INDEX: usize = 2;
-const PAGE_HEADER_REC_LSN_RANGE: Range<usize> = 8..16;
-const PAGE_HEADER_PAGE_LSN_RANGE: Range<usize> = 16..24;
-const PAGE_HEADER_PAGE_ID_RANGE: Range<usize> = 24..32;
+const PAGE_HEADER_PAGE_LSN_RANGE: Range<usize> = 8..16;
+const PAGE_HEADER_PAGE_ID_RANGE: Range<usize> = 16..24;
 
 const PAGE_FOOTER_SIZE: usize = 8;
 const PAGE_FOOTER_CHECKSUM_RANGE: Range<usize> = 0..8;
@@ -151,8 +150,6 @@ macro_rules! const_assert {
 const_assert!(PAGE_HEADER_VERSION_RANGE.end <= PAGE_HEADER_SIZE);
 const_assert!(range_size(PAGE_HEADER_VERSION_RANGE) == 2);
 const_assert!(PAGE_HEADER_KIND_INDEX < PAGE_HEADER_SIZE);
-const_assert!(PAGE_HEADER_REC_LSN_RANGE.end <= PAGE_HEADER_SIZE);
-const_assert!(range_size(PAGE_HEADER_REC_LSN_RANGE) == 8);
 const_assert!(PAGE_HEADER_PAGE_LSN_RANGE.end <= PAGE_HEADER_SIZE);
 const_assert!(range_size(PAGE_HEADER_PAGE_LSN_RANGE) == 8);
 const_assert!(PAGE_HEADER_PAGE_ID_RANGE.end <= PAGE_HEADER_SIZE);
@@ -260,7 +257,8 @@ impl Pager {
                 RwLock::new(PageMeta {
                     id: dummy_pgid,
                     kind: PageKind::None,
-                    wal: None,
+                    lsn: None,
+                    is_dirty: false,
                 })
             })
             .collect::<Vec<_>>()
@@ -343,7 +341,8 @@ impl Pager {
             let mut meta = PageMeta {
                 id: dummy_pgid,
                 kind: PageKind::None,
-                wal: None,
+                lsn: None,
+                is_dirty: false,
             };
 
             let ok = Self::decode_internal(page_size, &mut meta, buff)?;
@@ -521,7 +520,8 @@ impl Pager {
                 *meta_locked = PageMeta {
                     id: pgid,
                     kind: PageKind::None,
-                    wal: None,
+                    lsn: None,
+                    is_dirty: false,
                 };
             }
             drop(meta_locked);
@@ -582,7 +582,8 @@ impl Pager {
                 *meta_locked = PageMeta {
                     id: pgid,
                     kind: PageKind::None,
-                    wal: None,
+                    lsn: None,
+                    is_dirty: false,
                 };
             }
             drop(meta_locked);
@@ -730,12 +731,9 @@ impl Pager {
             // TODO: maybe acquire read lock first and skip it if it's already clean.
             // only when it's dirty, we acquire write lock and flush it.
             // TODO: maybe we can batch few pages together to reduce the number of syscall.
-            let mut frame = meta.write();
-            if let Some(ref wal_info) = frame.wal {
-                wal.sync(wal_info.page)?;
-                frame.wal = None;
-                let frame = RwLockWriteGuard::downgrade(frame);
-
+            let frame = meta.read();
+            if let Some(lsn) = frame.lsn {
+                wal.sync(lsn)?;
                 Self::encode(&frame, buffer)?;
                 Self::flush_page(&self.f, &self.double_buff_f, frame.id, buffer)?;
             }
@@ -781,6 +779,12 @@ impl Pager {
             ));
         }
 
+        log::debug!(
+            "decode page pgid={:?} kind={:?} lsn={:?}",
+            meta.id,
+            meta.kind,
+            meta.lsn
+        );
         Ok(())
     }
 
@@ -798,7 +802,6 @@ impl Pager {
         let buff_checksum = &footer[PAGE_FOOTER_CHECKSUM_RANGE];
         let buff_version = &header[PAGE_HEADER_VERSION_RANGE];
         let buff_kind = &header[PAGE_HEADER_KIND_INDEX];
-        let buff_rec_lsn = &header[PAGE_HEADER_REC_LSN_RANGE];
         let buff_page_lsn = &header[PAGE_HEADER_PAGE_LSN_RANGE];
         let buff_page_id = &header[PAGE_HEADER_PAGE_ID_RANGE];
         let buff_checksum_content = &buff[..page_size - PAGE_FOOTER_SIZE];
@@ -813,7 +816,6 @@ impl Pager {
             return Err(anyhow!("page version {} is not supported", version));
         }
 
-        let rec_lsn = Lsn::from_be_bytes(buff_rec_lsn.try_into().unwrap());
         let page_lsn = Lsn::from_be_bytes(buff_page_lsn.try_into().unwrap());
         let Some(page_id) = PageId::from_be_bytes(buff_page_id.try_into().unwrap()) else {
             return Err(anyhow!("found an empty page_id field when decoding page",));
@@ -822,34 +824,14 @@ impl Pager {
         let kind = match buff_kind {
             0 => PageKind::None,
             1 => Self::decode_interior_page(payload)?,
-            2 => Self::decode_leaf_page(buff)?,
+            2 => Self::decode_leaf_page(payload)?,
             3 => Self::decode_overflow_page(buff)?,
             4 => Self::decode_freelist_page(buff)?,
             _ => return Err(anyhow!("page kind {buff_kind} is not recognized")),
         };
         meta.id = page_id;
         meta.kind = kind;
-
-        if let Some(rec_lsn) = rec_lsn {
-            let Some(page_lsn) = page_lsn else {
-                return Err(anyhow!(
-                    "page {} has rec_lsn but no page_lsn",
-                    meta.id.get()
-                ));
-            };
-            meta.wal = Some(PageWalInfo {
-                rec: rec_lsn,
-                page: page_lsn,
-            });
-        } else {
-            if page_lsn.is_some() {
-                return Err(anyhow!(
-                    "page {} has page_lsn but no rec_lsn",
-                    meta.id.get()
-                ));
-            }
-            meta.wal = None;
-        }
+        meta.lsn = page_lsn;
 
         Ok(true)
     }
@@ -887,10 +869,7 @@ impl Pager {
         })
     }
 
-    fn decode_leaf_page(buff: &[u8]) -> anyhow::Result<PageKind> {
-        let page_size = buff.len();
-
-        let payload = &buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
+    fn decode_leaf_page(payload: &[u8]) -> anyhow::Result<PageKind> {
         let header = &payload[..LEAF_PAGE_HEADER_SIZE];
         let buff_next = &header[LEAF_HEADER_NEXT_RANGE];
         let buff_count = &header[LEAF_HEADER_COUNT_RANGE];
@@ -902,7 +881,7 @@ impl Pager {
 
         let mut remaining = payload.len() - LEAF_PAGE_HEADER_SIZE;
         for i in 0..count {
-            let cell = get_leaf_cell(buff, i as usize);
+            let cell = get_leaf_cell(payload, i as usize);
             remaining -= LEAF_CELL_SIZE + cell.raw().len();
         }
 
@@ -949,6 +928,13 @@ impl Pager {
     }
 
     fn encode(meta: &PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
+        log::debug!(
+            "encode page pgid={:?} kind={:?} lsn={:?}",
+            meta.id,
+            meta.kind,
+            meta.lsn
+        );
+
         let page_size = buff.len();
         let header = &mut buff[..PAGE_HEADER_SIZE];
 
@@ -963,14 +949,7 @@ impl Pager {
         };
         header[PAGE_HEADER_KIND_INDEX] = kind;
 
-        let (rec_lsn, page_lsn) = if let Some(ref wal_info) = meta.wal {
-            (Some(wal_info.rec), Some(wal_info.page))
-        } else {
-            (None, None)
-        };
-
-        header[PAGE_HEADER_REC_LSN_RANGE].copy_from_slice(&rec_lsn.to_be_bytes());
-        header[PAGE_HEADER_PAGE_LSN_RANGE].copy_from_slice(&page_lsn.to_be_bytes());
+        header[PAGE_HEADER_PAGE_LSN_RANGE].copy_from_slice(&meta.lsn.to_be_bytes());
         header[PAGE_HEADER_PAGE_ID_RANGE].copy_from_slice(&meta.id.to_be_bytes());
 
         let payload_buff = &mut buff[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE];
@@ -1050,7 +1029,7 @@ impl Pager {
         Ok(())
     }
 
-    fn release(&self, frame_id: usize, is_mutated: bool) {
+    fn release(&self, frame_id: usize, is_dirty: bool) {
         let mut internal = self.internal.write();
         internal.ref_count[frame_id] -= 1;
 
@@ -1061,7 +1040,7 @@ impl Pager {
             false
         };
 
-        let maybe_clean = if is_mutated {
+        let maybe_clean = if is_dirty {
             internal.dirty_frames.insert(frame_id);
             internal.free_and_clean.remove(&frame_id);
             false
@@ -1078,17 +1057,15 @@ impl Pager {
     }
 }
 
+#[derive(Debug)]
 struct PageMeta {
     id: PageId,
     kind: PageKind,
-    wal: Option<PageWalInfo>,
+    lsn: Option<Lsn>,
+    is_dirty: bool,
 }
 
-struct PageWalInfo {
-    rec: Lsn,
-    page: Lsn,
-}
-
+#[derive(Debug)]
 enum PageKind {
     None,
     Interior {
@@ -1170,7 +1147,7 @@ pub(crate) struct PageWrite<'a> {
 
 impl Drop for PageWrite<'_> {
     fn drop(&mut self) {
-        self.pager.release(self.frame_id, self.meta.wal.is_some());
+        self.pager.release(self.frame_id, self.meta.is_dirty);
     }
 }
 
@@ -1184,7 +1161,7 @@ impl<'a> PageWrite<'a> {
     }
 
     pub(crate) fn page_lsn(&self) -> Option<Lsn> {
-        self.meta.wal.as_ref().map(|wal| wal.page)
+        self.meta.lsn
     }
 
     pub(crate) fn init_interior(
@@ -1197,7 +1174,7 @@ impl<'a> PageWrite<'a> {
             record_mutation(
                 self.txid,
                 ctx,
-                &mut self.meta.wal,
+                &mut self.meta.lsn,
                 WalRecord::InteriorInit { pgid, last },
                 WalRecord::InteriorInit { pgid, last },
             )?;
@@ -1225,14 +1202,27 @@ impl<'a> PageWrite<'a> {
             matches!(self.meta.kind, PageKind::None),
             "page is not empty"
         );
-        let LogContext::Redo(lsn) = ctx else {
-            panic!("set_interior only can be used for redo-ing wal");
-        };
 
-        record_redo_mutation(lsn, &mut self.meta);
+        let pgid = self.id();
+        let page_size = self.buffer.len();
+        record_mutation(
+            self.txid,
+            ctx,
+            &mut self.meta.lsn,
+            WalRecord::InteriorSet {
+                pgid,
+                page_version: 0,
+                payload,
+            },
+            WalRecord::InteriorSet {
+                pgid,
+                page_version: 0,
+                payload,
+            },
+        )?;
 
         self.meta.kind = Pager::decode_interior_page(payload)?;
-        self.buffer.copy_from_slice(payload);
+        self.buffer[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE].copy_from_slice(payload);
 
         Ok(self
             .into_interior()
@@ -1247,16 +1237,13 @@ impl<'a> PageWrite<'a> {
         }
     }
 
-    pub(crate) fn init_leaf(
-        mut self,
-        ctx: LogContext<'_>,
-    ) -> anyhow::Result<Option<LeafPageWrite<'a>>> {
+    pub(crate) fn init_leaf(mut self, ctx: LogContext<'_>) -> anyhow::Result<LeafPageWrite<'a>> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             record_mutation(
                 self.txid,
                 ctx,
-                &mut self.meta.wal,
+                &mut self.meta.lsn,
                 WalRecord::LeafInit { pgid },
                 WalRecord::LeafInit { pgid },
             )?;
@@ -1272,7 +1259,13 @@ impl<'a> PageWrite<'a> {
             };
         }
 
-        Ok(self.into_leaf())
+        let Some(leaf) = self.into_leaf() else {
+            return Err(anyhow!(
+                "cannot init leaf page because page is not an empty page nor leaf page",
+            ));
+        };
+
+        Ok(leaf)
     }
 
     pub(crate) fn set_leaf(
@@ -1284,14 +1277,27 @@ impl<'a> PageWrite<'a> {
             matches!(self.meta.kind, PageKind::None),
             "page is not empty"
         );
-        let LogContext::Redo(lsn) = ctx else {
-            panic!("set_leaf only can be used for redo-ing wal");
-        };
 
-        record_redo_mutation(lsn, &mut self.meta);
+        let pgid = self.id();
+        let page_size = self.buffer.len();
+        record_mutation(
+            self.txid,
+            ctx,
+            &mut self.meta.lsn,
+            WalRecord::LeafSet {
+                pgid,
+                page_version: 0,
+                payload,
+            },
+            WalRecord::LeafSet {
+                pgid,
+                page_version: 0,
+                payload,
+            },
+        )?;
 
         self.meta.kind = Pager::decode_leaf_page(payload)?;
-        self.buffer.copy_from_slice(payload);
+        self.buffer[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE].copy_from_slice(payload);
 
         Ok(self.into_leaf().expect("the page should be a leaf now"))
     }
@@ -1315,7 +1321,7 @@ impl<'a> PageWrite<'a> {
             record_mutation(
                 self.txid,
                 ctx,
-                &mut self.meta.wal,
+                &mut self.meta.lsn,
                 WalRecord::OverflowInit { pgid },
                 WalRecord::OverflowInit { pgid },
             )?;
@@ -1364,7 +1370,7 @@ impl<'a> PageWrite<'a> {
 fn record_mutation(
     txid: TxId,
     ctx: LogContext<'_>,
-    meta_wal: &mut Option<PageWalInfo>,
+    meta_wal: &mut Option<Lsn>,
     entry: WalRecord,
     compensation_entry: WalRecord,
 ) -> anyhow::Result<()> {
@@ -1380,27 +1386,12 @@ fn record_mutation(
         LogContext::Redo(lsn) => lsn,
     };
 
-    if let Some(ref mut wal_info) = meta_wal {
-        wal_info.page = lsn;
-    } else {
-        *meta_wal = Some(PageWalInfo {
-            rec: lsn,
-            page: lsn,
-        });
-    }
-
+    *meta_wal = Some(lsn);
     Ok(())
 }
 
 fn record_redo_mutation(lsn: Lsn, meta: &mut PageMeta) {
-    if let Some(ref mut wal_info) = meta.wal {
-        wal_info.page = lsn;
-    } else {
-        meta.wal = Some(PageWalInfo {
-            rec: lsn,
-            page: lsn,
-        });
-    }
+    meta.lsn = Some(lsn);
 }
 
 pub(crate) trait BTreePage<'a> {
@@ -1538,11 +1529,13 @@ impl<'a> InteriorPageWrite<'a> {
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
+        Pager::encode(&self.0.meta, &mut self.0.buffer)?;
+
         let pgid = self.id();
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorReset {
                 pgid,
                 page_version: 0,
@@ -1565,7 +1558,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorSetLast {
                 pgid,
                 last: new_last,
@@ -1605,7 +1598,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorSetCellPtr {
                 pgid,
                 index,
@@ -1644,7 +1637,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorSetCellOverflow {
                 pgid,
                 index,
@@ -1694,7 +1687,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorInsert {
                 pgid,
                 index: i,
@@ -1754,7 +1747,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorInsert {
                 pgid,
                 index: i,
@@ -1883,12 +1876,12 @@ impl<'a> InteriorPageWrite<'a> {
         );
 
         // TODO: we can reduce the wal entry size by merging all of these mutations together.
-        for i in n_cells_to_keep..count {
+        for i in (n_cells_to_keep..count).rev() {
             let cell = get_interior_cell(&self.0.buffer[PAGE_HEADER_SIZE..], i);
             record_mutation(
                 self.0.txid,
                 ctx,
-                &mut self.0.meta.wal,
+                &mut self.0.meta.lsn,
                 WalRecord::InteriorDelete {
                     pgid,
                     index: i,
@@ -1936,7 +1929,7 @@ impl<'a> InteriorPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::InteriorDelete {
                 pgid,
                 index,
@@ -2015,7 +2008,10 @@ impl<'a, 'b> BTreePage<'b> for LeafPageRead<'a> {
     }
 
     fn get(&'b self, index: usize) -> Self::Cell {
-        get_leaf_cell(self.0.buffer, index)
+        get_leaf_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 }
 
@@ -2032,7 +2028,10 @@ impl<'a> LeafPageRead<'a> {
     }
 
     pub(crate) fn get(&self, index: usize) -> LeafCell {
-        get_leaf_cell(self.0.buffer, index)
+        get_leaf_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 
     pub(crate) fn next(&self) -> Option<PageId> {
@@ -2055,7 +2054,10 @@ impl<'a, 'b> BTreePage<'b> for LeafPageWrite<'a> {
     }
 
     fn get(&'b self, index: usize) -> Self::Cell {
-        get_leaf_cell(self.0.buffer, index)
+        get_leaf_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 }
 
@@ -2072,7 +2074,10 @@ impl<'a> LeafPageWrite<'a> {
     }
 
     pub(crate) fn get(&self, index: usize) -> LeafCell {
-        get_leaf_cell(self.0.buffer, index)
+        get_leaf_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        )
     }
 
     pub(crate) fn next(&self) -> Option<PageId> {
@@ -2083,12 +2088,13 @@ impl<'a> LeafPageWrite<'a> {
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
-        let pgid = self.id();
+        Pager::encode(&self.0.meta, &mut self.0.buffer)?;
 
+        let pgid = self.id();
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::LeafReset {
                 pgid,
                 page_version: 0,
@@ -2102,8 +2108,18 @@ impl<'a> LeafPageWrite<'a> {
     }
 
     pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
+        log::debug!(
+            "leaf_delete pgid={:?} index={index} kind={:?} lsn={:?}",
+            self.id(),
+            self.0.meta.kind,
+            self.0.meta.lsn
+        );
+
         let pgid = self.0.meta.id;
-        let cell = get_leaf_cell(self.0.buffer, index);
+        let cell = get_leaf_cell(
+            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            index,
+        );
         let content_offset =
             u16::from_be_bytes(cell.cell[LEAF_CELL_OFFSET_RANGE].try_into().unwrap()) as usize;
         let content_size =
@@ -2112,7 +2128,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::LeafDelete {
                 pgid,
                 index,
@@ -2133,6 +2149,8 @@ impl<'a> LeafPageWrite<'a> {
         else {
             unreachable!();
         };
+        assert!(index < *count, "deleting {index} of {count}");
+        assert!(*count > 0);
 
         if *offset == content_offset {
             *offset += content_size;
@@ -2160,11 +2178,14 @@ impl<'a> LeafPageWrite<'a> {
             unreachable!();
         };
         let old_next = next;
+        if old_next == new_next {
+            return Ok(());
+        }
 
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::LeafSetNext {
                 pgid,
                 next: new_next,
@@ -2204,7 +2225,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::LeafSetOverflow {
                 pgid,
                 index,
@@ -2229,6 +2250,14 @@ impl<'a> LeafPageWrite<'a> {
         i: usize,
         cell: LeafCell,
     ) -> anyhow::Result<()> {
+        log::debug!(
+            "leaf_insert_cell pgid={:?} kind={:?} lsn={:?} cell_raw_len={:?}",
+            self.id(),
+            self.0.meta.kind,
+            self.0.meta.lsn,
+            cell.raw().len(),
+        );
+
         let PageKind::Leaf { remaining, .. } = self.0.meta.kind else {
             unreachable!();
         };
@@ -2239,18 +2268,17 @@ impl<'a> LeafPageWrite<'a> {
         );
 
         let reserved_offset = self.reserve_cell(raw.len());
-        Bytes::new(cell.raw)
-            .put(&mut self.0.buffer[reserved_offset..reserved_offset + raw.len()])?;
+        self.0.buffer[reserved_offset..reserved_offset + raw.len()].copy_from_slice(raw);
 
         let pgid = self.id();
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::LeafInsert {
                 pgid,
                 index: i,
-                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                raw: cell.raw(),
                 overflow: cell.overflow(),
                 key_size: cell.key_size(),
                 value_size: cell.val_size(),
@@ -2258,7 +2286,7 @@ impl<'a> LeafPageWrite<'a> {
             WalRecord::LeafInsert {
                 pgid,
                 index: i,
-                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                raw: cell.raw(),
                 overflow: cell.overflow(),
                 key_size: cell.key_size(),
                 value_size: cell.val_size(),
@@ -2285,6 +2313,13 @@ impl<'a> LeafPageWrite<'a> {
         value_size: usize,
         overflow: Option<PageId>,
     ) -> anyhow::Result<bool> {
+        log::debug!(
+            "leaf_insert_content pgid={:?} kind={:?} lsn={:?}",
+            self.id(),
+            self.0.meta.kind,
+            self.0.meta.lsn
+        );
+
         let content_size = content.remaining();
         let payload_size =
             self.0.buffer.len() - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
@@ -2311,7 +2346,7 @@ impl<'a> LeafPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::LeafInsert {
                 pgid,
                 index: i,
@@ -2336,20 +2371,26 @@ impl<'a> LeafPageWrite<'a> {
 
     fn reserve_cell(&mut self, raw_size: usize) -> usize {
         let added = LEAF_CELL_SIZE + raw_size;
-        let PageKind::Leaf { offset, count, .. } = self.0.meta.kind else {
+        let PageKind::Leaf {
+            offset,
+            count,
+            remaining,
+            ..
+        } = self.0.meta.kind
+        else {
             unreachable!();
         };
+        assert!(added <= remaining, "added cell should be fit in the page");
         let current_cell_size = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_CELL_SIZE * count;
         if current_cell_size + added > offset {
             self.rearrange();
         }
 
-        let PageKind::Leaf { ref mut offset, .. } = self.0.meta.kind else {
+        let PageKind::Leaf { offset, .. } = self.0.meta.kind else {
             unreachable!();
         };
-        assert!(current_cell_size + added <= *offset);
-
-        *offset - raw_size
+        assert!(current_cell_size + added <= offset, "added cell overflowed to the offset. current_cell_size={current_cell_size} added={added} offset={offset}");
+        offset - raw_size
     }
 
     // insert_cell_meta assumes that the raw content is already inserted to the page
@@ -2362,6 +2403,7 @@ impl<'a> LeafPageWrite<'a> {
         raw_size: usize,
     ) {
         let added = LEAF_CELL_SIZE + raw_size;
+        let pgid = self.id();
         let PageKind::Leaf {
             ref mut offset,
             ref mut count,
@@ -2371,6 +2413,10 @@ impl<'a> LeafPageWrite<'a> {
         else {
             unreachable!();
         };
+        assert!(
+            index <= *count,
+            "insert cell meta on pgid={pgid:?} index out of bound. index={index}, count={count}",
+        );
         let current_cell_size = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_CELL_SIZE * *count;
         assert!(current_cell_size + added <= *offset);
 
@@ -2388,8 +2434,7 @@ impl<'a> LeafPageWrite<'a> {
         *offset -= raw_size;
         *remaining -= added;
         *count += 1;
-        cell[LEAF_CELL_OVERFLOW_RANGE]
-            .copy_from_slice(&overflow.map(|p| p.0.get()).unwrap_or(0).to_be_bytes());
+        cell[LEAF_CELL_OVERFLOW_RANGE].copy_from_slice(&overflow.to_be_bytes());
         cell[LEAF_CELL_KEY_SIZE_RANGE].copy_from_slice(&(key_size as u32).to_be_bytes());
         cell[LEAF_CELL_VAL_SIZE_RANGE].copy_from_slice(&(val_size as u32).to_be_bytes());
         cell[LEAF_CELL_OFFSET_RANGE].copy_from_slice(&(*offset as u16).to_be_bytes());
@@ -2398,11 +2443,12 @@ impl<'a> LeafPageWrite<'a> {
 
     fn rearrange(&mut self) {
         // TODO: try not to copy
-        let copied = self.0.buffer.to_vec();
+        let copied_payload =
+            self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE].to_vec();
 
         let mut new_offset = self.0.pager.page_size - PAGE_FOOTER_SIZE;
         for i in 0..self.count() {
-            let copied_cell = get_leaf_cell(&copied, i);
+            let copied_cell = get_leaf_cell(&copied_payload, i);
             let copied_content = copied_cell.raw();
             new_offset -= copied_content.len();
             self.0.buffer[new_offset..new_offset + copied_content.len()]
@@ -2417,10 +2463,22 @@ impl<'a> LeafPageWrite<'a> {
             unreachable!();
         };
         *offset = new_offset;
+
+        let PageKind::Leaf {
+            offset, remaining, ..
+        } = self.0.meta.kind
+        else {
+            unreachable!();
+        };
+        log::debug!(
+            "rearrange result pgid={:?} offset={offset} remaining={remaining}",
+            self.id(),
+        );
     }
 
     pub(crate) fn split(&mut self, ctx: LogContext<'_>) -> anyhow::Result<LeafPageSplit> {
         let pgid = self.id();
+        log::debug!("leaf split start pgid={pgid:?} kind={:?}", self.0.meta.kind);
         let payload_size =
             self.0.pager.page_size - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
         let half_payload = payload_size / 2;
@@ -2432,12 +2490,16 @@ impl<'a> LeafPageWrite<'a> {
         let mut n_cells_to_keep = 0;
 
         for i in 0..count {
-            let cell = get_leaf_cell(self.0.buffer, i);
-            cummulative_size += cell.raw.len() + LEAF_CELL_SIZE;
-            if cummulative_size >= half_payload {
+            let cell = get_leaf_cell(
+                &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                i,
+            );
+            let new_cummulative_size = cummulative_size + cell.raw.len() + LEAF_CELL_SIZE;
+            if new_cummulative_size >= half_payload {
                 n_cells_to_keep = i;
                 break;
             }
+            cummulative_size = new_cummulative_size;
         }
         assert!(
             n_cells_to_keep < count,
@@ -2445,12 +2507,15 @@ impl<'a> LeafPageWrite<'a> {
         );
 
         // TODO: we can reduce the wal entry size by merging all of these mutations together.
-        for i in n_cells_to_keep..count {
-            let cell = get_leaf_cell(self.0.buffer, i);
+        for i in (n_cells_to_keep..count).rev() {
+            let cell = get_leaf_cell(
+                &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                i,
+            );
             record_mutation(
                 self.0.txid,
                 ctx,
-                &mut self.0.meta.wal,
+                &mut self.0.meta.lsn,
                 WalRecord::LeafDelete {
                     pgid,
                     index: i,
@@ -2475,6 +2540,11 @@ impl<'a> LeafPageWrite<'a> {
         *count = n_cells_to_keep;
         *remaining = payload_size - cummulative_size;
 
+        log::debug!(
+            "leaf split finish pgid={pgid:?} kind={:?}",
+            self.0.meta.kind
+        );
+
         Ok(LeafPageSplit {
             n: n_cells_to_keep,
 
@@ -2485,12 +2555,18 @@ impl<'a> LeafPageWrite<'a> {
     }
 }
 
-fn get_leaf_cell(buff: &[u8], index: usize) -> LeafCell<'_> {
-    let cell_offset = PAGE_HEADER_SIZE + LEAF_PAGE_HEADER_SIZE + LEAF_CELL_SIZE * index;
-    let cell = &buff[cell_offset..cell_offset + LEAF_CELL_SIZE];
+fn get_leaf_cell(payload: &[u8], index: usize) -> LeafCell<'_> {
+    let cell_offset = LEAF_PAGE_HEADER_SIZE + LEAF_CELL_SIZE * index;
+    let cell = &payload[cell_offset..cell_offset + LEAF_CELL_SIZE];
     let offset = u16::from_be_bytes(cell[LEAF_CELL_OFFSET_RANGE].try_into().unwrap()) as usize;
+    assert!(offset >= PAGE_HEADER_SIZE);
+    let offset = offset - PAGE_HEADER_SIZE;
     let size = u16::from_be_bytes(cell[LEAF_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
-    let raw = &buff[offset..offset + size];
+    assert!(
+        offset + size <= payload.len(),
+        "offset + size is overflow. offset={offset} size={size}"
+    );
+    let raw = &payload[offset..offset + size];
     LeafCell { cell, raw }
 }
 
@@ -2535,7 +2611,10 @@ impl<'a> Iterator for LeafPageSplit<'a> {
             return None;
         }
 
-        let cell = get_leaf_cell(self.buff, self.i);
+        let cell = get_leaf_cell(
+            &self.buff[PAGE_HEADER_SIZE..self.buff.len() - PAGE_FOOTER_SIZE],
+            self.i,
+        );
         self.i += 1;
         Some(cell)
     }
@@ -2584,7 +2663,7 @@ impl<'a> OverflowPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::OverflowSetNext {
                 pgid,
                 next: new_next,
@@ -2634,7 +2713,7 @@ impl<'a> OverflowPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::OverflowSetContent { pgid, raw, next },
             WalRecord::OverflowSetContent { pgid, raw, next },
         )?;
@@ -2665,7 +2744,7 @@ impl<'a> OverflowPageWrite<'a> {
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::OverflowUndoSetContent { pgid },
             WalRecord::OverflowUndoSetContent { pgid },
         )?;
@@ -2679,11 +2758,13 @@ impl<'a> OverflowPageWrite<'a> {
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
+        Pager::encode(&self.0.meta, &mut self.0.buffer)?;
+
         let pgid = self.id();
         record_mutation(
             self.0.txid,
             ctx,
-            &mut self.0.meta.wal,
+            &mut self.0.meta.lsn,
             WalRecord::OverflowReset {
                 pgid,
                 page_version: 0,

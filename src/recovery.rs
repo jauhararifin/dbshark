@@ -5,14 +5,24 @@ use crate::wal::{
     WalHeader, WalRecord, WAL_HEADER_SIZE,
 };
 use anyhow::anyhow;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 
-pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::Result<Wal> {
+pub(crate) struct RecoveryResult {
+    pub(crate) wal: Wal,
+    pub(crate) next_txid: TxId,
+}
+
+pub(crate) fn recover(
+    mut f: File,
+    pager: &Pager,
+    page_size: usize,
+) -> anyhow::Result<RecoveryResult> {
     let wal_header = get_wal_header(&mut f)?;
 
+    // TODO: due to our way of checkpointing, we don't need to separate analyze and redo phase. We
+    // can just combine them into a single phase.
     let analyze_result = analyze(&mut f, &wal_header, page_size)?;
     redo(&mut f, pager, &wal_header, &analyze_result, page_size)?;
 
@@ -25,7 +35,13 @@ pub(crate) fn recover(mut f: File, pager: &Pager, page_size: usize) -> anyhow::R
 
     undo(&analyze_result, pager, &wal)?;
 
-    Ok(wal)
+    let next_txid = if let Some(txid) = analyze_result.last_txid {
+        TxId::new(txid.get() + 1).unwrap()
+    } else {
+        TxId::new(1).unwrap()
+    };
+
+    Ok(RecoveryResult { wal, next_txid })
 }
 
 fn get_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
@@ -106,9 +122,9 @@ impl WalIterator<'_> {
 
 struct AriesAnalyzeResult {
     lsn_to_redo: Lsn,
-    dirty_pages: HashMap<PageId, Lsn>,
     active_tx: TxState,
     next_lsn: Lsn,
+    last_txid: Option<TxId>,
 }
 
 fn analyze(
@@ -116,7 +132,6 @@ fn analyze(
     wal_header: &WalHeader,
     page_size: usize,
 ) -> anyhow::Result<AriesAnalyzeResult> {
-    // TODO: perform aries recovery here, and get the `next_lsn`.
     let analyze_start = wal_header
         .checkpoint
         .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
@@ -131,7 +146,6 @@ fn analyze(
     let mut next_lsn = wal_header.checkpoint;
     let mut tx_state = TxState::None;
     let mut last_txn: Option<TxId> = None;
-    let mut dirty_pages = HashMap::default();
 
     log::debug!("aries analysis started wal_header={wal_header:?}");
 
@@ -144,9 +158,14 @@ fn analyze(
                 assert_eq!(
                     TxState::None,
                     tx_state,
-                    "when a transaction begin, there should be no active tx previously"
+                    "when a transaction begin, there should be no active tx previously, but got {tx_state:?}"
                 );
-                assert!(last_txn.map(TxId::get).unwrap_or(0) < entry.txid.get());
+                let last_txid = last_txn.map(TxId::get).unwrap_or(0);
+                assert!(
+                    last_txid < entry.txid.get(),
+                    "last txn is {last_txid}, but newer txid is {}",
+                    entry.txid.get()
+                );
                 tx_state = TxState::Active(entry.txid);
                 last_txn = Some(entry.txid);
             }
@@ -167,13 +186,6 @@ fn analyze(
                 };
             }
             WalRecord::End => {
-                assert!(
-                    TxState::Committing(entry.txid) == tx_state ||
-                    if let TxState::Aborting{txid, ..} = tx_state {
-                        txid == entry.txid
-                    } else { false },
-                    "when a transaction ended, there should be exactly one committing or aborting tx previously",
-                );
                 tx_state = TxState::None;
             }
 
@@ -181,38 +193,49 @@ fn analyze(
                 tx_state = active_tx;
             }
 
-            WalRecord::InteriorInit { pgid, .. }
-            | WalRecord::InteriorInsert { pgid, .. }
-            | WalRecord::InteriorDelete { pgid, .. }
-            | WalRecord::LeafInit { pgid, .. }
-            | WalRecord::LeafInsert { pgid, .. } => {
-                dirty_pages.entry(pgid).or_insert(lsn);
-            }
-
-            _ => (),
+            WalRecord::InteriorReset { .. }
+            | WalRecord::InteriorUndoReset { .. }
+            | WalRecord::InteriorSet { .. }
+            | WalRecord::InteriorInit { .. }
+            | WalRecord::InteriorInsert { .. }
+            | WalRecord::InteriorDelete { .. }
+            | WalRecord::InteriorUndoDelete { .. }
+            | WalRecord::InteriorSetCellOverflow { .. }
+            | WalRecord::InteriorSetCellPtr { .. }
+            | WalRecord::InteriorSetLast { .. }
+            | WalRecord::LeafReset { .. }
+            | WalRecord::LeafUndoReset { .. }
+            | WalRecord::LeafSet { .. }
+            | WalRecord::LeafInit { .. }
+            | WalRecord::LeafInsert { .. }
+            | WalRecord::LeafDelete { .. }
+            | WalRecord::LeafUndoDelete { .. }
+            | WalRecord::LeafSetOverflow { .. }
+            | WalRecord::LeafSetNext { .. }
+            | WalRecord::OverflowReset { .. }
+            | WalRecord::OverflowUndoReset { .. }
+            | WalRecord::OverflowInit { .. }
+            | WalRecord::OverflowSetContent { .. }
+            | WalRecord::OverflowUndoSetContent { .. }
+            | WalRecord::OverflowSetNext { .. }
+            | WalRecord::HeaderSet { .. }
+            | WalRecord::HeaderUndoSet { .. } => (),
         }
 
         next_lsn = Some(lsn);
     }
 
-    log::debug!("aries analysis finished next_lsn={next_lsn:?} dirty_pages={dirty_pages:?} tx_state={tx_state:?}");
-
-    let mut min_rec_lsn = next_lsn;
-    for rec_lsn in dirty_pages.values() {
-        if let Some(min_lsn) = min_rec_lsn {
-            min_rec_lsn = Some(std::cmp::min(min_lsn, *rec_lsn));
-        } else {
-            min_rec_lsn = Some(*rec_lsn);
-        }
-    }
+    log::debug!("aries analysis finished next_lsn={next_lsn:?} tx_state={tx_state:?}");
 
     let next_lsn = next_lsn.unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
 
     Ok(AriesAnalyzeResult {
-        lsn_to_redo: Lsn::new(wal_header.relative_lsn_offset + 2 * WAL_HEADER_SIZE as u64).unwrap(),
-        dirty_pages,
+        lsn_to_redo: wal_header
+            .checkpoint
+            .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap()),
         active_tx: tx_state,
         next_lsn,
+        last_txid: last_txn,
     })
 }
 
@@ -249,6 +272,7 @@ fn redo(
 
             WalRecord::InteriorReset { pgid, .. }
             | WalRecord::InteriorUndoReset { pgid }
+            | WalRecord::InteriorSet { pgid, .. }
             | WalRecord::InteriorInit { pgid, .. }
             | WalRecord::InteriorInsert { pgid, .. }
             | WalRecord::InteriorDelete { pgid, .. }
@@ -258,6 +282,7 @@ fn redo(
             | WalRecord::InteriorSetLast { pgid, .. }
             | WalRecord::LeafReset { pgid, .. }
             | WalRecord::LeafUndoReset { pgid }
+            | WalRecord::LeafSet { pgid, .. }
             | WalRecord::LeafInit { pgid, .. }
             | WalRecord::LeafInsert { pgid, .. }
             | WalRecord::LeafDelete { pgid, .. }
@@ -270,7 +295,7 @@ fn redo(
             | WalRecord::OverflowSetContent { pgid, .. }
             | WalRecord::OverflowUndoSetContent { pgid, .. }
             | WalRecord::OverflowSetNext { pgid, .. } => {
-                redo_page(pager, analyze_result, lsn, &entry, pgid)?;
+                redo_page(pager, lsn, &entry, pgid)?;
             }
         };
     }
@@ -280,20 +305,7 @@ fn redo(
     Ok(())
 }
 
-fn redo_page(
-    pager: &Pager,
-    analyze_result: &AriesAnalyzeResult,
-    lsn: Lsn,
-    entry: &WalEntry,
-    pgid: PageId,
-) -> anyhow::Result<()> {
-    let Some(rec_lsn) = analyze_result.dirty_pages.get(&pgid) else {
-        return Ok(());
-    };
-    if &lsn < rec_lsn {
-        return Ok(());
-    }
-
+fn redo_page(pager: &Pager, lsn: Lsn, entry: &WalEntry, pgid: PageId) -> anyhow::Result<()> {
     let page = pager.write(entry.txid, pgid)?;
     if let Some(page_lsn) = page.page_lsn() {
         if page_lsn >= lsn {
@@ -317,14 +329,17 @@ fn redo_page(
         WalRecord::InteriorReset { .. } | WalRecord::InteriorUndoReset { .. } => {
             let Some(page) = page.into_interior() else {
                 return Err(anyhow!(
-                    "redo failed on interior reset because page is not an interior"
+                    "redo failed on interior reset because page {pgid:?} is not an interior"
                 ));
             };
             page.reset(ctx)?;
         }
+        WalRecord::InteriorSet { payload, .. } => {
+            page.set_interior(ctx, payload)?;
+        }
         WalRecord::InteriorInit { last, .. } => {
             if page.init_interior(ctx, last)?.is_none() {
-                return Err(anyhow!("redo failed on interior init"));
+                return Err(anyhow!("redo failed on interior init on page {pgid:?}"));
             }
         }
         WalRecord::InteriorInsert {
@@ -337,21 +352,21 @@ fn redo_page(
         } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
-                    "redo failed on interior insert because page is not an interior"
+                    "redo failed on interior insert because page {pgid:?} is not an interior"
                 ));
             };
             let ok =
                 page.insert_content(ctx, index, &mut Bytes::new(raw), key_size, ptr, overflow)?;
             if !ok {
                 return Err(anyhow!(
-                    "redo failed on interior insert because the content can't be inserted"
+                    "redo failed on interior insert because the content can't be inserted into page {pgid:?}"
                 ));
             }
         }
         WalRecord::InteriorDelete { index, .. } | WalRecord::InteriorUndoDelete { index, .. } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
-                    "redo failed on interior delete because page is not an interior"
+                    "redo failed on interior delete because page {pgid:?} is not an interior"
                 ));
             };
             page.delete(ctx, index)?;
@@ -361,7 +376,7 @@ fn redo_page(
         } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
-                    "redo failed on interior set overflow because page is not an interior"
+                    "redo failed on interior set overflow because page {pgid:?} is not an interior"
                 ));
             };
             page.set_cell_overflow(ctx, index, overflow)?;
@@ -369,7 +384,7 @@ fn redo_page(
         WalRecord::InteriorSetCellPtr { index, ptr, .. } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
-                    "redo failed on interior set ptr because page is not an interior"
+                    "redo failed on interior set ptr because page {pgid:?} is not an interior"
                 ));
             };
             page.set_cell_ptr(ctx, index, ptr)?;
@@ -377,7 +392,7 @@ fn redo_page(
         WalRecord::InteriorSetLast { last, .. } => {
             let Some(mut page) = page.into_interior() else {
                 return Err(anyhow!(
-                    "redo failed on interior set ptr because page is not an interior"
+                    "redo failed on interior set ptr because page {pgid:?} is not an interior"
                 ));
             };
             page.set_last(ctx, last)?;
@@ -386,15 +401,16 @@ fn redo_page(
         WalRecord::LeafReset { .. } | WalRecord::LeafUndoReset { .. } => {
             let Some(page) = page.into_leaf() else {
                 return Err(anyhow!(
-                    "redo failed on leaf reset because page is not a leaf"
+                    "redo failed on leaf reset because page {pgid:?} is not a leaf"
                 ));
             };
             page.reset(ctx)?;
         }
+        WalRecord::LeafSet { payload, .. } => {
+            page.set_leaf(ctx, payload)?;
+        }
         WalRecord::LeafInit { .. } => {
-            if page.init_leaf(ctx)?.is_none() {
-                return Err(anyhow!("redo failed on leaf init"));
-            };
+            page.init_leaf(ctx)?;
         }
         WalRecord::LeafInsert {
             index,
@@ -406,7 +422,7 @@ fn redo_page(
         } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
-                    "redo failed on leaf insert because page is not a leaf"
+                    "redo failed on leaf insert because page {pgid:?} is not a leaf"
                 ));
             };
             let ok = page.insert_content(
@@ -419,14 +435,14 @@ fn redo_page(
             )?;
             if !ok {
                 return Err(anyhow!(
-                    "redo failed on leaf insert because the content can't be inserted"
+                    "redo failed on leaf insert because the content can't be inserted into page {pgid:?}"
                 ));
             }
         }
         WalRecord::LeafDelete { index, .. } | WalRecord::LeafUndoDelete { index, .. } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
-                    "redo failed on leaf delete because page is not a leaf"
+                    "redo failed on leaf delete because page {pgid:?} is not a leaf"
                 ));
             };
             page.delete(ctx, index)?;
@@ -436,7 +452,7 @@ fn redo_page(
         } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
-                    "redo failed on leaf set overflow because page is not a leaf"
+                    "redo failed on leaf set overflow because page {pgid:?} is not a leaf",
                 ));
             };
             page.set_cell_overflow(ctx, index, overflow)?;
@@ -444,7 +460,7 @@ fn redo_page(
         WalRecord::LeafSetNext { next, .. } => {
             let Some(mut page) = page.into_leaf() else {
                 return Err(anyhow!(
-                    "redo failed on leaf set overflow because page is not a leaf"
+                    "redo failed on leaf set overflow because page {pgid:?} is not a leaf",
                 ));
             };
             page.set_next(ctx, next)?;
@@ -453,7 +469,7 @@ fn redo_page(
         WalRecord::OverflowReset { .. } | WalRecord::OverflowUndoReset { .. } => {
             let Some(page) = page.into_overflow() else {
                 return Err(anyhow!(
-                    "redo failed on overflow reset because page is not an overflow"
+                    "redo failed on overflow reset because page {pgid:?} is not an overflow"
                 ));
             };
             page.reset(ctx)?;
@@ -466,7 +482,7 @@ fn redo_page(
         WalRecord::OverflowSetContent { next, raw, .. } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
-                    "redo failed on overflow reset because page is not an overflow"
+                    "redo failed on overflow reset because page {pgid:?} is not an overflow"
                 ));
             };
             page.set_content(ctx, &mut Bytes::new(raw), next)?;
@@ -474,7 +490,7 @@ fn redo_page(
         WalRecord::OverflowUndoSetContent { .. } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
-                    "redo failed on overflow reset because page is not an overflow"
+                    "redo failed on overflow reset because page {pgid:?} is not an overflow"
                 ));
             };
             page.unset_content(ctx)?;
@@ -482,7 +498,7 @@ fn redo_page(
         WalRecord::OverflowSetNext { next, .. } => {
             let Some(mut page) = page.into_overflow() else {
                 return Err(anyhow!(
-                    "redo failed on overflow reset because page is not an overflow"
+                    "redo failed on overflow reset because page {pgid:?} is not an overflow"
                 ));
             };
             page.set_next(ctx, next)?;
@@ -533,14 +549,13 @@ pub(crate) fn undo_txn(
     lsn: Lsn,
     last_undone_clr: &mut Lsn,
 ) -> anyhow::Result<()> {
-    log::debug!("undo txn started from={lsn:?} last_undone_clr={last_undone_clr:?}");
+    log::debug!("undo txn started txid={txid:?} from={lsn:?} last_undone_clr={last_undone_clr:?}");
 
     let mut iterator = wal.iterate_back(lsn);
-    let mut is_ended = false;
-
-    let ctx = LogContext::Undo(wal, lsn);
 
     while let Some((lsn, entry)) = iterator.next()? {
+        let ctx = LogContext::Undo(wal, lsn);
+
         log::debug!("undo txn item lsn={lsn:?} entry={entry:?}");
         if entry.txid != txid {
             continue;
@@ -560,7 +575,7 @@ pub(crate) fn undo_txn(
                 return Err(anyhow!("found a commit log during transaction rollback"))
             }
             WalRecord::Rollback => (),
-            WalRecord::End => is_ended = true,
+            WalRecord::End => return Err(anyhow!("found a transaction-end log during rollback")),
 
             WalRecord::HeaderSet {
                 old_root,
@@ -594,6 +609,18 @@ pub(crate) fn undo_txn(
             WalRecord::InteriorUndoReset { .. } => {
                 unreachable!("InteriorUndoReset only used for CLR which shouldn't be undone");
             }
+            WalRecord::InteriorSet {
+                pgid, page_version, ..
+            } => {
+                if page_version != 0 {
+                    return Err(anyhow!("page version {page_version} is not supported"));
+                }
+                let page = pager.write(txid, pgid)?;
+                let Some(page) = page.into_interior() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.reset(ctx)?;
+            }
             WalRecord::InteriorInit { pgid, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(page) = page.into_interior() else {
@@ -620,7 +647,7 @@ pub(crate) fn undo_txn(
                 let Some(mut page) = page.into_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.insert_content(
+                let ok = page.insert_content(
                     ctx,
                     index,
                     &mut Bytes::new(old_raw),
@@ -628,6 +655,7 @@ pub(crate) fn undo_txn(
                     old_ptr,
                     old_overflow,
                 )?;
+                assert!(ok, "if it can be deleted, then it must be ok to insert");
             }
             WalRecord::InteriorUndoDelete { .. } => {
                 unreachable!("InteriorUndoDelete only used for CLR which shouldn't be undone");
@@ -678,6 +706,18 @@ pub(crate) fn undo_txn(
             WalRecord::LeafUndoReset { .. } => {
                 unreachable!("LeafUndoReset only used for CLR which shouldn't be undone");
             }
+            WalRecord::LeafSet {
+                pgid, page_version, ..
+            } => {
+                if page_version != 0 {
+                    return Err(anyhow!("page version {page_version} is not supported"));
+                }
+                let page = pager.write(txid, pgid)?;
+                let Some(page) = page.into_leaf() else {
+                    return Err(anyhow!("expected an interior page for undo"));
+                };
+                page.reset(ctx)?;
+            }
             WalRecord::LeafInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(page) = page.into_leaf() else {
@@ -704,7 +744,7 @@ pub(crate) fn undo_txn(
                 let Some(mut page) = page.into_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo"));
                 };
-                page.insert_content(
+                let ok = page.insert_content(
                     ctx,
                     index,
                     &mut Bytes::new(old_raw),
@@ -712,6 +752,7 @@ pub(crate) fn undo_txn(
                     old_val_size,
                     old_overflow,
                 )?;
+                assert!(ok, "if it can be deleted, then it must be ok to insert");
             }
             WalRecord::LeafUndoDelete { .. } => {
                 unreachable!("LeafUndoDelete only used for CLR which shouldn't be undone");
@@ -779,11 +820,7 @@ pub(crate) fn undo_txn(
         }
     }
 
-    if !is_ended {
-        log::debug!("appending txn-end txid={txid:?}");
-        wal.append(txid, None, WalRecord::End)?;
-    }
-
+    wal.append(txid, None, WalRecord::End)?;
     log::debug!("undo txn finished");
     Ok(())
 }

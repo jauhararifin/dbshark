@@ -1,7 +1,7 @@
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
 use crate::pager::{DbState, LogContext, PageId, PageIdExt, Pager};
 use crate::recovery::{recover, undo_txn};
-use crate::wal::{TxId, TxIdExt, TxState, Wal, WalRecord};
+use crate::wal::{TxId, TxState, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
@@ -94,15 +94,10 @@ impl Db {
             .create(true)
             .truncate(false)
             .open(wal_path)?;
-        let wal = recover(wal_file, &pager, page_size)?;
-        let wal = Arc::new(wal);
+        let result = recover(wal_file, &pager, page_size)?;
+        let wal = Arc::new(result.wal);
 
-        let next_txid = if let Some(txid) = header.last_txid {
-            txid.next().get()
-        } else {
-            1
-        };
-        let next_txid = AtomicU64::new(next_txid);
+        let next_txid = AtomicU64::new(result.next_txid.get());
 
         // at this point, the recovery is already finished, so there is no active transaction
         let tx_state = Arc::new(RwLock::new(TxState::None));
@@ -176,7 +171,6 @@ impl Db {
         let header = Header {
             version: 0,
             page_size: DEFAULT_PAGE_SIZE as u32,
-            last_txid: None,
         };
 
         let mut buff = vec![0; 2 * DB_HEADER_SIZE];
@@ -191,7 +185,7 @@ impl Db {
         let tx_guard = self.tx_lock.write();
 
         let mut tx_state = self.tx_state.write();
-        self.undo_dangling_tx(&mut tx_state)?;
+        self.finish_dangling_tx(&mut tx_state)?;
 
         let txid = self.next_txid.fetch_add(1, Ordering::SeqCst);
         let txid = TxId::new(txid).unwrap();
@@ -200,39 +194,58 @@ impl Db {
         Tx::new(txid, self, tx_guard)
     }
 
-    fn undo_dangling_tx(&self, tx_state: &mut TxState) -> anyhow::Result<()> {
-        let TxState::Active(txid) = *tx_state else {
-            return Ok(());
-        };
+    fn finish_dangling_tx(&self, tx_state: &mut TxState) -> anyhow::Result<()> {
+        match *tx_state {
+            TxState::None => Ok(()),
+            TxState::Active(txid) => {
+                log::debug!("previous transaction {txid:?} is not closed yet");
 
-        log::debug!("previous transaction {txid:?} is not closed yet");
+                let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
+                *tx_state = TxState::Aborting {
+                    txid,
+                    rollback: lsn,
+                    last_undone: lsn,
+                };
+                let TxState::Aborting {
+                    ref mut last_undone,
+                    ..
+                } = &mut *tx_state
+                else {
+                    unreachable!();
+                };
 
-        let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
-        *tx_state = TxState::Aborting {
-            txid,
-            rollback: lsn,
-            last_undone: lsn,
-        };
-        let TxState::Aborting {
-            ref mut last_undone,
-            ..
-        } = &mut *tx_state
-        else {
-            unreachable!();
-        };
+                undo_txn(&self.pager, &self.wal, txid, lsn, last_undone)?;
+                self.wal.append(txid, None, WalRecord::End)?;
+                *tx_state = TxState::None;
+                Ok(())
+            }
+            TxState::Aborting {
+                txid,
+                rollback,
+                ref mut last_undone,
+            } => {
+                log::debug!("continue aborting previous transaction {txid:?}");
 
-        undo_txn(&self.pager, &self.wal, txid, lsn, last_undone)?;
-        self.wal.append(txid, None, WalRecord::End)?;
-        *tx_state = TxState::None;
-
-        Ok(())
+                undo_txn(&self.pager, &self.wal, txid, rollback, last_undone)?;
+                self.wal.append(txid, None, WalRecord::End)?;
+                *tx_state = TxState::None;
+                Ok(())
+            }
+            TxState::Committing(txid) => {
+                let commit_lsn = self.wal.append(txid, None, WalRecord::Commit)?;
+                self.wal.append(txid, None, WalRecord::End)?;
+                self.wal.sync(commit_lsn)?;
+                *tx_state = TxState::None;
+                Ok(())
+            }
+        }
     }
 
     pub fn read(&self) -> anyhow::Result<ReadTx> {
         let tx_guard = self.tx_lock.read();
 
         let mut tx_state = self.tx_state.write();
-        self.undo_dangling_tx(&mut tx_state)?;
+        self.finish_dangling_tx(&mut tx_state)?;
 
         let txid = self.next_txid.fetch_add(1, Ordering::SeqCst);
         let txid = TxId::new(txid).unwrap();
@@ -276,14 +289,13 @@ impl Db {
     }
 }
 
-const DB_HEADER_SIZE: usize = 32;
+const DB_HEADER_SIZE: usize = 24;
 const DEFAULT_PAGE_SIZE: usize = 0x1000;
 const MAGIC_HEADER: &[u8] = b"dbest000";
 
 struct Header {
     version: u32,
     page_size: u32,
-    last_txid: Option<TxId>,
 }
 
 impl Header {
@@ -291,9 +303,8 @@ impl Header {
         buff[0..8].copy_from_slice(MAGIC_HEADER);
         buff[8..12].copy_from_slice(&self.version.to_be_bytes());
         buff[12..16].copy_from_slice(&self.page_size.to_be_bytes());
-        buff[16..24].copy_from_slice(&self.last_txid.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..24]);
-        buff[24..32].copy_from_slice(&checksum.to_be_bytes());
+        let checksum = crc64::crc64(0, &buff[0..16]);
+        buff[16..24].copy_from_slice(&checksum.to_be_bytes());
     }
 
     fn decode(buff: &[u8]) -> Option<Self> {
@@ -307,13 +318,8 @@ impl Header {
 
         let version = u32::from_be_bytes(buff[8..12].try_into().unwrap());
         let page_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
-        let last_txid = TxId::from_be_bytes(buff[16..24].try_into().unwrap());
 
-        Some(Self {
-            version,
-            page_size,
-            last_txid,
-        })
+        Some(Self { version, page_size })
     }
 }
 
