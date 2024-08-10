@@ -58,6 +58,11 @@ impl Lsn {
         Self::new(v).expect("should not overflow")
     }
 
+    pub(crate) fn sub(&self, offset: usize) -> Self {
+        let v = self.0.get() - offset as u64;
+        Self::new(v).expect("should not overflow")
+    }
+
     pub(crate) fn from_be_bytes(lsn: [u8; 8]) -> Option<Self> {
         Self::new(u64::from_be_bytes(lsn))
     }
@@ -334,10 +339,20 @@ pub(crate) enum WalRecord<'a> {
 
         freelist: Option<PageId>,
         old_freelist: Option<PageId>,
+
+        page_count: u64,
+        old_page_count: u64,
     },
     HeaderUndoSet {
         root: Option<PageId>,
         freelist: Option<PageId>,
+        page_count: u64,
+    },
+    AllocPage {
+        pgid: PageId,
+    },
+    DeallocPage {
+        pgid: PageId,
     },
 
     InteriorReset {
@@ -472,6 +487,7 @@ pub(crate) enum WalRecord<'a> {
         active_tx: TxState,
         root: Option<PageId>,
         freelist: Option<PageId>,
+        page_count: u64,
     },
 }
 
@@ -495,6 +511,8 @@ const WAL_RECORD_END_KIND: u8 = 4;
 
 const WAL_RECORD_HEADER_SET_KIND: u8 = 10;
 const WAL_RECORD_HEADER_UNDO_SET_KIND: u8 = 11;
+const WAL_RECORD_ALLOC_PAGE_KIND: u8 = 12;
+const WAL_RECORD_DEALLOC_PAGE_KIND: u8 = 13;
 
 const WAL_RECORD_INTERIOR_RESET_KIND: u8 = 20;
 const WAL_RECORD_INTERIOR_UNDO_RESET_KIND: u8 = 21;
@@ -536,6 +554,8 @@ impl<'a> WalRecord<'a> {
 
             WalRecord::HeaderSet { .. } => WAL_RECORD_HEADER_SET_KIND,
             WalRecord::HeaderUndoSet { .. } => WAL_RECORD_HEADER_UNDO_SET_KIND,
+            WalRecord::AllocPage { .. } => WAL_RECORD_ALLOC_PAGE_KIND,
+            WalRecord::DeallocPage { .. } => WAL_RECORD_DEALLOC_PAGE_KIND,
 
             WalRecord::InteriorReset { .. } => WAL_RECORD_INTERIOR_RESET_KIND,
             WalRecord::InteriorUndoReset { .. } => WAL_RECORD_INTERIOR_UNDO_RESET_KIND,
@@ -573,8 +593,10 @@ impl<'a> WalRecord<'a> {
         match self {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => 0,
 
-            WalRecord::HeaderSet { .. } => 32,
-            WalRecord::HeaderUndoSet { .. } => 16,
+            WalRecord::HeaderSet { .. } => 48,
+            WalRecord::HeaderUndoSet { .. } => 24,
+            WalRecord::AllocPage { .. } => 8,
+            WalRecord::DeallocPage { .. } => 8,
 
             WalRecord::InteriorReset { payload, .. } => 8 + 2 + 2 + payload.len(),
             WalRecord::InteriorUndoReset { .. } => 8,
@@ -604,7 +626,7 @@ impl<'a> WalRecord<'a> {
             WalRecord::OverflowUndoSetContent { .. } => 8,
             WalRecord::OverflowSetNext { .. } => 24,
 
-            WalRecord::CheckpointBegin { .. } => 48,
+            WalRecord::CheckpointBegin { .. } => 56,
         }
     }
 
@@ -617,15 +639,30 @@ impl<'a> WalRecord<'a> {
                 old_root,
                 freelist,
                 old_freelist,
+                page_count,
+                old_page_count,
             } => {
                 buff[0..8].copy_from_slice(&root.to_be_bytes());
                 buff[8..16].copy_from_slice(&old_root.to_be_bytes());
                 buff[16..24].copy_from_slice(&freelist.to_be_bytes());
                 buff[24..32].copy_from_slice(&old_freelist.to_be_bytes());
+                buff[32..40].copy_from_slice(&page_count.to_be_bytes());
+                buff[40..48].copy_from_slice(&old_page_count.to_be_bytes());
             }
-            WalRecord::HeaderUndoSet { root, freelist } => {
+            WalRecord::HeaderUndoSet {
+                root,
+                freelist,
+                page_count,
+            } => {
                 buff[0..8].copy_from_slice(&root.to_be_bytes());
                 buff[8..16].copy_from_slice(&freelist.to_be_bytes());
+                buff[16..24].copy_from_slice(&page_count.to_be_bytes());
+            }
+            WalRecord::AllocPage { pgid } => {
+                buff[0..8].copy_from_slice(&pgid.to_be_bytes());
+            }
+            WalRecord::DeallocPage { pgid } => {
+                buff[0..8].copy_from_slice(&pgid.to_be_bytes());
             }
 
             WalRecord::InteriorReset {
@@ -874,6 +911,7 @@ impl<'a> WalRecord<'a> {
                 active_tx,
                 root,
                 freelist,
+                page_count,
             } => {
                 match active_tx {
                     TxState::None => {
@@ -901,6 +939,7 @@ impl<'a> WalRecord<'a> {
                 }
                 buff[32..40].copy_from_slice(&root.to_be_bytes());
                 buff[40..48].copy_from_slice(&freelist.to_be_bytes());
+                buff[48..56].copy_from_slice(&page_count.to_be_bytes());
             }
         }
     }
@@ -917,17 +956,38 @@ impl<'a> WalRecord<'a> {
                 let old_root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
                 let old_freelist = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
+                let page_count = u64::from_be_bytes(buff[32..40].try_into().unwrap());
+                let old_page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
                 Ok(Self::HeaderSet {
                     root,
                     old_root,
                     freelist,
                     old_freelist,
+                    page_count,
+                    old_page_count,
                 })
             }
             WAL_RECORD_HEADER_UNDO_SET_KIND => {
                 let root = PageId::from_be_bytes(buff[0..8].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                Ok(Self::HeaderUndoSet { root, freelist })
+                let page_count = u64::from_be_bytes(buff[16..24].try_into().unwrap());
+                Ok(Self::HeaderUndoSet {
+                    root,
+                    freelist,
+                    page_count,
+                })
+            }
+            WAL_RECORD_ALLOC_PAGE_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                Ok(Self::AllocPage { pgid })
+            }
+            WAL_RECORD_DEALLOC_PAGE_KIND => {
+                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
+                    return Err(anyhow!("zero page id"));
+                };
+                Ok(Self::DeallocPage { pgid })
             }
 
             WAL_RECORD_INTERIOR_RESET_KIND => {
@@ -1263,10 +1323,12 @@ impl<'a> WalRecord<'a> {
 
                 let root = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[40..48].try_into().unwrap());
+                let page_count = u64::from_be_bytes(buff[48..56].try_into().unwrap());
                 Ok(Self::CheckpointBegin {
                     active_tx,
                     root,
                     freelist,
+                    page_count,
                 })
             }
             _ => Err(anyhow!("invalid wal record kind {kind}")),
@@ -1548,6 +1610,8 @@ mod tests {
                     old_root: PageId::new(1),
                     freelist: PageId::new(101),
                     old_freelist: None,
+                    page_count: 10,
+                    old_page_count: 0,
                 },
             },
             WalEntry {
@@ -1558,6 +1622,31 @@ mod tests {
                     old_root: PageId::new(1),
                     freelist: PageId::new(101),
                     old_freelist: PageId::new(33),
+                    page_count: 0,
+                    old_page_count: 10,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::HeaderUndoSet {
+                    root: PageId::new(23),
+                    freelist: PageId::new(101),
+                    page_count: 10,
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::AllocPage {
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                txid: TxId::new(1011).unwrap(),
+                clr: Lsn::new(99),
+                record: WalRecord::DeallocPage {
+                    pgid: PageId::new(23).unwrap(),
                 },
             },
             WalEntry {
@@ -1714,6 +1803,7 @@ mod tests {
                     active_tx: TxState::None,
                     root: None,
                     freelist: PageId::new(100),
+                    page_count: 10,
                 },
             },
             WalEntry {
@@ -1723,6 +1813,7 @@ mod tests {
                     active_tx: TxState::Active(TxId::new(12).unwrap()),
                     root: PageId::new(100),
                     freelist: None,
+                    page_count: 10,
                 },
             },
             WalEntry {
@@ -1732,6 +1823,7 @@ mod tests {
                     active_tx: TxState::Committing(TxId::new(12).unwrap()),
                     root: PageId::new(100),
                     freelist: PageId::new(200),
+                    page_count: 10,
                 },
             },
             WalEntry {
@@ -1745,6 +1837,7 @@ mod tests {
                     },
                     root: PageId::new(100),
                     freelist: PageId::new(200),
+                    page_count: 10,
                 },
             },
         ];

@@ -482,6 +482,24 @@ impl<'a> BTree<'a, LogContext<'a>> {
 
         Ok(())
     }
+
+    fn new_page(&self) -> anyhow::Result<PageWrite<'a>> {
+        let Some(_freelist_pgid) = self.pager.freelist() else {
+            let page = self.pager.alloc(self.ctx, self.txid)?;
+            return Ok(page);
+        };
+
+        todo!("allocate new page from freelist");
+    }
+
+    fn delete_page(&self, _pgid: PageId) -> anyhow::Result<()> {
+        // TODO: consider batch deletion after the end of transaction so that
+        // if in a single transaction we delete a page and then allocate a page,
+        // we don't have to write the freelist page twice.
+
+        // TODO: put the page into freelist
+        Ok(())
+    }
 }
 
 impl<'a, T> BTree<'a, T> {
@@ -629,24 +647,6 @@ impl<'a, T> BTree<'a, T> {
 
         let (i, _) = self.search_key_in_leaf(&leaf, key)?;
         Ok(Some((leaf, i)))
-    }
-
-    fn new_page(&self) -> anyhow::Result<PageWrite<'a>> {
-        let Some(_freelist_pgid) = self.pager.freelist() else {
-            let page = self.pager.alloc(self.txid)?;
-            return Ok(page);
-        };
-
-        todo!("allocate new page from freelist");
-    }
-
-    fn delete_page(&self, _pgid: PageId) -> anyhow::Result<()> {
-        // TODO: consider batch deletion after the end of transaction so that
-        // if in a single transaction we delete a page and then allocate a page,
-        // we don't have to write the freelist page twice.
-
-        // TODO: put the page into freelist
-        Ok(())
     }
 }
 

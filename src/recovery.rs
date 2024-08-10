@@ -56,10 +56,10 @@ fn iterate_wal_forward(
     f: &mut File,
     relative_lsn_offset: usize,
     page_size: usize,
-    lsn: Lsn,
+    start_lsn: Lsn,
 ) -> anyhow::Result<WalIterator> {
     let file_len = f.metadata()?.len();
-    let f_offset = lsn.add(relative_lsn_offset).get();
+    let f_offset = start_lsn.sub(relative_lsn_offset).get();
     if f_offset >= file_len {
         f.seek(SeekFrom::Start(file_len))?;
     } else {
@@ -68,7 +68,7 @@ fn iterate_wal_forward(
 
     Ok(WalIterator {
         f,
-        lsn,
+        lsn: start_lsn,
         buffer: vec![0u8; 4 * page_size],
         start_offset: 0,
         end_offset: 0,
@@ -93,9 +93,10 @@ impl WalIterator<'_> {
             let entry = WalEntry::decode(buff);
             match entry {
                 WalDecodeResult::Ok(entry) => {
+                    let lsn = self.lsn;
                     self.start_offset += entry.size();
                     self.lsn = self.lsn.add(entry.size());
-                    return Ok(Some((self.lsn, entry)));
+                    return Ok(Some((lsn, entry)));
                 }
                 WalDecodeResult::NeedMoreBytes => {
                     let len = self.end_offset - self.start_offset;
@@ -143,7 +144,7 @@ fn analyze(
         analyze_start,
     )?;
 
-    let mut next_lsn = wal_header.checkpoint;
+    let mut next_lsn = None;
     let mut tx_state = TxState::None;
     let mut last_txn: Option<TxId> = None;
 
@@ -219,10 +220,12 @@ fn analyze(
             | WalRecord::OverflowUndoSetContent { .. }
             | WalRecord::OverflowSetNext { .. }
             | WalRecord::HeaderSet { .. }
-            | WalRecord::HeaderUndoSet { .. } => (),
+            | WalRecord::HeaderUndoSet { .. }
+            | WalRecord::AllocPage { .. }
+            | WalRecord::DeallocPage { .. } => (),
         }
 
-        next_lsn = Some(lsn);
+        next_lsn = Some(lsn.add(entry.size()));
     }
 
     log::debug!("aries analysis finished next_lsn={next_lsn:?} tx_state={tx_state:?}");
@@ -260,14 +263,39 @@ fn redo(
         match entry.record {
             WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
 
-            WalRecord::CheckpointBegin { root, freelist, .. }
-            | WalRecord::HeaderSet { root, freelist, .. }
-            | WalRecord::HeaderUndoSet { root, freelist, .. } => {
+            WalRecord::CheckpointBegin {
+                root,
+                freelist,
+                page_count,
+                ..
+            }
+            | WalRecord::HeaderSet {
+                root,
+                freelist,
+                page_count,
+                ..
+            }
+            | WalRecord::HeaderUndoSet {
+                root,
+                freelist,
+                page_count,
+            } => {
                 pager.set_db_state(
                     entry.txid,
                     LogContext::Redo(lsn),
-                    DbState { root, freelist },
+                    DbState {
+                        root,
+                        freelist,
+                        page_count,
+                    },
                 )?;
+            }
+
+            WalRecord::AllocPage { pgid } => {
+                pager.alloc_for_redo(entry.txid, lsn, pgid)?;
+            }
+            WalRecord::DeallocPage { pgid } => {
+                pager.dealloc(LogContext::Redo(lsn), entry.txid, pgid)?;
             }
 
             WalRecord::InteriorReset { pgid, .. }
@@ -307,10 +335,12 @@ fn redo(
 
 fn redo_page(pager: &Pager, lsn: Lsn, entry: &WalEntry, pgid: PageId) -> anyhow::Result<()> {
     let page = pager.write(entry.txid, pgid)?;
-    if let Some(page_lsn) = page.page_lsn() {
-        if page_lsn >= lsn {
-            return Ok(());
-        }
+    if page.page_lsn() >= lsn {
+        log::debug!(
+            "redo skipped becauase page_lsn={:?} >= {lsn:?}",
+            page.page_lsn()
+        );
+        return Ok(());
     }
 
     let ctx = LogContext::Redo(lsn);
@@ -322,7 +352,9 @@ fn redo_page(pager: &Pager, lsn: Lsn, entry: &WalEntry, pgid: PageId) -> anyhow:
         | WalRecord::End
         | WalRecord::CheckpointBegin { .. }
         | WalRecord::HeaderSet { .. }
-        | WalRecord::HeaderUndoSet { .. } => {
+        | WalRecord::HeaderUndoSet { .. }
+        | WalRecord::AllocPage { .. }
+        | WalRecord::DeallocPage { .. } => {
             unreachable!("this case should be filtered out by the caller")
         }
 
@@ -580,6 +612,7 @@ pub(crate) fn undo_txn(
             WalRecord::HeaderSet {
                 old_root,
                 old_freelist,
+                old_page_count,
                 ..
             } => {
                 pager.set_db_state(
@@ -588,11 +621,19 @@ pub(crate) fn undo_txn(
                     DbState {
                         root: old_root,
                         freelist: old_freelist,
+                        page_count: old_page_count,
                     },
                 )?;
             }
             WalRecord::HeaderUndoSet { .. } => {
                 unreachable!("HeaderUndoSet only used for CLR which shouldn't be undone");
+            }
+
+            WalRecord::AllocPage { pgid } => {
+                pager.dealloc(ctx, txid, pgid)?;
+            }
+            WalRecord::DeallocPage { .. } => {
+                unreachable!("DeallocPage only used for CLR which shouldn't be undone");
             }
 
             WalRecord::InteriorReset {
@@ -655,7 +696,7 @@ pub(crate) fn undo_txn(
                     old_ptr,
                     old_overflow,
                 )?;
-                assert!(ok, "if it can be deleted, then it must be ok to insert");
+                assert!(ok, "if it can be deleted, then it must be ok to insert, pgid={pgid:?} index={index} old_raw_len={}", old_raw.len());
             }
             WalRecord::InteriorUndoDelete { .. } => {
                 unreachable!("InteriorUndoDelete only used for CLR which shouldn't be undone");
@@ -728,7 +769,7 @@ pub(crate) fn undo_txn(
             WalRecord::LeafInsert { pgid, index, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {
-                    return Err(anyhow!("expected an leaf page for undo"));
+                    return Err(anyhow!("expected a leaf page for undo"));
                 };
                 page.delete(ctx, index)?;
             }
@@ -752,7 +793,7 @@ pub(crate) fn undo_txn(
                     old_val_size,
                     old_overflow,
                 )?;
-                assert!(ok, "if it can be deleted, then it must be ok to insert");
+                assert!(ok, "if it can be deleted, then it must be ok to insert, pgid={pgid:?} index={index} old_raw_len={}", old_raw.len());
             }
             WalRecord::LeafUndoDelete { .. } => {
                 unreachable!("LeafUndoDelete only used for CLR which shouldn't be undone");

@@ -43,7 +43,7 @@ fn main() {
                 let child = child.clone();
                 let rng = rng.clone();
                 s.spawn(move || {
-                    let ms = rng.lock().unwrap().gen_range(5..10 * 1000);
+                    let ms = rng.lock().unwrap().gen_range(0..10 * 1000);
                     let res = recv.recv_timeout(Duration::from_millis(ms));
                     if matches!(res, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
                         child.lock().unwrap().kill().expect("cannot kill child");

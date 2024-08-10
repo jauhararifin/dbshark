@@ -73,6 +73,9 @@ impl Db {
             .create(true)
             .truncate(false)
             .open(db_path)?;
+        if !db_file.metadata()?.is_file() {
+            return Err(anyhow!("db file is not a regular file"));
+        }
         let header = Self::load_db_header(&mut db_file)?;
 
         let double_buff_file = OpenOptions::new()
@@ -81,6 +84,9 @@ impl Db {
             .create(true)
             .truncate(false)
             .open(double_buff_path)?;
+        if !double_buff_file.metadata()?.is_file() {
+            return Err(anyhow!("double buffer file is not a regular file"));
+        }
 
         if header.version != 0 {
             return Err(anyhow!("unsupported database version"));
@@ -94,6 +100,9 @@ impl Db {
             .create(true)
             .truncate(false)
             .open(wal_path)?;
+        if !wal_file.metadata()?.is_file() {
+            return Err(anyhow!("wal file is not a regular file"));
+        }
         let result = recover(wal_file, &pager, page_size)?;
         let wal = Arc::new(result.wal);
 
@@ -364,7 +373,7 @@ impl<'db> Tx<'db> {
             pgid
         } else {
             drop(result);
-            let bucket_root = self.pager.alloc(self.id)?;
+            let bucket_root = self.pager.alloc(LogContext::Runtime(&self.wal), self.id)?;
             let bucket_root_id = bucket_root.id();
             drop(bucket_root);
 
@@ -383,7 +392,7 @@ impl<'db> Tx<'db> {
         if let Some(pgid) = self.pager.root() {
             Ok(pgid)
         } else {
-            let page = self.pager.alloc(self.id)?;
+            let page = self.pager.alloc(LogContext::Runtime(&self.wal), self.id)?;
             let pgid = page.id();
             self.pager.set_db_state(
                 self.id,
@@ -391,6 +400,7 @@ impl<'db> Tx<'db> {
                 DbState {
                     root: Some(pgid),
                     freelist: self.pager.freelist(),
+                    page_count: self.pager.page_count(),
                 },
             )?;
             drop(page);
@@ -399,22 +409,14 @@ impl<'db> Tx<'db> {
     }
 
     pub fn commit(self) -> anyhow::Result<()> {
-        {
-            let mut tx_state = self.tx_state.write();
-            assert_eq!(*tx_state, TxState::Active(self.id));
-            *tx_state = TxState::Committing(self.id);
-        }
-
+        let mut tx_state = self.tx_state.write();
+        assert_eq!(*tx_state, TxState::Active(self.id));
         let commit_lsn = self.wal.append(self.id, None, WalRecord::Commit)?;
         self.wal.append(self.id, None, WalRecord::End)?;
+        *tx_state = TxState::None;
+        drop(tx_state);
+
         self.wal.sync(commit_lsn)?;
-
-        {
-            let mut tx_state = self.tx_state.write();
-            assert_eq!(*tx_state, TxState::Committing(self.id));
-            *tx_state = TxState::None;
-        }
-
         Ok(())
     }
 
