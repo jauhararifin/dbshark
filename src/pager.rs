@@ -583,9 +583,6 @@ impl Pager {
             Ok((frame_id, meta, buffer))
         } else if internal.allocated < self.n {
             let frame_id = internal.allocated;
-            internal.allocated += 1;
-            internal.ref_count[frame_id] += 1;
-            internal.page_to_frame.insert(pgid, frame_id);
 
             // SAFETY:
             // - it's guaranteed that the address pointed by metas + frame_id is valid
@@ -603,8 +600,6 @@ impl Pager {
             // shared reference since it's protected by page meta's lock.
             let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_offset, self.page_size) };
 
-            drop(internal);
-
             if let Some(lsn) = alloc_lsn {
                 *meta_locked = PageMeta {
                     id: pgid,
@@ -616,7 +611,9 @@ impl Pager {
                 self.decode(pgid, &mut meta_locked, buffer)?;
             }
 
-            drop(meta_locked);
+            internal.allocated += 1;
+            internal.ref_count[frame_id] += 1;
+            internal.page_to_frame.insert(pgid, frame_id);
 
             Ok((frame_id, meta, buffer_offset))
         } else {
@@ -634,13 +631,6 @@ impl Pager {
                 meta.read().id
             };
 
-            internal.page_to_frame.remove(&old_pgid);
-            internal.page_to_frame.insert(pgid, frame_id);
-            assert!(internal.ref_count[frame_id] == 0);
-            internal.ref_count[frame_id] += 1;
-            internal.free_frames.remove(&frame_id);
-            internal.free_and_clean.remove(&frame_id);
-
             // It's ok to acquire exclusive lock here when `internal`'s lock is held because
             // acquiring the meta's lock here is instant since only free page can be evicted.
             let mut meta_locked = meta.write();
@@ -650,9 +640,7 @@ impl Pager {
             // SAFETY: it's guaranteed that buffer has only one mutable reference or multiple
             // shared reference since it's protected by page meta's lock.
             let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_offset, self.page_size) };
-            internal.dirty_frames.remove(&frame_id);
 
-            drop(internal);
             if evicted {
                 Self::encode(&meta_locked, buffer)?;
 
@@ -678,7 +666,14 @@ impl Pager {
             } else {
                 self.decode(pgid, &mut meta_locked, buffer)?;
             }
-            drop(meta_locked);
+
+            internal.page_to_frame.remove(&old_pgid);
+            internal.page_to_frame.insert(pgid, frame_id);
+            assert!(internal.ref_count[frame_id] == 0);
+            internal.ref_count[frame_id] += 1;
+            internal.free_frames.remove(&frame_id);
+            internal.free_and_clean.remove(&frame_id);
+            internal.dirty_frames.remove(&frame_id);
 
             Ok((frame_id, meta, buffer_offset))
         }

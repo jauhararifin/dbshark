@@ -1,4 +1,5 @@
 // TODO: implement deletion
+// TODO: use nonce for checksum
 // TODO: implement WAL rolling
 // TODO: use pointer swizzling for better buffer pool
 // TODO: add fast path for adding entry to a btree

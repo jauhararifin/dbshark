@@ -300,7 +300,7 @@ impl Db {
 
 const DB_HEADER_SIZE: usize = 24;
 const DEFAULT_PAGE_SIZE: usize = 0x1000;
-const MAGIC_HEADER: &[u8] = b"dbest000";
+const MAGIC_HEADER: &[u8] = b"dbshark0";
 
 struct Header {
     version: u32,
