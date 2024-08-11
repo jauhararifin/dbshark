@@ -312,12 +312,12 @@ impl Header {
         buff[0..8].copy_from_slice(MAGIC_HEADER);
         buff[8..12].copy_from_slice(&self.version.to_be_bytes());
         buff[12..16].copy_from_slice(&self.page_size.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..16]);
+        let checksum = crc64::crc64(0x1d0f, &buff[0..16]);
         buff[16..24].copy_from_slice(&checksum.to_be_bytes());
     }
 
     fn decode(buff: &[u8]) -> Option<Self> {
-        let calculated_checksum = crc64::crc64(0, &buff[0..DB_HEADER_SIZE - 8]);
+        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..DB_HEADER_SIZE - 8]);
         let checksum =
             u64::from_be_bytes(buff[DB_HEADER_SIZE - 8..DB_HEADER_SIZE].try_into().unwrap());
 

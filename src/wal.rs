@@ -293,7 +293,7 @@ impl<'a> WalBackwardIterator<'a> {
         }
 
         let calculated_checksum =
-            crc64::crc64(0, &self.buffer[self.end_offset - size..self.end_offset - 8]);
+            crc64::crc64(0x1d0f, &self.buffer[self.end_offset - size..self.end_offset - 8]);
         if recorded_checksum != calculated_checksum {
             // TODO: maybe we can consider this entry as "uncompleted" and then skip it? but if
             // it's in the middle of the WAL, this entry should be considered broken.
@@ -1383,7 +1383,7 @@ impl<'a> WalEntry<'a> {
         buff[next + 2..next + 8].copy_from_slice(b"abcxyz");
 
         let next = next + 8;
-        let checksum = crc64::crc64(0, &buff[0..next]);
+        let checksum = crc64::crc64(0x1d0f, &buff[0..next]);
         buff[next..next + 8].copy_from_slice(&checksum.to_be_bytes());
     }
 
@@ -1418,7 +1418,7 @@ impl<'a> WalEntry<'a> {
         assert_eq!(magic_bytes, b"abcxyz");
 
         let next = pad8(next + 2);
-        let calculated_checksum = crc64::crc64(0, &buff[0..next]);
+        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..next]);
         let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
         if calculated_checksum != stored_checksum {
             // TODO: if there is an incomplete record, followed by complete record, it means
@@ -1468,7 +1468,7 @@ impl WalHeader {
         let checkpoint = Lsn::from_be_bytes(buff[16..24].try_into().unwrap());
 
         let stored_checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
-        let calculated_checksum = crc64::crc64(0, &buff[0..24]);
+        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..24]);
         if stored_checksum != calculated_checksum {
             return None;
         }
@@ -1485,7 +1485,7 @@ impl WalHeader {
         buff[6..8].copy_from_slice(&self.version.to_be_bytes());
         buff[8..16].copy_from_slice(&self.relative_lsn_offset.to_be_bytes());
         buff[16..24].copy_from_slice(&self.checkpoint.to_be_bytes());
-        let checksum = crc64::crc64(0, &buff[0..24]);
+        let checksum = crc64::crc64(0x1d0f, &buff[0..24]);
         buff[24..32].copy_from_slice(&checksum.to_be_bytes());
     }
 }

@@ -904,7 +904,7 @@ impl Pager {
         let buff_page_id = &header[PAGE_HEADER_PAGE_ID_RANGE];
         let buff_checksum_content = &buff[..page_size - PAGE_FOOTER_SIZE];
 
-        let checksum = crc64::crc64(0, buff_checksum_content);
+        let checksum = crc64::crc64(0x1d0f, buff_checksum_content);
         let page_sum = u64::from_be_bytes(buff_checksum.try_into().unwrap());
         if checksum != page_sum {
             return Ok(false);
@@ -1093,7 +1093,7 @@ impl Pager {
             }
         }
 
-        let checksum = crc64::crc64(0, &buff[..page_size - PAGE_FOOTER_SIZE]);
+        let checksum = crc64::crc64(0x1d0f, &buff[..page_size - PAGE_FOOTER_SIZE]);
         let footer = &mut buff[page_size - PAGE_FOOTER_SIZE..];
         footer[PAGE_FOOTER_CHECKSUM_RANGE].copy_from_slice(&checksum.to_be_bytes());
 
