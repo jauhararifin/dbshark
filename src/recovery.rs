@@ -337,7 +337,7 @@ fn redo_page(pager: &Pager, lsn: Lsn, entry: &WalEntry, pgid: PageId) -> anyhow:
     let page = pager.write(entry.txid, pgid)?;
     if page.page_lsn() >= lsn {
         log::debug!(
-            "redo skipped becauase page_lsn={:?} >= {lsn:?}",
+            "redo skipped because page_lsn={:?} >= {lsn:?}",
             page.page_lsn()
         );
         return Ok(());
@@ -762,14 +762,14 @@ pub(crate) fn undo_txn(
             WalRecord::LeafInit { pgid } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(page) = page.into_leaf() else {
-                    return Err(anyhow!("expected a leaf page for undo"));
+                    return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.reset(ctx)?;
             }
             WalRecord::LeafInsert { pgid, index, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {
-                    return Err(anyhow!("expected a leaf page for undo"));
+                    return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.delete(ctx, index)?;
             }
@@ -783,7 +783,7 @@ pub(crate) fn undo_txn(
             } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {
-                    return Err(anyhow!("expected a leaf page for undo"));
+                    return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 let ok = page.insert_content(
                     ctx,
@@ -806,14 +806,14 @@ pub(crate) fn undo_txn(
             } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {
-                    return Err(anyhow!("expected a leaf page for undo"));
+                    return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.set_cell_overflow(ctx, index, old_overflow)?;
             }
             WalRecord::LeafSetNext { pgid, old_next, .. } => {
                 let page = pager.write(txid, pgid)?;
                 let Some(mut page) = page.into_leaf() else {
-                    return Err(anyhow!("expected a leaf page for undo"));
+                    return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.set_next(ctx, old_next)?;
             }
