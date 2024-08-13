@@ -69,7 +69,7 @@ fn main() {
 fn worker() {
     env_logger::init();
 
-    let path = std::env::args().skip(1).next().unwrap();
+    let path = std::env::args().nth(1).unwrap();
     let db = Db::open(
         &PathBuf::from(path),
         Setting {

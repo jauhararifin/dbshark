@@ -489,7 +489,7 @@ impl Pager {
         let mut internal = self.internal.write();
         let pgid = {
             internal.db_state.page_count += 1;
-            PageId::new((internal.db_state.page_count - 1) as u64).unwrap()
+            PageId::new(internal.db_state.page_count - 1).unwrap()
         };
 
         let lsn = record_mutation(
@@ -688,7 +688,7 @@ impl Pager {
 
         let mut f = f.lock();
         let page_size = buffer.len();
-        write_page(&mut *f, pgid, page_size, buffer)?;
+        write_page(&mut f, pgid, page_size, buffer)?;
         f.sync_all()?;
         drop(f);
 
@@ -739,7 +739,7 @@ impl Pager {
         let mut f = f.lock();
         for (i, pgid) in internal.flushing_pgids.iter().enumerate() {
             write_page(
-                &mut *f,
+                &mut f,
                 *pgid,
                 page_size,
                 &internal.flushing_pages[i * page_size..(i + 1) * page_size],
@@ -833,7 +833,7 @@ impl Pager {
             } else {
                 drop(flush_internal);
                 let mut f = self.f.lock();
-                read_page(&mut *f, pgid, self.page_size, buff)?
+                read_page(&mut f, pgid, self.page_size, buff)?
             }
         };
         if ok {
@@ -1099,7 +1099,7 @@ impl Pager {
             // first, then to the actual page.
             // TODO: also, we need to make sure that the WAL log is already written safely before we can
             // write to disk.
-            write_page(&mut *f, *pgid, self.page_size, buffer)?;
+            write_page(&mut f, *pgid, self.page_size, buffer)?;
         }
 
         // TODO(important): this is not safe. We can get non-atomic write.
@@ -1602,7 +1602,7 @@ impl<'a> InteriorPageWrite<'a> {
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
-        Pager::encode(&self.0.meta, &mut self.0.buffer)?;
+        Pager::encode(&self.0.meta, self.0.buffer)?;
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
@@ -2211,7 +2211,7 @@ impl<'a> LeafPageWrite<'a> {
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
-        Pager::encode(&self.0.meta, &mut self.0.buffer)?;
+        Pager::encode(&self.0.meta, self.0.buffer)?;
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
@@ -2845,7 +2845,7 @@ impl<'a> OverflowPageWrite<'a> {
     }
 
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<PageWrite<'a>> {
-        Pager::encode(&self.0.meta, &mut self.0.buffer)?;
+        Pager::encode(&self.0.meta, self.0.buffer)?;
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(

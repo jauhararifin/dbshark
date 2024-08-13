@@ -292,8 +292,10 @@ impl<'a> WalBackwardIterator<'a> {
             self.start_offset -= s;
         }
 
-        let calculated_checksum =
-            crc64::crc64(0x1d0f, &self.buffer[self.end_offset - size..self.end_offset - 8]);
+        let calculated_checksum = crc64::crc64(
+            0x1d0f,
+            &self.buffer[self.end_offset - size..self.end_offset - 8],
+        );
         if recorded_checksum != calculated_checksum {
             // TODO: maybe we can consider this entry as "uncompleted" and then skip it? but if
             // it's in the middle of the WAL, this entry should be considered broken.
