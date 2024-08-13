@@ -335,7 +335,11 @@ fn redo(
 
 fn redo_page(pager: &Pager, lsn: Lsn, entry: &WalEntry, pgid: PageId) -> anyhow::Result<()> {
     let page = pager.write(entry.txid, pgid)?;
-    if page.page_lsn() >= lsn {
+    if page
+        .page_lsn()
+        .map(|page_lsn| page_lsn >= lsn)
+        .unwrap_or_default()
+    {
         log::debug!(
             "redo skipped because page_lsn={:?} >= {lsn:?}",
             page.page_lsn()
