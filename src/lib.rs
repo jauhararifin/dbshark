@@ -27,5 +27,8 @@ mod db;
 mod pager;
 mod recovery;
 mod wal;
+mod wal_v2;
+mod log;
+mod id;
 
 pub use db::{Db, Setting};

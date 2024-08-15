@@ -107,6 +107,7 @@ struct PagerFlushInternal {
 }
 
 const MINIMUM_PAGE_SIZE: usize = 256;
+pub(crate) const MAXIMUM_PAGE_SIZE: usize = 0x4000;
 
 const PAGE_HEADER_SIZE: usize = 24;
 const PAGE_HEADER_VERSION_RANGE: Range<usize> = 0..2;
@@ -314,7 +315,7 @@ impl Pager {
                 page_size
             ));
         }
-        if page_size > 0x4000 {
+        if page_size > MAXIMUM_PAGE_SIZE {
             return Err(anyhow!(
                 "page size must be at most 16KB, but got {}",
                 page_size
