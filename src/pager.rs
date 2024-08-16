@@ -1,4 +1,5 @@
 use crate::content::{Bytes, Content};
+use crate::id::{PageId, PageIdExt};
 use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalRecord};
 use anyhow::anyhow;
 use indexmap::IndexSet;
@@ -11,42 +12,6 @@ use std::ops::Range;
 
 // TODO: use better eviction policy. De-priorize pages with `page_lsn` < `flushed_lsn`.
 // Also use better algorithm such as tiny-lfu or secondchance.
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct PageId(NonZeroU64);
-
-impl PageId {
-    pub(crate) fn new(id: u64) -> Option<Self> {
-        NonZeroU64::new(id).map(Self)
-    }
-
-    pub(crate) fn get(&self) -> u64 {
-        self.0.get()
-    }
-
-    pub(crate) fn from_be_bytes(pgid: [u8; 8]) -> Option<Self> {
-        Self::new(u64::from_be_bytes(pgid))
-    }
-}
-
-pub(crate) trait PageIdExt {
-    fn to_be_bytes(&self) -> [u8; 8];
-}
-
-impl PageIdExt for PageId {
-    fn to_be_bytes(&self) -> [u8; 8] {
-        self.0.get().to_be_bytes()
-    }
-}
-impl PageIdExt for Option<PageId> {
-    fn to_be_bytes(&self) -> [u8; 8] {
-        if let Some(pgid) = self {
-            pgid.to_be_bytes()
-        } else {
-            0u64.to_be_bytes()
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(crate) enum LogContext<'a> {
@@ -260,7 +225,7 @@ impl Pager {
             return Err(anyhow!("page size * n overflows: {} * {}", page_size, n));
         };
 
-        let dummy_pgid = PageId(NonZeroU64::new(1).unwrap());
+        let dummy_pgid = PageId::new(1).unwrap();
         let metas = (0..n)
             .map(|_| {
                 RwLock::new(PageMeta {
@@ -1044,7 +1009,7 @@ impl Pager {
                 remaining: _,
             } => {
                 let header = &mut payload_buff[..INTERIOR_PAGE_HEADER_SIZE];
-                header[INTERIOR_HEADER_LAST_RANGE].copy_from_slice(&last.0.get().to_be_bytes());
+                header[INTERIOR_HEADER_LAST_RANGE].copy_from_slice(&last.to_be_bytes());
                 header[INTERIOR_HEADER_COUNT_RANGE].copy_from_slice(&(*count as u16).to_be_bytes());
                 header[INTERIOR_HEADER_OFFSET_RANGE]
                     .copy_from_slice(&(*offset as u16).to_be_bytes());
@@ -1056,20 +1021,17 @@ impl Pager {
                 remaining: _,
             } => {
                 let header = &mut payload_buff[..LEAF_PAGE_HEADER_SIZE];
-                let next = next.map(|p| p.0.get()).unwrap_or(0);
                 header[LEAF_HEADER_NEXT_RANGE].copy_from_slice(&next.to_be_bytes());
                 header[LEAF_HEADER_COUNT_RANGE].copy_from_slice(&(*count as u16).to_be_bytes());
                 header[LEAF_HEADER_OFFSET_RANGE].copy_from_slice(&(*offset as u16).to_be_bytes());
             }
             PageKind::Overflow { next, size } => {
                 let header = &mut payload_buff[..OVERFLOW_PAGE_HEADER_SIZE];
-                let next = next.map(|p| p.0.get()).unwrap_or(0);
                 header[OVERFLOW_HEADER_NEXT_RANGE].copy_from_slice(&next.to_be_bytes());
                 header[OVERFLOW_HEADER_SIZE_RANGE].copy_from_slice(&(*size as u16).to_be_bytes());
             }
             PageKind::Freelist { next, count } => {
                 let header = &mut payload_buff[..FREELIST_PAGE_HEADER_SIZE];
-                let next = next.map(|p| p.0.get()).unwrap_or(0);
                 header[FREELIST_HEADER_NEXT_RANGE].copy_from_slice(&next.to_be_bytes());
                 header[FREELIST_HEADER_COUNT_RANGE].copy_from_slice(&(*count as u16).to_be_bytes());
             }
@@ -1912,9 +1874,8 @@ impl<'a> InteriorPageWrite<'a> {
         *remaining -= added;
         *count += 1;
 
-        cell[INTERIOR_CELL_PTR_RANGE].copy_from_slice(&ptr.0.get().to_be_bytes());
-        cell[INTERIOR_CELL_OVERFLOW_RANGE]
-            .copy_from_slice(&overflow.map(|p| p.0.get()).unwrap_or(0).to_be_bytes());
+        cell[INTERIOR_CELL_PTR_RANGE].copy_from_slice(&ptr.to_be_bytes());
+        cell[INTERIOR_CELL_OVERFLOW_RANGE].copy_from_slice(&overflow.to_be_bytes());
         cell[INTERIOR_CELL_KEY_SIZE_RANGE].copy_from_slice(&(key_size as u32).to_be_bytes());
         cell[INTERIOR_CELL_OFFSET_RANGE].copy_from_slice(&(*offset as u16).to_be_bytes());
         cell[INTERIOR_CELL_SIZE_RANGE].copy_from_slice(&(raw_size as u16).to_be_bytes());

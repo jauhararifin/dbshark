@@ -1,4 +1,4 @@
-use crate::pager::{PageId, PageIdExt};
+use crate::id::{PageId, PageIdExt};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock};
 use std::fs::File;

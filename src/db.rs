@@ -1,5 +1,6 @@
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
-use crate::pager::{DbState, LogContext, PageId, PageIdExt, Pager};
+use crate::id::{PageId, PageIdExt};
+use crate::pager::{DbState, LogContext, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::wal::{TxId, TxState, Wal, WalRecord};
 use anyhow::anyhow;

@@ -1,5 +1,6 @@
 use crate::content::Bytes;
-use crate::pager::{DbState, LogContext, PageId, Pager};
+use crate::id::PageId;
+use crate::pager::{DbState, LogContext, Pager};
 use crate::wal::{
     build_wal_header, load_wal_header, Lsn, TxId, TxState, Wal, WalDecodeResult, WalEntry,
     WalHeader, WalRecord, WAL_HEADER_SIZE,

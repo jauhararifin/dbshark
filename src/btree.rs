@@ -1,7 +1,8 @@
 use crate::content::{Bytes, Content};
+use crate::id::PageId;
 use crate::pager::{
     BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
-    OverflowPageRead, PageId, PageWrite, Pager,
+    OverflowPageRead, PageWrite, Pager,
 };
 use crate::wal::{TxId, Wal};
 use anyhow::anyhow;
