@@ -1,5 +1,5 @@
 use crate::id::Lsn;
-use crate::log::{TxState, WalDecodeResult, WalEntry, WalHeader, WAL_HEADER_SIZE};
+use crate::log::{WalDecodeResult, WalEntry, WalHeader, WAL_HEADER_SIZE};
 use crate::pager::MAXIMUM_PAGE_SIZE;
 use anyhow::{anyhow, Context};
 use parking_lot::{Mutex, RwLock};
@@ -249,7 +249,7 @@ where
     );
 
     let mut buffer = vec![0u8; MAXIMUM_PAGE_SIZE * 20];
-    let mut next_lsn = Lsn::new(2 * WAL_HEADER_SIZE as u64);
+    let mut next_lsn = Lsn::new(0);
     {
         let mut offset_start = 0;
         let mut offset_end = 0;
@@ -290,8 +290,6 @@ where
                 entry = WalEntry::decode(&buffer[offset_start..offset_end]);
             };
 
-            let f = if use_wal_1 { &mut f1 } else { &mut f2 };
-
             match entry {
                 WalDecodeResult::Ok(entry) => {
                     let lsn = current_lsn;
@@ -310,20 +308,7 @@ where
                     offset_start = 0;
                     offset_end = 0;
                 }
-                WalDecodeResult::Err(err) => {
-                    f.f.seek(SeekFrom::Start(0)).unwrap();
-                    let mut copy = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open("jauhar_wal")
-                        .unwrap();
-                    std::io::copy(&mut f.f, &mut copy).unwrap();
-                    drop(copy);
-
-                    return Err(err);
-                }
+                WalDecodeResult::Err(err) => return Err(err),
             }
         }
     }
@@ -352,24 +337,19 @@ where
 
     let (flush_trigger, flush_signal) = std::sync::mpsc::sync_channel::<()>(0);
     {
-        let internal = Arc::downgrade(&internal);
+        let internal = internal.clone();
         let buffer = buffer.clone();
         let f1 = f1.clone();
         let f2 = f2.clone();
         spawn(move || loop {
-            loop {
-                let result = flush_signal.recv_timeout(std::time::Duration::from_secs(3600));
-                if result == Err(RecvTimeoutError::Disconnected) {
-                    break;
-                }
-
-                let Some(internal) = internal.upgrade() else {
-                    break;
-                };
-                let mut internal = internal.write();
-                if let Err(err) = Wal::flush(&mut internal, &mut buffer.write(), &f1, &f2) {
-                    log::error!("wal_flush_error err={err}");
-                }
+            let result = flush_signal.recv_timeout(std::time::Duration::from_secs(3600));
+            if result == Err(RecvTimeoutError::Disconnected) {
+                return;
+            }
+            let mut internal = internal.write();
+            let mut buffer = buffer.write();
+            if let Err(err) = Wal::flush(&mut internal, &mut buffer, &f1, &f2) {
+                log::error!("wal_flush_error err={err}");
             }
         });
     }
@@ -441,7 +421,7 @@ impl std::fmt::Debug for RecoveringWalFile {
 mod tests {
     use super::*;
     use crate::id::{PageId, TxId};
-    use crate::log::WalKind;
+    use crate::log::{TxState, WalKind};
     use rand::Rng;
 
     #[test]
