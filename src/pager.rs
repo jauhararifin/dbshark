@@ -1,13 +1,12 @@
 use crate::content::{Bytes, Content};
-use crate::id::{PageId, PageIdExt};
-use crate::wal::{Lsn, LsnExt, TxId, TxState, Wal, WalRecord};
+use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId};
+use crate::wal::{Wal, WalRecord, TxState};
 use anyhow::anyhow;
 use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::num::NonZeroU64;
 use std::ops::Range;
 
 // TODO: use better eviction policy. De-priorize pages with `page_lsn` < `flushed_lsn`.
@@ -2883,12 +2882,12 @@ mod tests {
             .truncate(false)
             .open(wal_path)
             .unwrap();
-        let wal = Arc::new(Wal::new(wal_file, 0, Lsn::new(64).unwrap(), page_size).unwrap());
+        let wal = Arc::new(Wal::new(wal_file, 0, Lsn::new(64), page_size).unwrap());
 
         let pager = Pager::new(file, double_buff_file, page_size, 10).unwrap();
         let txid = TxId::new(1).unwrap();
 
-        let ctx = LogContext::Redo(Lsn::new(1).unwrap());
+        let ctx = LogContext::Redo(Lsn::new(1));
         let page1 = pager.alloc(ctx, txid).unwrap();
         let pgid_last = PageId::new(7).unwrap();
         let mut page1 = page1

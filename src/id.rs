@@ -18,6 +18,11 @@ impl TxId {
     pub(crate) fn from_be_bytes(txid: [u8; 8]) -> Option<Self> {
         Self::new(u64::from_be_bytes(txid))
     }
+
+    #[inline]
+    pub(crate) fn get(self) -> u64 {
+        self.0.get()
+    }
 }
 
 pub(crate) trait TxIdExt {
@@ -76,6 +81,11 @@ impl Lsn {
     #[inline]
     pub(crate) fn add(&self, rhs: u64) -> Self {
         Self::new(self.0 + rhs)
+    }
+
+    #[inline]
+    pub(crate) fn sub(&self, rhs: u64) -> Self {
+        Self::new(self.0.checked_sub(rhs).unwrap())
     }
 }
 

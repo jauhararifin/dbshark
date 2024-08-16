@@ -1,8 +1,8 @@
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
-use crate::id::{PageId, PageIdExt};
+use crate::id::{PageId, PageIdExt, TxId};
 use crate::pager::{DbState, LogContext, Pager};
 use crate::recovery::{recover, undo_txn};
-use crate::wal::{TxId, TxState, Wal, WalRecord};
+use crate::wal::{TxState, Wal, WalRecord};
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;

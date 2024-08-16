@@ -1,10 +1,10 @@
 use crate::content::{Bytes, Content};
-use crate::id::PageId;
+use crate::id::{PageId, TxId};
 use crate::pager::{
     BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
     OverflowPageRead, PageWrite, Pager,
 };
-use crate::wal::{TxId, Wal};
+use crate::wal::Wal;
 use anyhow::anyhow;
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};

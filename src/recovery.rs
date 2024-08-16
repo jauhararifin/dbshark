@@ -1,9 +1,9 @@
 use crate::content::Bytes;
-use crate::id::PageId;
+use crate::id::{Lsn, PageId, TxId};
 use crate::pager::{DbState, LogContext, Pager};
 use crate::wal::{
-    build_wal_header, load_wal_header, Lsn, TxId, TxState, Wal, WalDecodeResult, WalEntry,
-    WalHeader, WalRecord, WAL_HEADER_SIZE,
+    build_wal_header, load_wal_header, TxState, Wal, WalDecodeResult, WalEntry, WalHeader,
+    WalRecord, WAL_HEADER_SIZE,
 };
 use anyhow::anyhow;
 use std::fs::File;
@@ -37,7 +37,7 @@ pub(crate) fn recover(
     undo(&analyze_result, pager, &wal)?;
 
     let next_txid = if let Some(txid) = analyze_result.last_txid {
-        TxId::new(txid.get() + 1).unwrap()
+        txid.next()
     } else {
         TxId::new(1).unwrap()
     };
@@ -60,7 +60,7 @@ fn iterate_wal_forward(
     start_lsn: Lsn,
 ) -> anyhow::Result<WalIterator> {
     let file_len = f.metadata()?.len();
-    let f_offset = start_lsn.sub(relative_lsn_offset).get();
+    let f_offset = start_lsn.sub(relative_lsn_offset as u64).get();
     if f_offset >= file_len {
         f.seek(SeekFrom::Start(file_len))?;
     } else {
@@ -96,7 +96,7 @@ impl WalIterator<'_> {
                 WalDecodeResult::Ok(entry) => {
                     let lsn = self.lsn;
                     self.start_offset += entry.size();
-                    self.lsn = self.lsn.add(entry.size());
+                    self.lsn.add_assign(entry.size() as u64);
                     return Ok(Some((lsn, entry)));
                 }
                 WalDecodeResult::NeedMoreBytes => {
@@ -136,7 +136,7 @@ fn analyze(
 ) -> anyhow::Result<AriesAnalyzeResult> {
     let analyze_start = wal_header
         .checkpoint
-        .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
+        .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2));
 
     let mut iter = iterate_wal_forward(
         f,
@@ -226,17 +226,17 @@ fn analyze(
             | WalRecord::DeallocPage { .. } => (),
         }
 
-        next_lsn = Some(lsn.add(entry.size()));
+        next_lsn = Some(lsn.add(entry.size() as u64));
     }
 
     log::debug!("aries analysis finished next_lsn={next_lsn:?} tx_state={tx_state:?}");
 
-    let next_lsn = next_lsn.unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap());
+    let next_lsn = next_lsn.unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2));
 
     Ok(AriesAnalyzeResult {
         lsn_to_redo: wal_header
             .checkpoint
-            .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2).unwrap()),
+            .unwrap_or(Lsn::new(WAL_HEADER_SIZE as u64 * 2)),
         active_tx: tx_state,
         next_lsn,
         last_txid: last_txn,
