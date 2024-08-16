@@ -24,11 +24,11 @@
 mod btree;
 mod content;
 mod db;
+mod id;
+mod log;
 mod pager;
 mod recovery;
 mod wal;
 mod wal_v2;
-mod log;
-mod id;
 
 pub use db::{Db, Setting};

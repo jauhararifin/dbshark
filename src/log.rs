@@ -55,13 +55,13 @@ impl WalEntry<'_> {
         // (8 bytes for clr)
         // (2 bytes for entry size)
         // (1 bytes for kind)
+        // (padding 8)
         // (entry) +
         // (padding 8) +
         // (2 bytes for entry size for backward iteration) +
         // (padding 8) +
         // (8 bytes checksum) +
-        // 8 + 2 + 1 + pad8(2 + record_size) + 8 + 8
-        pad8(8 + 2 + 1 + record_size) + 2 + 6 + 8
+        pad8(8 + 2 + 6 + record_size) + 2 + 6 + 8
     }
 
     pub(crate) fn encode(&self, buff: &mut [u8]) {
@@ -75,10 +75,10 @@ impl WalEntry<'_> {
         buff[8..10].copy_from_slice(&(record_size as u16).to_be_bytes());
         buff[10] = self.kind.kind();
 
-        self.kind.encode(&mut buff[11..11 + record_size]);
+        self.kind.encode(&mut buff[16..16 + record_size]);
 
-        let next = pad8(11 + record_size);
-        buff[11 + record_size..next].fill(0);
+        let next = pad8(16 + record_size);
+        buff[16 + record_size..next].fill(0);
 
         buff[next..next + 2].copy_from_slice(&(record_size as u16).to_be_bytes());
         buff[next + 2..next + 8].copy_from_slice(b"abcxyz");
@@ -89,7 +89,7 @@ impl WalEntry<'_> {
     }
 
     pub(crate) fn decode(buff: &[u8]) -> WalDecodeResult<'_> {
-        if buff.len() < 11 {
+        if buff.len() < 16 {
             return WalDecodeResult::NeedMoreBytes;
         }
 
@@ -103,11 +103,11 @@ impl WalEntry<'_> {
         }
         assert!(total_length < 1 << 16);
 
-        let kind = match WalKind::decode(&buff[11..11 + kind_size], kind) {
+        let kind = match WalKind::decode(&buff[16..16 + kind_size], kind) {
             Ok(record) => record,
             Err(e) => return WalDecodeResult::Err(e),
         };
-        let next = pad8(11 + kind_size);
+        let next = pad8(16 + kind_size);
 
         let record_size_2 = u16::from_be_bytes(buff[next..next + 2].try_into().unwrap());
         assert_eq!(kind_size, record_size_2 as usize);
@@ -119,8 +119,6 @@ impl WalEntry<'_> {
         let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..next]);
         let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
         if calculated_checksum != stored_checksum {
-            // TODO: if there is an incomplete record, followed by complete record, it means
-            // something is wrong and we should warn the user
             return WalDecodeResult::Incomplete;
         }
 
@@ -128,6 +126,7 @@ impl WalEntry<'_> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum WalDecodeResult<'a> {
     Ok(WalEntry<'a>),
     NeedMoreBytes,

@@ -10,6 +10,11 @@ impl TxId {
     }
 
     #[inline]
+    pub(crate) fn next(&self) -> Self {
+        Self(self.0.checked_add(1).unwrap())
+    }
+
+    #[inline]
     pub(crate) fn from_be_bytes(txid: [u8; 8]) -> Option<Self> {
         Self::new(u64::from_be_bytes(txid))
     }
@@ -38,32 +43,39 @@ impl TxIdExt for Option<TxId> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Lsn(NonZeroU64);
+pub(crate) struct Lsn(u64);
 
 impl Lsn {
     #[inline]
-    pub(crate) fn new(lsn: u64) -> Option<Self> {
-        NonZeroU64::new(lsn).map(Self)
+    pub(crate) fn new(lsn: u64) -> Self {
+        assert!(lsn != u64::MAX);
+        Self(lsn)
     }
 
     #[inline]
     pub(crate) fn from_be_bytes(lsn: [u8; 8]) -> Option<Self> {
-        Self::new(u64::from_be_bytes(lsn))
+        let val = u64::from_be_bytes(lsn);
+        if val == u64::MAX {
+            None
+        } else {
+            Some(Self(val))
+        }
     }
 
     #[inline]
     pub(crate) fn get(&self) -> u64 {
-        self.0.get()
+        self.0
     }
 
     #[inline]
     pub(crate) fn add_assign(&mut self, rhs: u64) {
-        self.0 = self.0.checked_add(rhs).unwrap()
+        self.0 += rhs;
+        assert!(self.0 != u64::MAX);
     }
 
     #[inline]
     pub(crate) fn add(&self, rhs: u64) -> Self {
-        Self(self.0.checked_add(rhs).unwrap())
+        Self::new(self.0 + rhs)
     }
 }
 
@@ -84,7 +96,7 @@ impl LsnExt for Option<Lsn> {
         if let Some(lsn) = self {
             lsn.to_be_bytes()
         } else {
-            [0u8; 8]
+            [0xffu8; 8]
         }
     }
 }
