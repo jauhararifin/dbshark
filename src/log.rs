@@ -456,7 +456,7 @@ impl<'a> WalKind<'a> {
             WalKind::OverflowInit { .. } => 16,
             WalKind::OverflowSetContent { raw, .. } => 26 + raw.len(),
             WalKind::OverflowUndoSetContent { .. } => 16,
-            WalKind::OverflowSetNext { .. } => 23,
+            WalKind::OverflowSetNext { .. } => 32,
 
             WalKind::Checkpoint { .. } => 40,
         }
@@ -742,7 +742,7 @@ impl<'a> WalKind<'a> {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..24].copy_from_slice(&next.to_be_bytes());
-                buff[14..32].copy_from_slice(&old_next.to_be_bytes());
+                buff[24..32].copy_from_slice(&old_next.to_be_bytes());
             }
 
             WalKind::OverflowReset {
@@ -1461,6 +1461,15 @@ mod tests {
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorSet {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 0,
+                    payload: b"this_is_just_a_dummy_bytes",
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
                 kind: WalKind::InteriorInit {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
@@ -1525,6 +1534,55 @@ mod tests {
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorSetCellOverflow {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    overflow: PageId::new(12),
+                    old_overflow: None,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorSetCellOverflow {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    overflow: None,
+                    old_overflow: PageId::new(12),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorSetCellOverflow {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    overflow: PageId::new(21),
+                    old_overflow: PageId::new(12),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorSetCellPtr {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    ptr: PageId::new(12).unwrap(),
+                    old_ptr: PageId::new(21).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorSetLast {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    last: PageId::new(12).unwrap(),
+                    old_last: PageId::new(21).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
                 kind: WalKind::LeafReset {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
@@ -1537,6 +1595,15 @@ mod tests {
                 kind: WalKind::LeafUndoReset {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSet {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 0,
+                    payload: b"this_is_just_a_dummy_bytes",
                 },
             },
             WalEntry {
@@ -1588,6 +1655,138 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: 22,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSetOverflow {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                    overflow: PageId::new(12),
+                    old_overflow: None,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSetOverflow {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                    overflow: None,
+                    old_overflow: PageId::new(12),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSetOverflow {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                    overflow: PageId::new(21),
+                    old_overflow: PageId::new(12),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSetNext {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    next: PageId::new(21),
+                    old_next: PageId::new(12),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSetNext {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    next: PageId::new(21),
+                    old_next: None,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafSetNext {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    next: None,
+                    old_next: PageId::new(12),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowReset {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 0,
+                    payload: b"this_is_just_a_dummy_bytes",
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowUndoReset {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowInit {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowSetContent {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    raw: b"this_is_just_a_dummy_bytes",
+                    next: None,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowSetContent {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    raw: b"this_is_just_a_dummy_bytes",
+                    next: PageId::new(912),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowUndoSetContent {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowSetNext {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    next: PageId::new(912),
+                    old_next: PageId::new(219),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowSetNext {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    next: None,
+                    old_next: PageId::new(219),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::OverflowSetNext {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    next: PageId::new(912),
+                    old_next: None,
                 },
             },
             WalEntry {
