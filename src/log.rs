@@ -326,7 +326,7 @@ pub(crate) enum WalKind<'a> {
         old_next: Option<PageId>,
     },
 
-    CheckpointBegin {
+    Checkpoint {
         active_tx: TxState,
         root: Option<PageId>,
         freelist: Option<PageId>,
@@ -371,7 +371,7 @@ const WAL_RECORD_OVERFLOW_SET_CONTENT_KIND: u8 = 43;
 const WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND: u8 = 44;
 const WAL_RECORD_OVERFLOW_SET_NEXT_KIND: u8 = 45;
 
-const WAL_RECORD_CHECKPOINT_BEGIN_KIND: u8 = 100;
+const WAL_RECORD_CHECKPOINT_KIND: u8 = 100;
 
 impl<'a> WalKind<'a> {
     fn kind(&self) -> u8 {
@@ -414,7 +414,7 @@ impl<'a> WalKind<'a> {
             WalKind::OverflowUndoSetContent { .. } => WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND,
             WalKind::OverflowSetNext { .. } => WAL_RECORD_OVERFLOW_SET_NEXT_KIND,
 
-            WalKind::CheckpointBegin { .. } => WAL_RECORD_CHECKPOINT_BEGIN_KIND,
+            WalKind::Checkpoint { .. } => WAL_RECORD_CHECKPOINT_KIND,
         }
     }
 
@@ -458,7 +458,7 @@ impl<'a> WalKind<'a> {
             WalKind::OverflowUndoSetContent { .. } => 16,
             WalKind::OverflowSetNext { .. } => 23,
 
-            WalKind::CheckpointBegin { .. } => 40,
+            WalKind::Checkpoint { .. } => 40,
         }
     }
 
@@ -795,7 +795,7 @@ impl<'a> WalKind<'a> {
                 buff[24..32].copy_from_slice(&old_next.to_be_bytes());
             }
 
-            WalKind::CheckpointBegin {
+            WalKind::Checkpoint {
                 active_tx,
                 root,
                 freelist,
@@ -877,7 +877,7 @@ impl<'a> WalKind<'a> {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let freelist = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
                 let page_count = u64::from_be_bytes(buff[24..32].try_into().unwrap());
                 Ok(Self::HeaderUndoSet {
                     txid,
@@ -1300,7 +1300,7 @@ impl<'a> WalKind<'a> {
                 })
             }
 
-            WAL_RECORD_CHECKPOINT_BEGIN_KIND => {
+            WAL_RECORD_CHECKPOINT_KIND => {
                 let active_tx = match buff[0] {
                     1 => TxState::None,
                     2 => {
@@ -1325,7 +1325,7 @@ impl<'a> WalKind<'a> {
 
                 let root = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
-                Ok(Self::CheckpointBegin {
+                Ok(Self::Checkpoint {
                     active_tx,
                     root,
                     freelist,
@@ -1346,4 +1346,294 @@ pub(crate) enum TxState {
     Active(TxId),
     Committing(TxId),
     Aborting { txid: TxId, last_undone: Lsn },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pad8() {
+        for i in 0..10000 {
+            let result = pad8(i);
+            assert!(result % 8 == 0);
+            assert!(result >= i);
+            assert!(result - i < 8);
+        }
+    }
+
+    #[test]
+    fn test_txid() {
+        assert_eq!(None, TxId::new(0), "txid cannot be zero");
+        TxId::new(1).unwrap();
+        TxId::new(10).unwrap();
+    }
+
+    #[test]
+    fn test_encode_decode() {
+        let testcases = vec![
+            WalEntry {
+                clr: None,
+                kind: WalKind::Begin {
+                    txid: TxId::new(1).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(1)),
+                kind: WalKind::Commit {
+                    txid: TxId::new(2).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(121)),
+                kind: WalKind::Rollback {
+                    txid: TxId::new(2).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: None,
+                kind: WalKind::End {
+                    txid: TxId::new(2).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: None,
+                kind: WalKind::HeaderSet {
+                    txid: TxId::new(2).unwrap(),
+                    root: None,
+                    old_root: PageId::new(1),
+                    freelist: PageId::new(101),
+                    old_freelist: None,
+                    page_count: 10,
+                    old_page_count: 0,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::HeaderSet {
+                    txid: TxId::new(1011).unwrap(),
+                    root: PageId::new(23),
+                    old_root: PageId::new(1),
+                    freelist: PageId::new(101),
+                    old_freelist: PageId::new(33),
+                    page_count: 0,
+                    old_page_count: 10,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::HeaderUndoSet {
+                    txid: TxId::new(1011).unwrap(),
+                    root: PageId::new(23),
+                    freelist: PageId::new(101),
+                    page_count: 10,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::AllocPage {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::DeallocPage {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorReset {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 12,
+                    payload: b"this_is_just_a_dummy_bytes",
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorUndoReset {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorInit {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    last: PageId::new(24).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorInsert {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 0,
+                    raw: b"content",
+                    ptr: PageId::new(101).unwrap(),
+                    key_size: 2,
+                    overflow: None,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorInsert {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: u16::MAX as usize,
+                    raw: b"key00000",
+                    ptr: PageId::new(101).unwrap(),
+                    key_size: 123456789,
+                    overflow: PageId::new(202),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorDelete {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    old_raw: b"the_old_raw_content",
+                    old_ptr: PageId::new(10).unwrap(),
+                    old_overflow: None,
+                    old_key_size: 19,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorDelete {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                    old_raw: b"the_old_raw_content",
+                    old_ptr: PageId::new(10).unwrap(),
+                    old_overflow: PageId::new(1),
+                    old_key_size: 1000,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::InteriorUndoDelete {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(99).unwrap(),
+                    index: 17,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafReset {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                    page_version: 12,
+                    payload: b"this_is_just_a_dummy_bytes",
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafUndoReset {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(23).unwrap(),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafInsert {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 0,
+                    raw: b"key00000val00000",
+                    overflow: None,
+                    key_size: 8,
+                    value_size: 8,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafInsert {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 23,
+                    raw: b"key0",
+                    overflow: PageId::new(101),
+                    key_size: 8,
+                    value_size: 8,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafDelete {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                    old_raw: b"key0",
+                    old_overflow: PageId::new(101),
+                    old_key_size: 8,
+                    old_val_size: 8,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::LeafUndoDelete {
+                    txid: TxId::new(1011).unwrap(),
+                    pgid: PageId::new(100).unwrap(),
+                    index: 22,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::Checkpoint {
+                    active_tx: TxState::None,
+                    root: None,
+                    freelist: PageId::new(100),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::Checkpoint {
+                    active_tx: TxState::Active(TxId::new(12).unwrap()),
+                    root: PageId::new(100),
+                    freelist: None,
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::Checkpoint {
+                    active_tx: TxState::Committing(TxId::new(12).unwrap()),
+                    root: PageId::new(100),
+                    freelist: PageId::new(200),
+                },
+            },
+            WalEntry {
+                clr: Some(Lsn::new(99)),
+                kind: WalKind::Checkpoint {
+                    active_tx: TxState::Aborting {
+                        txid: TxId::new(12).unwrap(),
+                        last_undone: Lsn::new(11),
+                    },
+                    root: PageId::new(100),
+                    freelist: PageId::new(200),
+                },
+            },
+        ];
+
+        for testcase in testcases {
+            let mut buff = vec![0u8; testcase.size()];
+            testcase.encode(&mut buff);
+            let WalDecodeResult::Ok(decoded_entry) = WalEntry::decode(&buff) else {
+                panic!("decode fail");
+            };
+            assert_eq!(testcase, decoded_entry);
+        }
+    }
 }

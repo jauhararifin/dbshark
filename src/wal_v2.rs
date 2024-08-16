@@ -10,6 +10,8 @@ use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::spawn;
 
+const BUFFER_SIZE: usize = MAXIMUM_PAGE_SIZE * 20;
+
 pub(crate) struct Wal {
     f1: Arc<Mutex<WalFile>>,
     f2: Arc<Mutex<WalFile>>,
@@ -55,6 +57,49 @@ struct WalInternal {
 }
 
 impl Wal {
+    fn new(f1: WalFile, f2: WalFile, use_wal_1: bool, next_lsn: Lsn) -> Self {
+        let internal = Arc::new(RwLock::new(WalInternal {
+            temp_buffer: vec![0u8; MAXIMUM_PAGE_SIZE],
+            use_wal_1,
+            next: next_lsn,
+            first_unflushed: next_lsn,
+        }));
+        let f1 = Arc::new(Mutex::new(f1));
+        let f2 = Arc::new(Mutex::new(f2));
+        let buffer = Arc::new(RwLock::new(Buffer {
+            buff: vec![0u8; BUFFER_SIZE],
+            offset_start: 0,
+            offset_end: 0,
+        }));
+
+        let (flush_trigger, flush_signal) = std::sync::mpsc::sync_channel::<()>(0);
+        {
+            let internal = internal.clone();
+            let buffer = buffer.clone();
+            let f1 = f1.clone();
+            let f2 = f2.clone();
+            spawn(move || loop {
+                let result = flush_signal.recv_timeout(std::time::Duration::from_secs(3600));
+                if result == Err(RecvTimeoutError::Disconnected) {
+                    return;
+                }
+                let mut internal = internal.write();
+                let mut buffer = buffer.write();
+                if let Err(err) = Wal::flush(&mut internal, &mut buffer, &f1, &f2) {
+                    log::error!("wal_flush_error err={err}");
+                }
+            });
+        }
+
+        Wal {
+            f1,
+            f2,
+            buffer,
+            internal,
+            flush_trigger,
+        }
+    }
+
     pub(crate) fn complete_checkpoint(&self, checkpoint_lsn: Lsn) -> anyhow::Result<()> {
         self.sync(checkpoint_lsn)?;
 
@@ -248,7 +293,7 @@ where
         "recovering f1={f1:?} f2={f2:?} start_with_1={use_wal_1} checkpoint={checkpoint:?}"
     );
 
-    let mut buffer = vec![0u8; MAXIMUM_PAGE_SIZE * 20];
+    let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut next_lsn = Lsn::new(0);
     {
         let mut offset_start = 0;
@@ -313,54 +358,7 @@ where
         }
     }
 
-    let internal = Arc::new(RwLock::new(WalInternal {
-        temp_buffer: vec![0u8; MAXIMUM_PAGE_SIZE],
-        use_wal_1,
-        next: next_lsn,
-        first_unflushed: next_lsn,
-    }));
-    let f1 = Arc::new(Mutex::new(WalFile {
-        f: f1.f,
-        relative_lsn: f1.relative_lsn,
-        is_empty: f1.is_empty,
-    }));
-    let f2 = Arc::new(Mutex::new(WalFile {
-        f: f2.f,
-        relative_lsn: f2.relative_lsn,
-        is_empty: f2.is_empty,
-    }));
-    let buffer = Arc::new(RwLock::new(Buffer {
-        buff: buffer,
-        offset_start: 0,
-        offset_end: 0,
-    }));
-
-    let (flush_trigger, flush_signal) = std::sync::mpsc::sync_channel::<()>(0);
-    {
-        let internal = internal.clone();
-        let buffer = buffer.clone();
-        let f1 = f1.clone();
-        let f2 = f2.clone();
-        spawn(move || loop {
-            let result = flush_signal.recv_timeout(std::time::Duration::from_secs(3600));
-            if result == Err(RecvTimeoutError::Disconnected) {
-                return;
-            }
-            let mut internal = internal.write();
-            let mut buffer = buffer.write();
-            if let Err(err) = Wal::flush(&mut internal, &mut buffer, &f1, &f2) {
-                log::error!("wal_flush_error err={err}");
-            }
-        });
-    }
-
-    Ok(Wal {
-        f1,
-        f2,
-        buffer,
-        internal,
-        flush_trigger,
-    })
+    Ok(Wal::new(f1.into(), f2.into(), use_wal_1, next_lsn))
 }
 
 fn recover_wal_file(mut f: File) -> anyhow::Result<RecoveringWalFile> {
@@ -405,6 +403,16 @@ struct RecoveringWalFile {
     relative_lsn: u64,
     checkpoint: Option<Lsn>,
     is_empty: bool,
+}
+
+impl From<RecoveringWalFile> for WalFile {
+    fn from(value: RecoveringWalFile) -> Self {
+        Self {
+            f: value.f,
+            relative_lsn: value.relative_lsn,
+            is_empty: value.is_empty,
+        }
+    }
 }
 
 impl std::fmt::Debug for RecoveringWalFile {
@@ -488,7 +496,7 @@ mod tests {
         }
         let checkpoint_lsn = wal.append_log(WalEntry {
             clr: None,
-            kind: WalKind::CheckpointBegin {
+            kind: WalKind::Checkpoint {
                 active_tx: TxState::None,
                 root: PageId::new(123),
                 freelist: PageId::new(321),
@@ -522,7 +530,7 @@ mod tests {
 
             if !checkpoint_consumed {
                 assert_eq!(checkpoint_lsn, lsn);
-                let WalKind::CheckpointBegin {
+                let WalKind::Checkpoint {
                     ref active_tx,
                     root,
                     freelist,
@@ -565,7 +573,7 @@ mod tests {
         }
         let checkpoint_lsn = wal.append_log(WalEntry {
             clr: None,
-            kind: WalKind::CheckpointBegin {
+            kind: WalKind::Checkpoint {
                 active_tx: TxState::None,
                 root: PageId::new(123),
                 freelist: PageId::new(321),
@@ -619,7 +627,7 @@ mod tests {
 
             if !checkpoint_consumed {
                 assert_eq!(checkpoint_lsn, lsn);
-                let WalKind::CheckpointBegin {
+                let WalKind::Checkpoint {
                     ref active_tx,
                     root,
                     freelist,
@@ -653,7 +661,7 @@ mod tests {
         }
         let checkpoint_lsn = wal.append_log(WalEntry {
             clr: None,
-            kind: WalKind::CheckpointBegin {
+            kind: WalKind::Checkpoint {
                 active_tx: TxState::None,
                 root: None,
                 freelist: None,
@@ -697,7 +705,131 @@ mod tests {
 
             if !checkpoint_consumed {
                 assert_eq!(checkpoint_lsn, lsn);
-                let WalKind::CheckpointBegin {
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(None, root);
+                assert_eq!(None, freelist);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+        })?;
+        assert_eq!(41, i);
+        drop(wal);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_1_and_2_have_checkpoint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let dummy_entry = |i: u64| WalEntry {
+            clr: None,
+            kind: WalKind::LeafInit {
+                txid: TxId::new(i).unwrap(),
+                pgid: PageId::new(1000 + i).unwrap(),
+            },
+        };
+        let checkpoint_entry = || WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: TxState::None,
+                root: None,
+                freelist: None,
+            },
+        };
+
+        let wal = recover(dir.path(), |_, _| {})?;
+        for i in 1..=5 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 6..=10 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        for i in 11..=15 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 16..=20 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.trigger_flush()?;
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        drop(wal);
+
+        let mut i = 16;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(None, root);
+                assert_eq!(None, freelist);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+        })?;
+        assert_eq!(21, i);
+
+        for i in 21..=25 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 26..=30 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        for i in 31..=35 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 36..=40 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.trigger_flush()?;
+        wal.complete_checkpoint(checkpoint_lsn)?;
+
+        drop(wal);
+
+        let mut i = 36;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
                     ref active_tx,
                     root,
                     freelist,
@@ -742,7 +874,7 @@ mod tests {
 
                 if !checkpoint_consumed {
                     assert_eq!(last_checkpoint.unwrap(), lsn);
-                    let WalKind::CheckpointBegin {
+                    let WalKind::Checkpoint {
                         ref active_tx,
                         root,
                         freelist,
@@ -787,7 +919,7 @@ mod tests {
             }
             let checkpoint_lsn = wal.append_log(WalEntry {
                 clr: None,
-                kind: WalKind::CheckpointBegin {
+                kind: WalKind::Checkpoint {
                     active_tx: TxState::None,
                     root: None,
                     freelist: None,
@@ -837,6 +969,7 @@ mod tests {
         // test if the last entry is not completed.
         // case 1: the bytes are there, but the checksum is wrong
         // case 2: the bytes are not there
+        // might need to mock the file system
         // todo!();
         Ok(())
     }
