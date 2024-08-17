@@ -330,6 +330,7 @@ pub(crate) enum WalKind<'a> {
         active_tx: TxState,
         root: Option<PageId>,
         freelist: Option<PageId>,
+        page_count: u64,
     },
 }
 
@@ -458,7 +459,7 @@ impl<'a> WalKind<'a> {
             WalKind::OverflowUndoSetContent { .. } => 16,
             WalKind::OverflowSetNext { .. } => 32,
 
-            WalKind::Checkpoint { .. } => 40,
+            WalKind::Checkpoint { .. } => 48,
         }
     }
 
@@ -799,6 +800,7 @@ impl<'a> WalKind<'a> {
                 active_tx,
                 root,
                 freelist,
+                page_count,
             } => {
                 match active_tx {
                     TxState::None => {
@@ -821,6 +823,7 @@ impl<'a> WalKind<'a> {
                 }
                 buff[24..32].copy_from_slice(&root.to_be_bytes());
                 buff[32..40].copy_from_slice(&freelist.to_be_bytes());
+                buff[40..48].copy_from_slice(&page_count.to_be_bytes());
             }
         }
     }
@@ -1325,10 +1328,12 @@ impl<'a> WalKind<'a> {
 
                 let root = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
+                let page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
                 Ok(Self::Checkpoint {
                     active_tx,
                     root,
                     freelist,
+                    page_count,
                 })
             }
             _ => Err(anyhow!("invalid wal record kind {kind}")),
@@ -1340,7 +1345,7 @@ fn pad8(size: usize) -> usize {
     (size + 7) & !7
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub(crate) enum TxState {
     None,
     Active(TxId),
@@ -1795,6 +1800,7 @@ mod tests {
                     active_tx: TxState::None,
                     root: None,
                     freelist: PageId::new(100),
+                    page_count: 99,
                 },
             },
             WalEntry {
@@ -1803,6 +1809,7 @@ mod tests {
                     active_tx: TxState::Active(TxId::new(12).unwrap()),
                     root: PageId::new(100),
                     freelist: None,
+                    page_count: 99,
                 },
             },
             WalEntry {
@@ -1811,6 +1818,7 @@ mod tests {
                     active_tx: TxState::Committing(TxId::new(12).unwrap()),
                     root: PageId::new(100),
                     freelist: PageId::new(200),
+                    page_count: 99,
                 },
             },
             WalEntry {
@@ -1822,6 +1830,7 @@ mod tests {
                     },
                     root: PageId::new(100),
                     freelist: PageId::new(200),
+                    page_count: 99,
                 },
             },
         ];

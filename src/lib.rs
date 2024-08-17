@@ -28,6 +28,7 @@ mod id;
 mod log;
 mod pager;
 mod recovery;
+mod recovery_v2;
 mod wal;
 mod wal_v2;
 

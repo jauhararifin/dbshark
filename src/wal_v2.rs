@@ -250,7 +250,7 @@ impl Wal {
 
 pub(crate) fn recover<F>(path: &Path, mut handler: F) -> anyhow::Result<Wal>
 where
-    F: FnMut(Lsn, WalEntry),
+    F: FnMut(Lsn, WalEntry) -> anyhow::Result<()>,
 {
     let wal_path_1 = path.join("wal_1");
     let wal_file_1 = OpenOptions::new()
@@ -342,7 +342,7 @@ where
                     offset_start += entry_size;
                     current_lsn.add_assign(entry_size as u64);
                     next_lsn = current_lsn;
-                    handler(lsn, entry);
+                    handler(lsn, entry)?;
                 }
                 WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
                     let next_f = if use_wal_1 { &f2 } else { &f1 };
@@ -436,7 +436,7 @@ mod tests {
     fn test_flushing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover(dir.path(), |_, _| {})?;
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -473,6 +473,7 @@ mod tests {
             assert_eq!(TxId::new(i).unwrap(), txid);
             assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
             i += 1;
+            Ok(())
         })?;
         assert_eq!(11, i);
         drop(wal);
@@ -484,7 +485,7 @@ mod tests {
     fn test_checkpoint() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover(dir.path(), |_, _| {})?;
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -500,6 +501,7 @@ mod tests {
                 active_tx: TxState::None,
                 root: PageId::new(123),
                 freelist: PageId::new(321),
+                page_count: 99,
             },
         })?;
         for i in 11..=15 {
@@ -534,6 +536,7 @@ mod tests {
                     ref active_tx,
                     root,
                     freelist,
+                    page_count,
                 } = entry.kind
                 else {
                     panic!("the entry should be a checkpoint");
@@ -541,6 +544,7 @@ mod tests {
                 assert_eq!(TxState::None, *active_tx);
                 assert_eq!(PageId::new(123), root);
                 assert_eq!(PageId::new(321), freelist);
+                assert_eq!(99u64, page_count);
                 checkpoint_consumed = true;
             } else {
                 let WalKind::LeafInit { txid, pgid } = entry.kind else {
@@ -550,6 +554,8 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+
+            Ok(())
         })?;
         assert_eq!(16, i);
         drop(wal);
@@ -561,7 +567,7 @@ mod tests {
     fn test_recovering_from_wal_1_and_2() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover(dir.path(), |_, _| {})?;
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -577,6 +583,7 @@ mod tests {
                 active_tx: TxState::None,
                 root: PageId::new(123),
                 freelist: PageId::new(321),
+                page_count: 99,
             },
         })?;
         for i in 11..=15 {
@@ -631,6 +638,7 @@ mod tests {
                     ref active_tx,
                     root,
                     freelist,
+                    page_count,
                 } = entry.kind
                 else {
                     panic!("the entry should be a checkpoint");
@@ -638,6 +646,7 @@ mod tests {
                 assert_eq!(TxState::None, *active_tx);
                 assert_eq!(PageId::new(123), root);
                 assert_eq!(PageId::new(321), freelist);
+                assert_eq!(99u64, page_count);
                 checkpoint_consumed = true;
             } else {
                 let WalKind::LeafInit { txid, pgid } = entry.kind else {
@@ -647,6 +656,8 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+
+            Ok(())
         })?;
         assert_eq!(26, i);
 
@@ -665,6 +676,7 @@ mod tests {
                 active_tx: TxState::None,
                 root: None,
                 freelist: None,
+                page_count: 99,
             },
         })?;
         for i in 31..=35 {
@@ -709,6 +721,7 @@ mod tests {
                     ref active_tx,
                     root,
                     freelist,
+                    page_count,
                 } = entry.kind
                 else {
                     panic!("the entry should be a checkpoint");
@@ -716,6 +729,7 @@ mod tests {
                 assert_eq!(TxState::None, *active_tx);
                 assert_eq!(None, root);
                 assert_eq!(None, freelist);
+                assert_eq!(99u64, page_count);
                 checkpoint_consumed = true;
             } else {
                 let WalKind::LeafInit { txid, pgid } = entry.kind else {
@@ -725,6 +739,8 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+
+            Ok(())
         })?;
         assert_eq!(41, i);
         drop(wal);
@@ -749,10 +765,11 @@ mod tests {
                 active_tx: TxState::None,
                 root: None,
                 freelist: None,
+                page_count: 99,
             },
         };
 
-        let wal = recover(dir.path(), |_, _| {})?;
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
         for i in 1..=5 {
             wal.append_log(dummy_entry(i))?;
         }
@@ -783,6 +800,7 @@ mod tests {
                     ref active_tx,
                     root,
                     freelist,
+                    page_count,
                 } = entry.kind
                 else {
                     panic!("the entry should be a checkpoint");
@@ -790,6 +808,7 @@ mod tests {
                 assert_eq!(TxState::None, *active_tx);
                 assert_eq!(None, root);
                 assert_eq!(None, freelist);
+                assert_eq!(99u64, page_count);
                 checkpoint_consumed = true;
             } else {
                 let WalKind::LeafInit { txid, pgid } = entry.kind else {
@@ -799,6 +818,8 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+
+            Ok(())
         })?;
         assert_eq!(21, i);
 
@@ -833,6 +854,7 @@ mod tests {
                     ref active_tx,
                     root,
                     freelist,
+                    page_count,
                 } = entry.kind
                 else {
                     panic!("the entry should be a checkpoint");
@@ -840,6 +862,7 @@ mod tests {
                 assert_eq!(TxState::None, *active_tx);
                 assert_eq!(None, root);
                 assert_eq!(None, freelist);
+                assert_eq!(99u64, page_count);
                 checkpoint_consumed = true;
             } else {
                 let WalKind::LeafInit { txid, pgid } = entry.kind else {
@@ -849,6 +872,8 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+
+            Ok(())
         })?;
         assert_eq!(41, i);
         drop(wal);
@@ -878,6 +903,7 @@ mod tests {
                         ref active_tx,
                         root,
                         freelist,
+                        page_count,
                     } = entry.kind
                     else {
                         panic!(
@@ -888,12 +914,15 @@ mod tests {
                     assert_eq!(TxState::None, *active_tx);
                     assert_eq!(None, root);
                     assert_eq!(None, freelist);
+                    assert_eq!(99u64, page_count);
                     checkpoint_consumed = true;
                 } else {
                     let WalKind::LeafInit { .. } = entry.kind else {
                         panic!("the entry should be a leaf init");
                     };
                 }
+
+                Ok(())
             })?;
 
             for _ in 0..r.gen_range(1..=8000) {
@@ -923,6 +952,7 @@ mod tests {
                     active_tx: TxState::None,
                     root: None,
                     freelist: None,
+                    page_count: 99,
                 },
             })?;
             for _ in 0..r.gen_range(1..=8000) {
