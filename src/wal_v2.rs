@@ -1,5 +1,5 @@
 use crate::id::Lsn;
-use crate::log::{WalDecodeResult, WalEntry, WalHeader, WAL_HEADER_SIZE};
+use crate::log::{TxState, WalDecodeResult, WalEntry, WalHeader, WAL_HEADER_SIZE};
 use crate::pager::MAXIMUM_PAGE_SIZE;
 use anyhow::{anyhow, Context};
 use parking_lot::{Mutex, RwLock};
@@ -24,21 +24,22 @@ struct WalFile {
     f: File,
     relative_lsn: u64,
     is_empty: bool,
+    checkpoint: bool,
 }
 
 struct Buffer {
     buff: Vec<u8>,
-    offset_start: usize,
-    offset_end: usize,
+    start_offset: usize,
+    end_offset: usize,
 }
 
 impl Buffer {
     #[inline]
     fn len(&self) -> usize {
-        if self.offset_start <= self.offset_end {
-            self.offset_end - self.offset_start
+        if self.start_offset <= self.end_offset {
+            self.end_offset - self.start_offset
         } else {
-            self.offset_end + self.buff.len() - self.offset_start
+            self.end_offset + self.buff.len() - self.start_offset
         }
     }
 
@@ -68,8 +69,8 @@ impl Wal {
         let f2 = Arc::new(Mutex::new(f2));
         let buffer = Arc::new(RwLock::new(Buffer {
             buff: vec![0u8; BUFFER_SIZE],
-            offset_start: 0,
-            offset_end: 0,
+            start_offset: 0,
+            end_offset: 0,
         }));
 
         let (flush_trigger, flush_signal) = std::sync::mpsc::sync_channel::<()>(0);
@@ -100,6 +101,10 @@ impl Wal {
         }
     }
 
+    pub(crate) fn end_transaction(&self) {
+        todo!();
+    }
+
     pub(crate) fn complete_checkpoint(&self, checkpoint_lsn: Lsn) -> anyhow::Result<()> {
         self.sync(checkpoint_lsn)?;
 
@@ -126,15 +131,34 @@ impl Wal {
         old_f.f.write_all(&buff)?;
         old_f.f.sync_all()?;
         old_f.is_empty = false;
+        old_f.checkpoint = true;
+
+        Self::maybe_swap_wal(&old_f, new_f, internal, false);
+
+        Ok(())
+    }
+
+    fn maybe_swap_wal(
+        old_f: &WalFile,
+        new_f: &Mutex<WalFile>,
+        internal: &mut WalInternal,
+        no_undoable_tx: bool,
+    ) {
+        let has_checkpoint = old_f.checkpoint;
+        if !has_checkpoint || no_undoable_tx {
+            log::debug!(
+                "wal_is_not_swapped has_checkpoint={has_checkpoint} no_undoable_tx={no_undoable_tx}"
+            );
+            return;
+        }
 
         // the new wal file is marked empty so that the next time we flush to it,
         // everything is resetted.
         let mut new_f = new_f.lock();
         internal.use_wal_1 = !internal.use_wal_1;
         new_f.is_empty = true;
+        new_f.checkpoint = false;
         new_f.relative_lsn = internal.first_unflushed.get();
-
-        Ok(())
     }
 
     pub(crate) fn append_log(&self, entry: WalEntry<'_>) -> anyhow::Result<Lsn> {
@@ -148,17 +172,17 @@ impl Wal {
             Self::flush(internal, &mut buffer, &self.f1, &self.f2)?;
         }
 
-        let offset_end = buffer.offset_end;
-        if offset_end + size > buffer.size() {
-            let part1 = buffer.size() - offset_end;
+        let end_offset = buffer.end_offset;
+        if end_offset + size > buffer.size() {
+            let part1 = buffer.size() - end_offset;
             let part2 = size - part1;
             entry.encode(&mut internal.temp_buffer[..size]);
-            buffer.buff[offset_end..].copy_from_slice(&internal.temp_buffer[..part1]);
+            buffer.buff[end_offset..].copy_from_slice(&internal.temp_buffer[..part1]);
             buffer.buff[..part2].copy_from_slice(&internal.temp_buffer[part1..size]);
-            buffer.offset_end = part2;
+            buffer.end_offset = part2;
         } else {
-            entry.encode(&mut buffer.buff[offset_end..offset_end + size]);
-            buffer.offset_end += size;
+            entry.encode(&mut buffer.buff[end_offset..end_offset + size]);
+            buffer.end_offset += size;
         }
         let lsn = internal.next;
         internal.next.add_assign(size as u64);
@@ -181,10 +205,11 @@ impl Wal {
         let mut f = f.lock();
 
         log::debug!(
-            "flushing_wal use_wal_1={} len={} is_empty={} relative_lsn={}",
+            "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={}",
             internal.use_wal_1,
             buffer.len(),
             f.is_empty,
+            f.checkpoint,
             f.relative_lsn,
         );
 
@@ -206,20 +231,21 @@ impl Wal {
         let offset = internal.first_unflushed.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2;
         f.f.seek(SeekFrom::Start(offset))?;
 
-        if buffer.offset_end < buffer.offset_start {
-            f.f.write_all(&buffer.buff[buffer.offset_start..])?;
-            f.f.write_all(&buffer.buff[..buffer.offset_end])?;
+        if buffer.end_offset < buffer.start_offset {
+            f.f.write_all(&buffer.buff[buffer.start_offset..])?;
+            f.f.write_all(&buffer.buff[..buffer.end_offset])?;
         } else {
-            f.f.write_all(&buffer.buff[buffer.offset_start..buffer.offset_end])?;
+            f.f.write_all(&buffer.buff[buffer.start_offset..buffer.end_offset])?;
         }
         f.f.sync_all()?;
 
-        buffer.offset_start = buffer.offset_end;
+        buffer.start_offset = buffer.end_offset;
         internal.first_unflushed = internal.next;
 
         Ok(())
     }
 
+    #[cfg(test)]
     fn trigger_flush(&self) -> anyhow::Result<()> {
         Wal::flush(
             &mut self.internal.write(),
@@ -247,10 +273,68 @@ impl Wal {
         Ok(())
     }
 
+    // pub(crate) fn iter_back(&self, upper_bound: Lsn) {
+    //     let wal_buffer = self.buffer.read();
+    //     let internal = self.internal.read();
+    //     let mut buffer = vec![0u8; wal_buffer.size()];
+    //     let buffer_len = buffer.len();
+    //
+    //     let filled = if upper_bound > internal.first_unflushed {
+    //         let offset = upper_bound.get() - internal.first_unflushed.get();
+    //         let to_copy = &wal_buffer.buff[..offset as usize];
+    //         buffer[buffer_len - to_copy.len()..].copy_from_slice(to_copy);
+    //         to_copy.len()
+    //     } else {
+    //         buffer_len
+    //     };
+    //     drop(internal);
+    //
+    //     let mut lsn = upper_bound;
+    //     let mut start_offset = buffer_len - filled;
+    //     let mut end_offset = buffer_len;
+    //
+    //     loop {
+    //         let internal = self.internal.read();
+    //         let mut entry = WalEntry::decode_backward(&buffer[start_offset..end_offset]);
+    //         let f = if internal.use_wal_1 { &mut f1 } else { &mut f2 };
+    //         if let WalDecodeResult::NeedMoreBytes = entry {
+    //             let len = end_offset - start_offset;
+    //             for i in 0..len {
+    //                 buffer[buffer_len - 1 - i] = buffer[end_offset - 1 - i];
+    //             }
+    //             start_offset = buffer_len - len;
+    //             end_offset = buffer_len;
+    //         }
+    //     }
+    // }
+
     pub(crate) fn shutdown(self) -> anyhow::Result<()> {
-        todo!();
+        Ok(())
     }
 }
+
+pub(crate) struct WalBackwardIterator<'a> {
+    wal: &'a Wal,
+
+    lsn: Lsn,
+    buffer: Vec<u8>,
+    start_offset: usize,
+    end_offset: usize,
+}
+
+// impl<'a> WalBackwardIterator<'a> {
+//     pub(crate) fn next(&mut self) -> anyhow::Result<Option<(Lsn, WalEntry)>> {
+//         let mut entry = WalEntry::decode_backward(&self.buffer[self.start_offset..self.end_offset]);
+//         if let WalDecodeResult::NeedMoreBytes = entry {
+//             let len = self.end_offset - self.start_offset;
+//             for i in 0..len {
+//                 self.buffer[self.buffer.len() - 1 - i] = self.buffer[self.end_offset - 1 - i];
+//             }
+//         }
+//
+//         todo!();
+//     }
+// }
 
 pub(crate) fn recover<F>(path: &Path, mut handler: F) -> anyhow::Result<Wal>
 where
@@ -300,22 +384,22 @@ where
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut next_lsn = Lsn::new(0);
     {
-        let mut offset_start = 0;
-        let mut offset_end = 0;
+        let mut start_offset = 0;
+        let mut end_offset = 0;
         let mut current_lsn = checkpoint;
         loop {
-            let buff = &buffer[offset_start..offset_end];
+            let buff = &buffer[start_offset..end_offset];
             let mut entry = WalEntry::decode(buff);
 
             let f = if use_wal_1 { &mut f1 } else { &mut f2 };
 
             if let WalDecodeResult::NeedMoreBytes = entry {
-                let len = offset_end - offset_start;
+                let len = end_offset - start_offset;
                 for i in 0..len {
-                    buffer[i] = buffer[offset_start + i];
+                    buffer[i] = buffer[start_offset + i];
                 }
-                offset_start = 0;
-                offset_end = len;
+                start_offset = 0;
+                end_offset = len;
 
                 if f.is_empty {
                     break;
@@ -323,27 +407,27 @@ where
                 f.f.seek(SeekFrom::Start(
                     current_lsn.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2 + len as u64,
                 ))?;
-                let n = f.f.read(&mut buffer[offset_end..])?;
+                let n = f.f.read(&mut buffer[end_offset..])?;
                 if n == 0 {
                     let next_f = if use_wal_1 { &f2 } else { &f1 };
                     if next_f.relative_lsn < current_lsn.get() {
                         break;
                     }
                     use_wal_1 = !use_wal_1;
-                    offset_start = 0;
-                    offset_end = 0;
+                    start_offset = 0;
+                    end_offset = 0;
                     continue;
                 }
 
-                offset_end += n;
-                entry = WalEntry::decode(&buffer[offset_start..offset_end]);
+                end_offset += n;
+                entry = WalEntry::decode(&buffer[start_offset..end_offset]);
             };
 
             match entry {
                 WalDecodeResult::Ok(entry) => {
                     let lsn = current_lsn;
                     let entry_size = entry.size();
-                    offset_start += entry_size;
+                    start_offset += entry_size;
                     current_lsn.add_assign(entry_size as u64);
                     next_lsn = current_lsn;
                     handler(lsn, entry)?;
@@ -354,8 +438,8 @@ where
                         break;
                     }
                     use_wal_1 = !use_wal_1;
-                    offset_start = 0;
-                    offset_end = 0;
+                    start_offset = 0;
+                    end_offset = 0;
                 }
                 WalDecodeResult::Err(err) => return Err(err),
             }
@@ -415,6 +499,7 @@ impl From<RecoveringWalFile> for WalFile {
             f: value.f,
             relative_lsn: value.relative_lsn,
             is_empty: value.is_empty,
+            checkpoint: value.checkpoint.is_some(),
         }
     }
 }
@@ -433,7 +518,7 @@ impl std::fmt::Debug for RecoveringWalFile {
 mod tests {
     use super::*;
     use crate::id::{PageId, TxId};
-    use crate::log::{TxState, WalKind};
+    use crate::log::WalKind;
     use rand::Rng;
 
     #[test]

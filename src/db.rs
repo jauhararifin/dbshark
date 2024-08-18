@@ -1,3 +1,4 @@
+use crate::bins::SliceExt;
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
@@ -323,15 +324,14 @@ impl Header {
 
     fn decode(buff: &[u8]) -> Option<Self> {
         let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..DB_HEADER_SIZE - 8]);
-        let checksum =
-            u64::from_be_bytes(buff[DB_HEADER_SIZE - 8..DB_HEADER_SIZE].try_into().unwrap());
+        let checksum = buff[DB_HEADER_SIZE - 8..].read_u64();
 
         if calculated_checksum != checksum {
             return None;
         }
 
-        let version = u32::from_be_bytes(buff[8..12].try_into().unwrap());
-        let page_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
+        let version = buff[8..].read_u32();
+        let page_size = buff[12..].read_u32();
 
         Some(Self { version, page_size })
     }

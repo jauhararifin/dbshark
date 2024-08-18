@@ -1,3 +1,4 @@
+use crate::bins::SliceExt;
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId, TxIdExt};
 use anyhow::anyhow;
 
@@ -12,11 +13,11 @@ pub(crate) struct WalHeader {
 
 impl WalHeader {
     pub(crate) fn decode(buff: &[u8]) -> Option<Self> {
-        let version = u16::from_be_bytes(buff[6..8].try_into().unwrap());
-        let relative_lsn = u64::from_be_bytes(buff[8..16].try_into().unwrap());
+        let version = buff[6..8].read_u16();
+        let relative_lsn = buff[8..16].read_u64();
         let checkpoint = Lsn::from_be_bytes(buff[16..24].try_into().unwrap());
 
-        let stored_checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
+        let stored_checksum = buff[24..32].read_u64();
         let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..24]);
         if stored_checksum != calculated_checksum {
             return None;
@@ -94,7 +95,7 @@ impl WalEntry<'_> {
         }
 
         let clr = Lsn::from_be_bytes(buff[0..8].try_into().unwrap());
-        let kind_size = u16::from_be_bytes(buff[8..10].try_into().unwrap()) as usize;
+        let kind_size = buff[8..10].read_u16() as usize;
         let kind = buff[10];
 
         let total_length = Self::size_by_kind_size(kind_size);
@@ -109,7 +110,7 @@ impl WalEntry<'_> {
         };
         let next = pad8(16 + kind_size);
 
-        let record_size_2 = u16::from_be_bytes(buff[next..next + 2].try_into().unwrap());
+        let record_size_2 = buff[next..next + 2].read_u16();
         assert_eq!(kind_size, record_size_2 as usize);
 
         let magic_bytes = &buff[next + 2..next + 8];
@@ -117,7 +118,7 @@ impl WalEntry<'_> {
 
         let next = pad8(next + 2);
         let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..next]);
-        let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
+        let stored_checksum = buff[next..next + 8].read_u64();
         if calculated_checksum != stored_checksum {
             return WalDecodeResult::Incomplete;
         }
@@ -130,11 +131,7 @@ impl WalEntry<'_> {
             return WalDecodeResult::NeedMoreBytes;
         }
 
-        let kind_size = u16::from_be_bytes(
-            buff[buff.len() - 16..buff.len() - 16 + 2]
-                .try_into()
-                .unwrap(),
-        );
+        let kind_size = buff[buff.len() - 16..].read_u16();
         let size = Self::size_by_kind_size(kind_size as usize);
         println!("kind size={kind_size} total_size={size}");
         if buff.len() < size {
@@ -877,8 +874,8 @@ impl<'a> WalKind<'a> {
                 let old_root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
                 let old_freelist = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[32..40].try_into().unwrap());
-                let old_page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
+                let page_count = buff[32..40].read_u64();
+                let old_page_count = buff[40..48].read_u64();
                 Ok(Self::HeaderSet {
                     root,
                     old_root,
@@ -894,7 +891,7 @@ impl<'a> WalKind<'a> {
                 };
                 let root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[24..32].try_into().unwrap());
+                let page_count = buff[24..32].read_u64();
                 Ok(Self::HeaderUndoSet {
                     txid,
                     root,
@@ -928,8 +925,8 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let page_version = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
+                let page_version = buff[16..18].read_u16();
+                let size = buff[18..20].read_u16();
                 Ok(Self::InteriorReset {
                     txid,
                     pgid,
@@ -953,8 +950,8 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let page_version = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
+                let page_version = buff[16..18].read_u16();
+                let size = buff[18..20].read_u16();
                 Ok(Self::InteriorSet {
                     txid,
                     pgid,
@@ -981,9 +978,9 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let key_size = u32::from_be_bytes(buff[16..20].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[20..22].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[22..24].try_into().unwrap());
+                let key_size = buff[16..20].read_u32();
+                let raw_size = buff[20..22].read_u16();
+                let index = buff[22..24].read_u16();
                 let Some(ptr) = PageId::from_be_bytes(buff[24..32].try_into().unwrap()) else {
                     return Err(anyhow!("zero pointer in interior cell"));
                 };
@@ -1005,9 +1002,9 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let key_size = u32::from_be_bytes(buff[16..20].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[20..22].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[22..24].try_into().unwrap());
+                let key_size = buff[16..20].read_u32();
+                let raw_size = buff[20..22].read_u16();
+                let index = buff[22..24].read_u16();
                 let Some(old_ptr) = PageId::from_be_bytes(buff[24..32].try_into().unwrap()) else {
                     return Err(anyhow!("zero pointer in interior cell"));
                 };
@@ -1860,8 +1857,11 @@ mod tests {
 
             for i in 0..buff.len() - 1 {
                 let result = WalEntry::decode(&buff[..i]);
-                assert!(matches!(result, WalDecodeResult::NeedMoreBytes), "decode {testcase:?} result should be need more bytes, but got {result:?}");
-                let result = WalEntry::decode_backward(&buff[testcase.size()-i..]);
+                assert!(
+                    matches!(result, WalDecodeResult::NeedMoreBytes),
+                    "decode {testcase:?} result should be need more bytes, but got {result:?}"
+                );
+                let result = WalEntry::decode_backward(&buff[testcase.size() - i..]);
                 assert!(matches!(result, WalDecodeResult::NeedMoreBytes), "decode backward {testcase:?} result should be need more bytes, but got {result:?}");
             }
         }

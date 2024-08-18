@@ -1,3 +1,4 @@
+use crate::bins::SliceExt;
 use crate::content::{Bytes, Content};
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
@@ -873,11 +874,11 @@ impl Pager {
         let buff_checksum_content = &buff[..page_size - PAGE_FOOTER_SIZE];
 
         let checksum = crc64::crc64(0x1d0f, buff_checksum_content);
-        let page_sum = u64::from_be_bytes(buff_checksum.try_into().unwrap());
+        let page_sum = buff_checksum.read_u64();
         if checksum != page_sum {
             return Ok(false);
         }
-        let version = u16::from_be_bytes(buff_version.try_into().unwrap());
+        let version = buff_version.read_u16();
         if version != 0 {
             return Err(anyhow!("page version {} is not supported", version));
         }
@@ -913,8 +914,8 @@ impl Pager {
         let Some(last) = PageId::from_be_bytes(buff_last.try_into().unwrap()) else {
             return Err(anyhow!("got zero last ptr on interior page"));
         };
-        let count = u16::from_be_bytes(buff_count.try_into().unwrap());
-        let offset = u16::from_be_bytes(buff_offset.try_into().unwrap());
+        let count = buff_count.read_u16();
+        let offset = buff_offset.read_u16();
 
         let mut remaining = payload.len() - INTERIOR_PAGE_HEADER_SIZE;
         for i in 0..count {
@@ -944,8 +945,8 @@ impl Pager {
         let buff_offset = &header[LEAF_HEADER_OFFSET_RANGE];
 
         let next = PageId::from_be_bytes(buff_next.try_into().unwrap());
-        let count = u16::from_be_bytes(buff_count.try_into().unwrap());
-        let offset = u16::from_be_bytes(buff_offset.try_into().unwrap());
+        let count = buff_count.read_u16();
+        let offset = buff_offset.read_u16();
 
         let mut remaining = payload.len() - LEAF_PAGE_HEADER_SIZE;
         for i in 0..count {
@@ -970,7 +971,7 @@ impl Pager {
         let buff_size = &header[OVERFLOW_HEADER_SIZE_RANGE];
 
         let next = PageId::from_be_bytes(buff_next.try_into().unwrap());
-        let size = u16::from_be_bytes(buff_size.try_into().unwrap());
+        let size = buff_size.read_u16();
 
         Ok(PageKind::Overflow {
             next,
@@ -987,7 +988,7 @@ impl Pager {
         let buff_count = &header[FREELIST_HEADER_COUNT_RANGE];
 
         let next = PageId::from_be_bytes(buff_next.try_into().unwrap());
-        let count = u16::from_be_bytes(buff_count.try_into().unwrap());
+        let count = buff_count.read_u16();
 
         Ok(PageKind::Freelist {
             next,
@@ -1537,8 +1538,8 @@ impl<'a> InteriorPageRead<'a> {
 fn get_interior_cell(buff: &[u8], index: usize) -> InteriorCell<'_> {
     let cell_offset = INTERIOR_PAGE_HEADER_SIZE + INTERIOR_CELL_SIZE * index;
     let cell = &buff[cell_offset..cell_offset + INTERIOR_CELL_SIZE];
-    let offset = u16::from_be_bytes(cell[INTERIOR_CELL_OFFSET_RANGE].try_into().unwrap()) as usize;
-    let size = u16::from_be_bytes(cell[INTERIOR_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
+    let offset = cell[INTERIOR_CELL_OFFSET_RANGE].read_u16() as usize;
+    let size = cell[INTERIOR_CELL_SIZE_RANGE].read_u16() as usize;
     let offset = offset - PAGE_HEADER_SIZE;
     let raw = &buff[offset..offset + size];
     InteriorCell { cell, raw }
@@ -1573,7 +1574,7 @@ impl<'a> BTreeCell<'a> for InteriorCell<'a> {
     }
 
     fn key_size(&self) -> usize {
-        u32::from_be_bytes(self.cell[INTERIOR_CELL_KEY_SIZE_RANGE].try_into().unwrap()) as usize
+        self.cell[INTERIOR_CELL_KEY_SIZE_RANGE].read_u32() as usize
     }
 
     fn overflow(&self) -> Option<PageId> {
@@ -2125,10 +2126,8 @@ impl<'a> InteriorPageWrite<'a> {
             &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
             index,
         );
-        let content_offset =
-            u16::from_be_bytes(cell.cell[INTERIOR_CELL_OFFSET_RANGE].try_into().unwrap()) as usize;
-        let content_size =
-            u16::from_be_bytes(cell.cell[INTERIOR_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
+        let content_offset = cell.cell[INTERIOR_CELL_OFFSET_RANGE].read_u16() as usize;
+        let content_size = cell.cell[INTERIOR_CELL_SIZE_RANGE].read_u16() as usize;
 
         self.0.meta.lsn = Some(record_mutation(
             ctx,
@@ -2342,10 +2341,8 @@ impl<'a> LeafPageWrite<'a> {
             &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
             index,
         );
-        let content_offset =
-            u16::from_be_bytes(cell.cell[LEAF_CELL_OFFSET_RANGE].try_into().unwrap()) as usize;
-        let content_size =
-            u16::from_be_bytes(cell.cell[LEAF_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
+        let content_offset = cell.cell[LEAF_CELL_OFFSET_RANGE].read_u16() as usize;
+        let content_size = cell.cell[LEAF_CELL_SIZE_RANGE].read_u16() as usize;
 
         self.0.meta.lsn = Some(record_mutation(
             ctx,
@@ -2796,13 +2793,13 @@ impl<'a> LeafPageWrite<'a> {
 fn get_leaf_cell(payload: &[u8], index: usize) -> LeafCell<'_> {
     let cell_offset = LEAF_PAGE_HEADER_SIZE + LEAF_CELL_SIZE * index;
     let cell = &payload[cell_offset..cell_offset + LEAF_CELL_SIZE];
-    let offset = u16::from_be_bytes(cell[LEAF_CELL_OFFSET_RANGE].try_into().unwrap()) as usize;
+    let offset = cell[LEAF_CELL_OFFSET_RANGE].read_u16() as usize;
     assert!(
         offset >= PAGE_HEADER_SIZE,
         "cannot get leaf cell {index}, offset={offset} page_header_size={PAGE_HEADER_SIZE} cell={cell:x?} payload={payload:x?}",
     );
     let offset = offset - PAGE_HEADER_SIZE;
-    let size = u16::from_be_bytes(cell[LEAF_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
+    let size = cell[LEAF_CELL_SIZE_RANGE].read_u16() as usize;
     assert!(
         offset + size <= payload.len(),
         "offset + size is overflow. offset={offset} size={size}"
@@ -2824,7 +2821,7 @@ impl<'a> BTreeCell<'a> for LeafCell<'a> {
     }
 
     fn key_size(&self) -> usize {
-        u32::from_be_bytes(self.cell[LEAF_CELL_KEY_SIZE_RANGE].try_into().unwrap()) as usize
+        self.cell[LEAF_CELL_KEY_SIZE_RANGE].read_u32() as usize
     }
 
     fn overflow(&self) -> Option<PageId> {
