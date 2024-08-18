@@ -4,7 +4,7 @@ use crate::pager::{
     BTreeCell, BTreePage, InteriorPageWrite, LeafCell, LeafPageRead, LeafPageWrite, LogContext,
     OverflowPageRead, PageWrite, Pager,
 };
-use crate::wal::Wal;
+use crate::wal_v2::Wal;
 use anyhow::anyhow;
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};

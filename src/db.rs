@@ -1,8 +1,9 @@
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
 use crate::id::{PageId, PageIdExt, TxId};
+use crate::log::{TxState, WalEntry, WalKind};
 use crate::pager::{DbState, LogContext, Pager};
-use crate::recovery::{recover, undo_txn};
-use crate::wal::{TxState, Wal, WalRecord};
+use crate::recovery_v2::{recover, undo_txn};
+use crate::wal_v2::Wal;
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
@@ -63,7 +64,6 @@ impl Db {
 
         log::debug!("opening db on {path:?}");
         let db_path = path.join("main");
-        let wal_path = path.join("wal");
         let double_buff_path = path.join("dbuff");
 
         // TODO(important): The files here are not locked. In order to prevent corruption, only
@@ -95,16 +95,7 @@ impl Db {
         let page_size = header.page_size as usize;
         let pager = Arc::new(Pager::new(db_file, double_buff_file, page_size, 1000)?);
 
-        let wal_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(wal_path)?;
-        if !wal_file.metadata()?.is_file() {
-            return Err(anyhow!("wal file is not a regular file"));
-        }
-        let result = recover(wal_file, &pager, page_size)?;
+        let result = recover(path, &pager)?;
         let wal = Arc::new(result.wal);
 
         let next_txid = AtomicU64::new(result.next_txid.get());
@@ -210,10 +201,12 @@ impl Db {
             TxState::Active(txid) => {
                 log::debug!("previous transaction {txid:?} is not closed yet");
 
-                let lsn = self.wal.append(txid, None, WalRecord::Rollback)?;
+                let lsn = self.wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::Rollback { txid },
+                })?;
                 *tx_state = TxState::Aborting {
                     txid,
-                    rollback: lsn,
                     last_undone: lsn,
                 };
                 let TxState::Aborting {
@@ -224,26 +217,37 @@ impl Db {
                     unreachable!();
                 };
 
-                undo_txn(&self.pager, &self.wal, txid, lsn, last_undone)?;
-                self.wal.append(txid, None, WalRecord::End)?;
+                undo_txn(&self.pager, &self.wal, txid, last_undone)?;
+                self.wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::End { txid },
+                })?;
                 *tx_state = TxState::None;
                 Ok(())
             }
             TxState::Aborting {
                 txid,
-                rollback,
                 ref mut last_undone,
             } => {
                 log::debug!("continue aborting previous transaction {txid:?}");
 
-                undo_txn(&self.pager, &self.wal, txid, rollback, last_undone)?;
-                self.wal.append(txid, None, WalRecord::End)?;
+                undo_txn(&self.pager, &self.wal, txid, last_undone)?;
+                self.wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::End { txid },
+                })?;
                 *tx_state = TxState::None;
                 Ok(())
             }
             TxState::Committing(txid) => {
-                let commit_lsn = self.wal.append(txid, None, WalRecord::Commit)?;
-                self.wal.append(txid, None, WalRecord::End)?;
+                let commit_lsn = self.wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::Commit { txid },
+                })?;
+                self.wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::End { txid },
+                })?;
                 self.wal.sync(commit_lsn)?;
                 *tx_state = TxState::None;
                 Ok(())
@@ -352,7 +356,10 @@ impl<'db> Tx<'db> {
             _tx_guard: tx_guard,
             tx_state: &db.tx_state,
         };
-        tx.wal.append(tx.id, None, WalRecord::Begin)?;
+        tx.wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Begin { txid: tx.id },
+        })?;
         Ok(tx)
     }
 
@@ -396,7 +403,6 @@ impl<'db> Tx<'db> {
             let page = self.pager.alloc(LogContext::Runtime(&self.wal), self.id)?;
             let pgid = page.id();
             self.pager.set_db_state(
-                self.id,
                 LogContext::Runtime(&self.wal),
                 DbState {
                     root: Some(pgid),
@@ -412,8 +418,14 @@ impl<'db> Tx<'db> {
     pub fn commit(self) -> anyhow::Result<()> {
         let mut tx_state = self.tx_state.write();
         assert_eq!(*tx_state, TxState::Active(self.id));
-        let commit_lsn = self.wal.append(self.id, None, WalRecord::Commit)?;
-        self.wal.append(self.id, None, WalRecord::End)?;
+        let commit_lsn = self.wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Commit { txid: self.id },
+        })?;
+        self.wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End { txid: self.id },
+        })?;
         *tx_state = TxState::None;
         drop(tx_state);
 
@@ -424,12 +436,14 @@ impl<'db> Tx<'db> {
     pub fn rollback(self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
-        let lsn = self.wal.append(self.id, None, WalRecord::Rollback)?;
+        let lsn = self.wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Rollback { txid: self.id },
+        })?;
         let mut tx_state = self.tx_state.write();
         assert_eq!(*tx_state, TxState::Active(self.id));
         *tx_state = TxState::Aborting {
             txid: self.id,
-            rollback: lsn,
             last_undone: lsn,
         };
         let TxState::Aborting {
@@ -440,7 +454,7 @@ impl<'db> Tx<'db> {
             unreachable!();
         };
 
-        undo_txn(&self.pager, &self.wal, self.id, lsn, last_undone)?;
+        undo_txn(&self.pager, &self.wal, self.id, last_undone)?;
         *tx_state = TxState::None;
 
         Ok(())

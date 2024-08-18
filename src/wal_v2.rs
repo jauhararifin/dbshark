@@ -246,6 +246,10 @@ impl Wal {
         Self::flush(&mut internal, &mut buffer, &self.f1, &self.f2)?;
         Ok(())
     }
+
+    pub(crate) fn shutdown(self) -> anyhow::Result<()> {
+        todo!();
+    }
 }
 
 pub(crate) fn recover<F>(path: &Path, mut handler: F) -> anyhow::Result<Wal>

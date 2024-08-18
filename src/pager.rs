@@ -1,6 +1,7 @@
 use crate::content::{Bytes, Content};
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId};
-use crate::wal::{Wal, WalRecord, TxState};
+use crate::log::{TxState, WalEntry, WalKind};
+use crate::wal_v2::Wal;
 use anyhow::anyhow;
 use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -22,6 +23,14 @@ pub(crate) enum LogContext<'a> {
 impl LogContext<'_> {
     fn is_undo(&self) -> bool {
         matches!(self, Self::Undo(..))
+    }
+
+    fn clr(&self) -> Option<Lsn> {
+        if let Self::Undo(_, lsn) = self {
+            Some(*lsn)
+        } else {
+            None
+        }
     }
 }
 
@@ -323,7 +332,6 @@ impl Pager {
 
     pub(crate) fn set_db_state(
         &self,
-        txid: TxId,
         ctx: LogContext<'_>,
         db_state: DbState,
     ) -> anyhow::Result<()> {
@@ -337,23 +345,28 @@ impl Pager {
         };
 
         record_mutation(
-            txid,
             ctx,
-            WalRecord::HeaderSet {
-                root: db_state.root,
-                freelist: db_state.freelist,
-                page_count: db_state.page_count,
-                old_root,
-                old_freelist,
-                old_page_count,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::HeaderSet {
+                    root: db_state.root,
+                    freelist: db_state.freelist,
+                    page_count: db_state.page_count,
+                    old_root,
+                    old_freelist,
+                    old_page_count,
+                },
             },
-            WalRecord::HeaderSet {
-                root: db_state.root,
-                freelist: db_state.freelist,
-                page_count: db_state.page_count,
-                old_root,
-                old_freelist,
-                old_page_count,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::HeaderSet {
+                    root: db_state.root,
+                    freelist: db_state.freelist,
+                    page_count: db_state.page_count,
+                    old_root,
+                    old_freelist,
+                    old_page_count,
+                },
             },
         )?;
 
@@ -458,10 +471,15 @@ impl Pager {
         };
 
         let lsn = record_mutation(
-            txid,
             ctx,
-            WalRecord::AllocPage { pgid },
-            WalRecord::AllocPage { pgid },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::AllocPage { txid, pgid },
+            },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::AllocPage { txid, pgid },
+            },
         )?;
 
         let (frame_id, meta, buffer) = self.acquire(internal, pgid, Some(lsn))?;
@@ -486,10 +504,15 @@ impl Pager {
     ) -> anyhow::Result<()> {
         let mut page = self.write(txid, pgid)?;
         page.meta.lsn = Some(record_mutation(
-            txid,
             ctx,
-            WalRecord::DeallocPage { pgid },
-            WalRecord::DeallocPage { pgid },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::DeallocPage { txid, pgid },
+            },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::DeallocPage { txid, pgid },
+            },
         )?);
         page.meta.kind = PageKind::None;
         page.meta.is_dirty = true;
@@ -731,16 +754,15 @@ impl Pager {
         let checkpoint_lsn = {
             // It's ok to append WAL while holding tx_state's lock since it's unlikely that the WAL
             // will block.
-            wal.append(
-                TxId::new(1).unwrap(),
-                None,
-                WalRecord::CheckpointBegin {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::Checkpoint {
                     active_tx: *tx_state.deref(),
                     root: internal.db_state.root,
                     freelist: internal.db_state.freelist,
                     page_count: internal.db_state.page_count,
                 },
-            )?
+            })?
         };
         drop(internal);
 
@@ -779,7 +801,7 @@ impl Pager {
             Self::flush_page(&self.f, &self.double_buff_f, frame.id, buffer)?;
         }
 
-        wal.update_checkpoint(checkpoint_lsn)?;
+        wal.complete_checkpoint(checkpoint_lsn)?;
 
         Ok(())
     }
@@ -1214,10 +1236,23 @@ impl<'a> PageWrite<'a> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             self.meta.lsn = Some(record_mutation(
-                self.txid,
                 ctx,
-                WalRecord::InteriorInit { pgid, last },
-                WalRecord::InteriorInit { pgid, last },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::InteriorInit {
+                        txid: self.txid,
+                        pgid,
+                        last,
+                    },
+                },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::InteriorInit {
+                        txid: self.txid,
+                        pgid,
+                        last,
+                    },
+                },
             )?);
             self.meta.is_dirty = true;
 
@@ -1248,17 +1283,24 @@ impl<'a> PageWrite<'a> {
         let pgid = self.id();
         let page_size = self.buffer.len();
         self.meta.lsn = Some(record_mutation(
-            self.txid,
             ctx,
-            WalRecord::InteriorSet {
-                pgid,
-                page_version: 0,
-                payload,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSet {
+                    txid: self.txid,
+                    pgid,
+                    page_version: 0,
+                    payload,
+                },
             },
-            WalRecord::InteriorSet {
-                pgid,
-                page_version: 0,
-                payload,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSet {
+                    txid: self.txid,
+                    pgid,
+                    page_version: 0,
+                    payload,
+                },
             },
         )?);
         self.meta.is_dirty = true;
@@ -1283,10 +1325,21 @@ impl<'a> PageWrite<'a> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             self.meta.lsn = Some(record_mutation(
-                self.txid,
                 ctx,
-                WalRecord::LeafInit { pgid },
-                WalRecord::LeafInit { pgid },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::LeafInit {
+                        txid: self.txid,
+                        pgid,
+                    },
+                },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::LeafInit {
+                        txid: self.txid,
+                        pgid,
+                    },
+                },
             )?);
             self.meta.is_dirty = true;
 
@@ -1323,17 +1376,24 @@ impl<'a> PageWrite<'a> {
         let pgid = self.id();
         let page_size = self.buffer.len();
         self.meta.lsn = Some(record_mutation(
-            self.txid,
             ctx,
-            WalRecord::LeafSet {
-                pgid,
-                page_version: 0,
-                payload,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafSet {
+                    txid: self.txid,
+                    pgid,
+                    page_version: 0,
+                    payload,
+                },
             },
-            WalRecord::LeafSet {
-                pgid,
-                page_version: 0,
-                payload,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafSet {
+                    txid: self.txid,
+                    pgid,
+                    page_version: 0,
+                    payload,
+                },
             },
         )?);
         self.meta.is_dirty = true;
@@ -1361,10 +1421,21 @@ impl<'a> PageWrite<'a> {
         if let PageKind::None = self.meta.kind {
             let pgid = self.id();
             self.meta.lsn = Some(record_mutation(
-                self.txid,
                 ctx,
-                WalRecord::OverflowInit { pgid },
-                WalRecord::OverflowInit { pgid },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::OverflowInit {
+                        txid: self.txid,
+                        pgid,
+                    },
+                },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::OverflowInit {
+                        txid: self.txid,
+                        pgid,
+                    },
+                },
             )?);
             self.meta.is_dirty = true;
             self.meta.kind = PageKind::Overflow {
@@ -1410,10 +1481,9 @@ impl<'a> PageWrite<'a> {
 
 // TODO: during recovery, we need to pass the LSN of the log to upadte this page's rec_lsn and page_lsn.
 fn record_mutation(
-    txid: TxId,
     ctx: LogContext<'_>,
-    entry: WalRecord,
-    compensation_entry: WalRecord,
+    entry: WalEntry,
+    compensation_entry: WalEntry,
 ) -> anyhow::Result<Lsn> {
     let entry = if ctx.is_undo() {
         compensation_entry
@@ -1422,8 +1492,8 @@ fn record_mutation(
     };
 
     let lsn = match ctx {
-        LogContext::Runtime(wal) => wal.append(txid, None, entry)?,
-        LogContext::Undo(wal, clr) => wal.append(txid, Some(clr), entry)?,
+        LogContext::Runtime(wal) => wal.append_log(entry)?,
+        LogContext::Undo(wal, ..) => wal.append_log(entry)?,
         LogContext::Redo(lsn) => lsn,
     };
     Ok(lsn)
@@ -1568,14 +1638,24 @@ impl<'a> InteriorPageWrite<'a> {
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorReset {
-                pgid,
-                page_version: 0,
-                payload: &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorReset {
+                    txid: self.0.txid,
+                    pgid,
+                    page_version: 0,
+                    payload: &self.0.buffer
+                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                },
             },
-            WalRecord::InteriorUndoReset { pgid },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorUndoReset {
+                    txid: self.0.txid,
+                    pgid,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -1591,17 +1671,24 @@ impl<'a> InteriorPageWrite<'a> {
         let old_last = last;
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorSetLast {
-                pgid,
-                last: new_last,
-                old_last,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSetLast {
+                    txid: self.0.txid,
+                    pgid,
+                    last: new_last,
+                    old_last,
+                },
             },
-            WalRecord::InteriorSetLast {
-                pgid,
-                last: new_last,
-                old_last,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSetLast {
+                    txid: self.0.txid,
+                    pgid,
+                    last: new_last,
+                    old_last,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -1631,19 +1718,26 @@ impl<'a> InteriorPageWrite<'a> {
         }
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorSetCellPtr {
-                pgid,
-                index,
-                ptr,
-                old_ptr,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSetCellPtr {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    ptr,
+                    old_ptr,
+                },
             },
-            WalRecord::InteriorSetCellPtr {
-                pgid,
-                index,
-                ptr,
-                old_ptr,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSetCellPtr {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    ptr,
+                    old_ptr,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -1670,19 +1764,26 @@ impl<'a> InteriorPageWrite<'a> {
         }
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorSetCellOverflow {
-                pgid,
-                index,
-                overflow: overflow_pgid,
-                old_overflow,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSetCellOverflow {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    overflow: overflow_pgid,
+                    old_overflow,
+                },
             },
-            WalRecord::InteriorSetCellOverflow {
-                pgid,
-                index,
-                overflow: overflow_pgid,
-                old_overflow,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorSetCellOverflow {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    overflow: overflow_pgid,
+                    old_overflow,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -1727,23 +1828,30 @@ impl<'a> InteriorPageWrite<'a> {
             .put(&mut self.0.buffer[reserved_offset..reserved_offset + raw.len()])?;
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorInsert {
-                pgid,
-                index: i,
-                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
-                ptr: cell.ptr(),
-                overflow: cell.overflow(),
-                key_size: cell.key_size(),
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                    ptr: cell.ptr(),
+                    overflow: cell.overflow(),
+                    key_size: cell.key_size(),
+                },
             },
-            WalRecord::InteriorInsert {
-                pgid,
-                index: i,
-                raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
-                ptr: cell.ptr(),
-                overflow: cell.overflow(),
-                key_size: cell.key_size(),
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                    ptr: cell.ptr(),
+                    overflow: cell.overflow(),
+                    key_size: cell.key_size(),
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -1800,23 +1908,30 @@ impl<'a> InteriorPageWrite<'a> {
         // to make sure that the WAL is written. If the page is mutated, but the WAL is not
         // written, we might have a corrupted page.
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorInsert {
-                pgid,
-                index: i,
-                raw: &self.0.buffer[content_offset..content_offset + raw_size],
-                ptr,
-                key_size,
-                overflow,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                    ptr,
+                    key_size,
+                    overflow,
+                },
             },
-            WalRecord::InteriorInsert {
-                pgid,
-                index: i,
-                raw: &self.0.buffer[content_offset..content_offset + raw_size],
-                ptr,
-                key_size,
-                overflow,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                    ptr,
+                    key_size,
+                    overflow,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -1946,17 +2061,27 @@ impl<'a> InteriorPageWrite<'a> {
         for i in (n_cells_to_keep..count).rev() {
             let cell = get_interior_cell(&self.0.buffer[PAGE_HEADER_SIZE..], i);
             self.0.meta.lsn = Some(record_mutation(
-                self.0.txid,
                 ctx,
-                WalRecord::InteriorDelete {
-                    pgid,
-                    index: i,
-                    old_raw: cell.raw(),
-                    old_ptr: cell.ptr(),
-                    old_overflow: cell.overflow(),
-                    old_key_size: cell.key_size(),
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::InteriorDelete {
+                        txid: self.0.txid,
+                        pgid,
+                        index: i,
+                        old_raw: cell.raw(),
+                        old_ptr: cell.ptr(),
+                        old_overflow: cell.overflow(),
+                        old_key_size: cell.key_size(),
+                    },
                 },
-                WalRecord::InteriorUndoDelete { pgid, index: i },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::InteriorUndoDelete {
+                        txid: self.0.txid,
+                        pgid,
+                        index: i,
+                    },
+                },
             )?);
         }
         self.0.meta.is_dirty = true;
@@ -2006,17 +2131,27 @@ impl<'a> InteriorPageWrite<'a> {
             u16::from_be_bytes(cell.cell[INTERIOR_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::InteriorDelete {
-                pgid,
-                index,
-                old_raw: &self.0.buffer[content_offset..content_offset + content_size],
-                old_ptr: cell.ptr(),
-                old_overflow: cell.overflow(),
-                old_key_size: cell.key_size(),
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorDelete {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    old_raw: &self.0.buffer[content_offset..content_offset + content_size],
+                    old_ptr: cell.ptr(),
+                    old_overflow: cell.overflow(),
+                    old_key_size: cell.key_size(),
+                },
             },
-            WalRecord::InteriorUndoDelete { pgid, index },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::InteriorUndoDelete {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -2176,14 +2311,24 @@ impl<'a> LeafPageWrite<'a> {
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::LeafReset {
-                pgid,
-                page_version: 0,
-                payload: &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafReset {
+                    txid: self.0.txid,
+                    pgid,
+                    page_version: 0,
+                    payload: &self.0.buffer
+                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                },
             },
-            WalRecord::LeafUndoReset { pgid },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafUndoReset {
+                    txid: self.0.txid,
+                    pgid,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -2203,17 +2348,27 @@ impl<'a> LeafPageWrite<'a> {
             u16::from_be_bytes(cell.cell[LEAF_CELL_SIZE_RANGE].try_into().unwrap()) as usize;
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::LeafDelete {
-                pgid,
-                index,
-                old_raw: &self.0.buffer[content_offset..content_offset + content_size],
-                old_overflow: cell.overflow(),
-                old_key_size: cell.key_size(),
-                old_val_size: cell.val_size(),
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafDelete {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    old_raw: &self.0.buffer[content_offset..content_offset + content_size],
+                    old_overflow: cell.overflow(),
+                    old_key_size: cell.key_size(),
+                    old_val_size: cell.val_size(),
+                },
             },
-            WalRecord::LeafUndoDelete { pgid, index },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafUndoDelete {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -2260,17 +2415,24 @@ impl<'a> LeafPageWrite<'a> {
         }
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::LeafSetNext {
-                pgid,
-                next: new_next,
-                old_next,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafSetNext {
+                    txid: self.0.txid,
+                    pgid,
+                    next: new_next,
+                    old_next,
+                },
             },
-            WalRecord::LeafSetNext {
-                pgid,
-                next: new_next,
-                old_next,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafSetNext {
+                    txid: self.0.txid,
+                    pgid,
+                    next: new_next,
+                    old_next,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -2300,19 +2462,26 @@ impl<'a> LeafPageWrite<'a> {
         }
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::LeafSetOverflow {
-                pgid,
-                index,
-                overflow: overflow_pgid,
-                old_overflow,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafSetOverflow {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    overflow: overflow_pgid,
+                    old_overflow,
+                },
             },
-            WalRecord::LeafSetOverflow {
-                pgid,
-                index,
-                overflow: overflow_pgid,
-                old_overflow,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafSetOverflow {
+                    txid: self.0.txid,
+                    pgid,
+                    index,
+                    overflow: overflow_pgid,
+                    old_overflow,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -2341,23 +2510,30 @@ impl<'a> LeafPageWrite<'a> {
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::LeafInsert {
-                pgid,
-                index: i,
-                raw: cell.raw(),
-                overflow: cell.overflow(),
-                key_size: cell.key_size(),
-                value_size: cell.val_size(),
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: cell.raw(),
+                    overflow: cell.overflow(),
+                    key_size: cell.key_size(),
+                    value_size: cell.val_size(),
+                },
             },
-            WalRecord::LeafInsert {
-                pgid,
-                index: i,
-                raw: cell.raw(),
-                overflow: cell.overflow(),
-                key_size: cell.key_size(),
-                value_size: cell.val_size(),
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: cell.raw(),
+                    overflow: cell.overflow(),
+                    key_size: cell.key_size(),
+                    value_size: cell.val_size(),
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -2406,23 +2582,30 @@ impl<'a> LeafPageWrite<'a> {
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::LeafInsert {
-                pgid,
-                index: i,
-                raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
-                overflow,
-                key_size,
-                value_size,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
+                    overflow,
+                    key_size,
+                    value_size,
+                },
             },
-            WalRecord::LeafInsert {
-                pgid,
-                index: i,
-                raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
-                overflow,
-                key_size,
-                value_size,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::LeafInsert {
+                    txid: self.0.txid,
+                    pgid,
+                    index: i,
+                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
+                    overflow,
+                    key_size,
+                    value_size,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -2563,17 +2746,27 @@ impl<'a> LeafPageWrite<'a> {
                 i,
             );
             self.0.meta.lsn = Some(record_mutation(
-                self.0.txid,
                 ctx,
-                WalRecord::LeafDelete {
-                    pgid,
-                    index: i,
-                    old_raw: cell.raw(),
-                    old_overflow: cell.overflow(),
-                    old_key_size: cell.key_size(),
-                    old_val_size: cell.val_size(),
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::LeafDelete {
+                        txid: self.0.txid,
+                        pgid,
+                        index: i,
+                        old_raw: cell.raw(),
+                        old_overflow: cell.overflow(),
+                        old_key_size: cell.key_size(),
+                        old_val_size: cell.val_size(),
+                    },
                 },
-                WalRecord::LeafUndoDelete { pgid, index: i },
+                WalEntry {
+                    clr: ctx.clr(),
+                    kind: WalKind::LeafUndoDelete {
+                        txid: self.0.txid,
+                        pgid,
+                        index: i,
+                    },
+                },
             )?);
         }
         self.0.meta.is_dirty = true;
@@ -2709,17 +2902,24 @@ impl<'a> OverflowPageWrite<'a> {
         };
         let old_next = *next;
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::OverflowSetNext {
-                pgid,
-                next: new_next,
-                old_next,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowSetNext {
+                    txid: self.0.txid,
+                    pgid,
+                    next: new_next,
+                    old_next,
+                },
             },
-            WalRecord::OverflowSetNext {
-                pgid,
-                next: new_next,
-                old_next,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowSetNext {
+                    txid: self.0.txid,
+                    pgid,
+                    next: new_next,
+                    old_next,
+                },
             },
         )?);
         self.0.meta.is_dirty = true;
@@ -2759,10 +2959,25 @@ impl<'a> OverflowPageWrite<'a> {
         let raw = &mut self.0.buffer[offset..offset + inserted_size];
         content.put(raw)?;
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::OverflowSetContent { pgid, raw, next },
-            WalRecord::OverflowSetContent { pgid, raw, next },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowSetContent {
+                    txid: self.0.txid,
+                    pgid,
+                    raw,
+                    next,
+                },
+            },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowSetContent {
+                    txid: self.0.txid,
+                    pgid,
+                    raw,
+                    next,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -2790,10 +3005,21 @@ impl<'a> OverflowPageWrite<'a> {
         }
 
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::OverflowUndoSetContent { pgid },
-            WalRecord::OverflowUndoSetContent { pgid },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowUndoSetContent {
+                    txid: self.0.txid,
+                    pgid,
+                },
+            },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowUndoSetContent {
+                    txid: self.0.txid,
+                    pgid,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -2810,14 +3036,44 @@ impl<'a> OverflowPageWrite<'a> {
 
         let pgid = self.id();
         self.0.meta.lsn = Some(record_mutation(
-            self.0.txid,
             ctx,
-            WalRecord::OverflowReset {
-                pgid,
-                page_version: 0,
-                payload: &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowReset {
+                    txid: self.0.txid,
+                    pgid,
+                    page_version: 0,
+                    payload: &self.0.buffer
+                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                },
             },
-            WalRecord::OverflowUndoReset { pgid },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowUndoReset {
+                    txid: self.0.txid,
+                    pgid,
+                },
+            },
+        )?);
+        self.0.meta.lsn = Some(record_mutation(
+            ctx,
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowReset {
+                    txid: self.0.txid,
+                    pgid,
+                    page_version: 0,
+                    payload: &self.0.buffer
+                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                },
+            },
+            WalEntry {
+                clr: ctx.clr(),
+                kind: WalKind::OverflowUndoReset {
+                    txid: self.0.txid,
+                    pgid,
+                },
+            },
         )?);
         self.0.meta.is_dirty = true;
 
@@ -2855,7 +3111,6 @@ fn write_page(f: &mut File, id: PageId, page_size: usize, buff: &[u8]) -> anyhow
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
-    use std::sync::Arc;
 
     #[test]
     fn test_pager_interior() {
@@ -2874,17 +3129,8 @@ mod tests {
         let double_buff_file_path = dir.path().join("test.wal");
         let double_buff_file = File::create(double_buff_file_path).unwrap();
 
-        let wal_path = dir.path().join("test.wal");
-        let wal_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(wal_path)
-            .unwrap();
-        let wal = Arc::new(Wal::new(wal_file, 0, Lsn::new(64), page_size).unwrap());
-
         let pager = Pager::new(file, double_buff_file, page_size, 10).unwrap();
+        let wal = crate::recovery_v2::recover(dir.path(), &pager).unwrap().wal;
         let txid = TxId::new(1).unwrap();
 
         let ctx = LogContext::Redo(Lsn::new(1));

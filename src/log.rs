@@ -150,7 +150,6 @@ pub(crate) enum WalKind<'a> {
     },
 
     HeaderSet {
-        txid: TxId,
         root: Option<PageId>,
         old_root: Option<PageId>,
         freelist: Option<PageId>,
@@ -426,7 +425,7 @@ impl<'a> WalKind<'a> {
             | WalKind::Rollback { .. }
             | WalKind::End { .. } => 8,
 
-            WalKind::HeaderSet { .. } => 56,
+            WalKind::HeaderSet { .. } => 48,
             WalKind::HeaderUndoSet { .. } => 32,
             WalKind::AllocPage { .. } => 16,
             WalKind::DeallocPage { .. } => 16,
@@ -473,7 +472,6 @@ impl<'a> WalKind<'a> {
             }
 
             WalKind::HeaderSet {
-                txid,
                 root,
                 old_root,
                 freelist,
@@ -481,13 +479,12 @@ impl<'a> WalKind<'a> {
                 page_count,
                 old_page_count,
             } => {
-                buff[0..8].copy_from_slice(&txid.to_be_bytes());
-                buff[8..16].copy_from_slice(&root.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_root.to_be_bytes());
-                buff[24..32].copy_from_slice(&freelist.to_be_bytes());
-                buff[32..40].copy_from_slice(&old_freelist.to_be_bytes());
-                buff[40..48].copy_from_slice(&page_count.to_be_bytes());
-                buff[48..56].copy_from_slice(&old_page_count.to_be_bytes());
+                buff[0..8].copy_from_slice(&root.to_be_bytes());
+                buff[8..16].copy_from_slice(&old_root.to_be_bytes());
+                buff[16..24].copy_from_slice(&freelist.to_be_bytes());
+                buff[24..32].copy_from_slice(&old_freelist.to_be_bytes());
+                buff[32..40].copy_from_slice(&page_count.to_be_bytes());
+                buff[40..48].copy_from_slice(&old_page_count.to_be_bytes());
             }
             WalKind::HeaderUndoSet {
                 txid,
@@ -856,17 +853,13 @@ impl<'a> WalKind<'a> {
             }
 
             WAL_RECORD_HEADER_SET_KIND => {
-                let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("empty transaction id"));
-                };
-                let root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let old_root = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let freelist = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let old_freelist = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
-                let old_page_count = u64::from_be_bytes(buff[48..56].try_into().unwrap());
+                let root = PageId::from_be_bytes(buff[0..8].try_into().unwrap());
+                let old_root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
+                let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
+                let old_freelist = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
+                let page_count = u64::from_be_bytes(buff[32..40].try_into().unwrap());
+                let old_page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
                 Ok(Self::HeaderSet {
-                    txid,
                     root,
                     old_root,
                     freelist,
@@ -1404,7 +1397,6 @@ mod tests {
             WalEntry {
                 clr: None,
                 kind: WalKind::HeaderSet {
-                    txid: TxId::new(2).unwrap(),
                     root: None,
                     old_root: PageId::new(1),
                     freelist: PageId::new(101),
@@ -1416,7 +1408,6 @@ mod tests {
             WalEntry {
                 clr: Some(Lsn::new(99)),
                 kind: WalKind::HeaderSet {
-                    txid: TxId::new(1011).unwrap(),
                     root: PageId::new(23),
                     old_root: PageId::new(1),
                     freelist: PageId::new(101),
