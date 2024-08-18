@@ -124,6 +124,26 @@ impl WalEntry<'_> {
 
         WalDecodeResult::Ok(WalEntry { clr, kind })
     }
+
+    pub(crate) fn decode_backward(buff: &[u8]) -> WalDecodeResult<'_> {
+        if buff.len() < 16 {
+            return WalDecodeResult::NeedMoreBytes;
+        }
+
+        let kind_size = u16::from_be_bytes(
+            buff[buff.len() - 16..buff.len() - 16 + 2]
+                .try_into()
+                .unwrap(),
+        );
+        let size = Self::size_by_kind_size(kind_size as usize);
+        println!("kind size={kind_size} total_size={size}");
+        if buff.len() < size {
+            return WalDecodeResult::NeedMoreBytes;
+        }
+
+        let full_buff = &buff[buff.len() - size..];
+        Self::decode(full_buff)
+    }
 }
 
 #[derive(Debug)]
@@ -1833,6 +1853,17 @@ mod tests {
                 panic!("decode fail");
             };
             assert_eq!(testcase, decoded_entry);
+            let WalDecodeResult::Ok(decoded_entry) = WalEntry::decode_backward(&buff) else {
+                panic!("decode backward fail");
+            };
+            assert_eq!(testcase, decoded_entry);
+
+            for i in 0..buff.len() - 1 {
+                let result = WalEntry::decode(&buff[..i]);
+                assert!(matches!(result, WalDecodeResult::NeedMoreBytes), "decode {testcase:?} result should be need more bytes, but got {result:?}");
+                let result = WalEntry::decode_backward(&buff[testcase.size()-i..]);
+                assert!(matches!(result, WalDecodeResult::NeedMoreBytes), "decode backward {testcase:?} result should be need more bytes, but got {result:?}");
+            }
         }
     }
 }
