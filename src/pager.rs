@@ -2,7 +2,7 @@ use crate::bins::SliceExt;
 use crate::content::{Bytes, Content};
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
-use crate::wal_v2::Wal;
+use crate::wal::Wal;
 use anyhow::anyhow;
 use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -1291,7 +1291,7 @@ impl<'a> PageWrite<'a> {
                     txid: self.txid,
                     pgid,
                     page_version: 0,
-                    payload,
+                    payload: Bytes::new(payload),
                 },
             },
             WalEntry {
@@ -1300,7 +1300,7 @@ impl<'a> PageWrite<'a> {
                     txid: self.txid,
                     pgid,
                     page_version: 0,
-                    payload,
+                    payload: Bytes::new(payload),
                 },
             },
         )?);
@@ -1384,7 +1384,7 @@ impl<'a> PageWrite<'a> {
                     txid: self.txid,
                     pgid,
                     page_version: 0,
-                    payload,
+                    payload: Bytes::new(payload),
                 },
             },
             WalEntry {
@@ -1393,7 +1393,7 @@ impl<'a> PageWrite<'a> {
                     txid: self.txid,
                     pgid,
                     page_version: 0,
-                    payload,
+                    payload: Bytes::new(payload),
                 },
             },
         )?);
@@ -1646,13 +1646,14 @@ impl<'a> InteriorPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     page_version: 0,
-                    payload: &self.0.buffer
-                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    payload: Bytes::new(
+                        &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    ),
                 },
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::InteriorUndoReset {
+                kind: WalKind::InteriorResetForUndo {
                     txid: self.0.txid,
                     pgid,
                 },
@@ -1836,7 +1837,7 @@ impl<'a> InteriorPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                    raw: Bytes::new(&self.0.buffer[reserved_offset..reserved_offset + raw.len()]),
                     ptr: cell.ptr(),
                     overflow: cell.overflow(),
                     key_size: cell.key_size(),
@@ -1848,7 +1849,7 @@ impl<'a> InteriorPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw.len()],
+                    raw: Bytes::new(&self.0.buffer[reserved_offset..reserved_offset + raw.len()]),
                     ptr: cell.ptr(),
                     overflow: cell.overflow(),
                     key_size: cell.key_size(),
@@ -1916,7 +1917,7 @@ impl<'a> InteriorPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                    raw: Bytes::new(&self.0.buffer[content_offset..content_offset + raw_size]),
                     ptr,
                     key_size,
                     overflow,
@@ -1928,7 +1929,7 @@ impl<'a> InteriorPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: &self.0.buffer[content_offset..content_offset + raw_size],
+                    raw: Bytes::new(&self.0.buffer[content_offset..content_offset + raw_size]),
                     ptr,
                     key_size,
                     overflow,
@@ -2069,7 +2070,7 @@ impl<'a> InteriorPageWrite<'a> {
                         txid: self.0.txid,
                         pgid,
                         index: i,
-                        old_raw: cell.raw(),
+                        old_raw: Bytes::new(cell.raw()),
                         old_ptr: cell.ptr(),
                         old_overflow: cell.overflow(),
                         old_key_size: cell.key_size(),
@@ -2077,7 +2078,7 @@ impl<'a> InteriorPageWrite<'a> {
                 },
                 WalEntry {
                     clr: ctx.clr(),
-                    kind: WalKind::InteriorUndoDelete {
+                    kind: WalKind::InteriorDeleteForUndo {
                         txid: self.0.txid,
                         pgid,
                         index: i,
@@ -2137,7 +2138,9 @@ impl<'a> InteriorPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index,
-                    old_raw: &self.0.buffer[content_offset..content_offset + content_size],
+                    old_raw: Bytes::new(
+                        &self.0.buffer[content_offset..content_offset + content_size],
+                    ),
                     old_ptr: cell.ptr(),
                     old_overflow: cell.overflow(),
                     old_key_size: cell.key_size(),
@@ -2145,7 +2148,7 @@ impl<'a> InteriorPageWrite<'a> {
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::InteriorUndoDelete {
+                kind: WalKind::InteriorDeleteForUndo {
                     txid: self.0.txid,
                     pgid,
                     index,
@@ -2317,13 +2320,14 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     page_version: 0,
-                    payload: &self.0.buffer
-                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    payload: Bytes::new(
+                        &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    ),
                 },
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::LeafUndoReset {
+                kind: WalKind::LeafResetForUndo {
                     txid: self.0.txid,
                     pgid,
                 },
@@ -2352,7 +2356,7 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index,
-                    old_raw: &self.0.buffer[content_offset..content_offset + content_size],
+                    old_raw: Bytes::new(&self.0.buffer[content_offset..content_offset + content_size]),
                     old_overflow: cell.overflow(),
                     old_key_size: cell.key_size(),
                     old_val_size: cell.val_size(),
@@ -2360,7 +2364,7 @@ impl<'a> LeafPageWrite<'a> {
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::LeafUndoDelete {
+                kind: WalKind::LeafDeleteForUndo {
                     txid: self.0.txid,
                     pgid,
                     index,
@@ -2514,7 +2518,7 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: cell.raw(),
+                    raw: Bytes::new(cell.raw()),
                     overflow: cell.overflow(),
                     key_size: cell.key_size(),
                     value_size: cell.val_size(),
@@ -2526,7 +2530,7 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: cell.raw(),
+                    raw: Bytes::new(cell.raw()),
                     overflow: cell.overflow(),
                     key_size: cell.key_size(),
                     value_size: cell.val_size(),
@@ -2586,7 +2590,7 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
+                    raw: Bytes::new(&self.0.buffer[reserved_offset..reserved_offset + raw_size]),
                     overflow,
                     key_size,
                     value_size,
@@ -2598,7 +2602,7 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index: i,
-                    raw: &self.0.buffer[reserved_offset..reserved_offset + raw_size],
+                    raw: Bytes::new(&self.0.buffer[reserved_offset..reserved_offset + raw_size]),
                     overflow,
                     key_size,
                     value_size,
@@ -2750,7 +2754,7 @@ impl<'a> LeafPageWrite<'a> {
                         txid: self.0.txid,
                         pgid,
                         index: i,
-                        old_raw: cell.raw(),
+                        old_raw: Bytes::new(cell.raw()),
                         old_overflow: cell.overflow(),
                         old_key_size: cell.key_size(),
                         old_val_size: cell.val_size(),
@@ -2758,7 +2762,7 @@ impl<'a> LeafPageWrite<'a> {
                 },
                 WalEntry {
                     clr: ctx.clr(),
-                    kind: WalKind::LeafUndoDelete {
+                    kind: WalKind::LeafDeleteForUndo {
                         txid: self.0.txid,
                         pgid,
                         index: i,
@@ -2831,7 +2835,7 @@ impl<'a> BTreeCell<'a> for LeafCell<'a> {
 
 impl<'a> LeafCell<'a> {
     pub(crate) fn val_size(&self) -> usize {
-        u32::from_be_bytes(self.cell[LEAF_CELL_VAL_SIZE_RANGE].try_into().unwrap()) as usize
+        self.cell[LEAF_CELL_VAL_SIZE_RANGE].read_u32() as usize
     }
 }
 
@@ -2962,7 +2966,7 @@ impl<'a> OverflowPageWrite<'a> {
                 kind: WalKind::OverflowSetContent {
                     txid: self.0.txid,
                     pgid,
-                    raw,
+                    raw: Bytes::new(raw),
                     next,
                 },
             },
@@ -2971,7 +2975,7 @@ impl<'a> OverflowPageWrite<'a> {
                 kind: WalKind::OverflowSetContent {
                     txid: self.0.txid,
                     pgid,
-                    raw,
+                    raw: Bytes::new(raw),
                     next,
                 },
             },
@@ -3005,14 +3009,14 @@ impl<'a> OverflowPageWrite<'a> {
             ctx,
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::OverflowUndoSetContent {
+                kind: WalKind::OverflowSetContentForUndo {
                     txid: self.0.txid,
                     pgid,
                 },
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::OverflowUndoSetContent {
+                kind: WalKind::OverflowSetContentForUndo {
                     txid: self.0.txid,
                     pgid,
                 },
@@ -3040,13 +3044,13 @@ impl<'a> OverflowPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     page_version: 0,
-                    payload: &self.0.buffer
-                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    payload: Bytes::new(&self.0.buffer
+                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE]),
                 },
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::OverflowUndoReset {
+                kind: WalKind::OverflowResetForUndo {
                     txid: self.0.txid,
                     pgid,
                 },
@@ -3060,13 +3064,13 @@ impl<'a> OverflowPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     page_version: 0,
-                    payload: &self.0.buffer
-                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    payload: Bytes::new(&self.0.buffer
+                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE]),
                 },
             },
             WalEntry {
                 clr: ctx.clr(),
-                kind: WalKind::OverflowUndoReset {
+                kind: WalKind::OverflowResetForUndo {
                     txid: self.0.txid,
                     pgid,
                 },
@@ -3127,7 +3131,7 @@ mod tests {
         let double_buff_file = File::create(double_buff_file_path).unwrap();
 
         let pager = Pager::new(file, double_buff_file, page_size, 10).unwrap();
-        let wal = crate::recovery_v2::recover(dir.path(), &pager).unwrap().wal;
+        let wal = crate::recovery::recover(dir.path(), &pager).unwrap().wal;
         let txid = TxId::new(1).unwrap();
 
         let ctx = LogContext::Redo(Lsn::new(1));

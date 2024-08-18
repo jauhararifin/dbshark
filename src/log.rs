@@ -1,4 +1,5 @@
 use crate::bins::SliceExt;
+use crate::content::Bytes;
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId, TxIdExt};
 use anyhow::anyhow;
 
@@ -41,7 +42,7 @@ impl WalHeader {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct WalEntry<'a> {
     pub(crate) clr: Option<Lsn>,
     pub(crate) kind: WalKind<'a>,
@@ -133,7 +134,6 @@ impl WalEntry<'_> {
 
         let kind_size = buff[buff.len() - 16..].read_u16();
         let size = Self::size_by_kind_size(kind_size as usize);
-        println!("kind size={kind_size} total_size={size}");
         if buff.len() < size {
             return WalDecodeResult::NeedMoreBytes;
         }
@@ -151,7 +151,7 @@ pub(crate) enum WalDecodeResult<'a> {
     Err(anyhow::Error),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum WalKind<'a> {
     Begin {
         txid: TxId,
@@ -174,7 +174,7 @@ pub(crate) enum WalKind<'a> {
         page_count: u64,
         old_page_count: u64,
     },
-    HeaderUndoSet {
+    HeaderSetForUndo {
         txid: TxId,
         root: Option<PageId>,
         freelist: Option<PageId>,
@@ -193,9 +193,9 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         page_version: u16,
-        payload: &'a [u8],
+        payload: Bytes<'a>,
     },
-    InteriorUndoReset {
+    InteriorResetForUndo {
         txid: TxId,
         pgid: PageId,
     },
@@ -203,7 +203,7 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         page_version: u16,
-        payload: &'a [u8],
+        payload: Bytes<'a>,
     },
     InteriorInit {
         txid: TxId,
@@ -214,7 +214,7 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         index: usize,
-        raw: &'a [u8],
+        raw: Bytes<'a>,
         ptr: PageId,
         key_size: usize,
         overflow: Option<PageId>,
@@ -223,12 +223,12 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         index: usize,
-        old_raw: &'a [u8],
+        old_raw: Bytes<'a>,
         old_ptr: PageId,
         old_overflow: Option<PageId>,
         old_key_size: usize,
     },
-    InteriorUndoDelete {
+    InteriorDeleteForUndo {
         txid: TxId,
         pgid: PageId,
         index: usize,
@@ -258,9 +258,9 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         page_version: u16,
-        payload: &'a [u8],
+        payload: Bytes<'a>,
     },
-    LeafUndoReset {
+    LeafResetForUndo {
         txid: TxId,
         pgid: PageId,
     },
@@ -268,7 +268,7 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         page_version: u16,
-        payload: &'a [u8],
+        payload: Bytes<'a>,
     },
     LeafInit {
         txid: TxId,
@@ -278,7 +278,7 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         index: usize,
-        raw: &'a [u8],
+        raw: Bytes<'a>,
         overflow: Option<PageId>,
         key_size: usize,
         value_size: usize,
@@ -287,12 +287,12 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         index: usize,
-        old_raw: &'a [u8],
+        old_raw: Bytes<'a>,
         old_overflow: Option<PageId>,
         old_key_size: usize,
         old_val_size: usize,
     },
-    LeafUndoDelete {
+    LeafDeleteForUndo {
         txid: TxId,
         pgid: PageId,
         index: usize,
@@ -315,9 +315,9 @@ pub(crate) enum WalKind<'a> {
         txid: TxId,
         pgid: PageId,
         page_version: u16,
-        payload: &'a [u8],
+        payload: Bytes<'a>,
     },
-    OverflowUndoReset {
+    OverflowResetForUndo {
         txid: TxId,
         pgid: PageId,
     },
@@ -328,10 +328,10 @@ pub(crate) enum WalKind<'a> {
     OverflowSetContent {
         txid: TxId,
         pgid: PageId,
-        raw: &'a [u8],
+        raw: Bytes<'a>,
         next: Option<PageId>,
     },
-    OverflowUndoSetContent {
+    OverflowSetContentForUndo {
         txid: TxId,
         pgid: PageId,
     },
@@ -356,36 +356,36 @@ const WAL_RECORD_ROLLBACK_KIND: u8 = 3;
 const WAL_RECORD_END_KIND: u8 = 4;
 
 const WAL_RECORD_HEADER_SET_KIND: u8 = 10;
-const WAL_RECORD_HEADER_UNDO_SET_KIND: u8 = 11;
+const WAL_RECORD_HEADER_SET_FOR_UNDO_KIND: u8 = 11;
 const WAL_RECORD_ALLOC_PAGE_KIND: u8 = 12;
 const WAL_RECORD_DEALLOC_PAGE_KIND: u8 = 13;
 
 const WAL_RECORD_INTERIOR_RESET_KIND: u8 = 20;
-const WAL_RECORD_INTERIOR_UNDO_RESET_KIND: u8 = 21;
+const WAL_RECORD_INTERIOR_RESET_FOR_UNDO_KIND: u8 = 21;
 const WAL_RECORD_INTERIOR_SET_KIND: u8 = 22;
 const WAL_RECORD_INTERIOR_INIT_KIND: u8 = 23;
 const WAL_RECORD_INTERIOR_INSERT_KIND: u8 = 24;
 const WAL_RECORD_INTERIOR_DELETE_KIND: u8 = 25;
-const WAL_RECORD_INTERIOR_UNDO_DELETE_KIND: u8 = 26;
+const WAL_RECORD_INTERIOR_DELETE_FOR_UNDO_KIND: u8 = 26;
 const WAL_RECORD_INTERIOR_SET_CELL_OVERFLOW_KIND: u8 = 27;
 const WAL_RECORD_INTERIOR_SET_CELL_PTR_KIND: u8 = 28;
 const WAL_RECORD_INTERIOR_SET_LAST_KIND: u8 = 29;
 
 const WAL_RECORD_LEAF_RESET_KIND: u8 = 30;
-const WAL_RECORD_LEAF_UNDO_RESET_KIND: u8 = 31;
+const WAL_RECORD_LEAF_RESET_FOR_UNDO_KIND: u8 = 31;
 const WAL_RECORD_LEAF_SET_KIND: u8 = 32;
 const WAL_RECORD_LEAF_INIT_KIND: u8 = 33;
 const WAL_RECORD_LEAF_INSERT_KIND: u8 = 34;
 const WAL_RECORD_LEAF_DELETE_KIND: u8 = 35;
-const WAL_RECORD_LEAF_UNDO_DELETE_KIND: u8 = 36;
+const WAL_RECORD_LEAF_DELETE_FOR_UNDO_KIND: u8 = 36;
 const WAL_RECORD_LEAF_SET_CELL_OVERFLOW_KIND: u8 = 37;
 const WAL_RECORD_LEAF_SET_NEXT_KIND: u8 = 38;
 
 const WAL_RECORD_OVERFLOW_RESET_KIND: u8 = 40;
-const WAL_RECORD_OVERFLOW_UNDO_RESET_KIND: u8 = 41;
+const WAL_RECORD_OVERFLOW_RESET_FOR_UNDO_KIND: u8 = 41;
 const WAL_RECORD_OVERFLOW_INIT_KIND: u8 = 42;
 const WAL_RECORD_OVERFLOW_SET_CONTENT_KIND: u8 = 43;
-const WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND: u8 = 44;
+const WAL_RECORD_OVERFLOW_SET_CONTENT_FOR_UNDO_KIND: u8 = 44;
 const WAL_RECORD_OVERFLOW_SET_NEXT_KIND: u8 = 45;
 
 const WAL_RECORD_CHECKPOINT_KIND: u8 = 100;
@@ -399,36 +399,38 @@ impl<'a> WalKind<'a> {
             WalKind::End { .. } => WAL_RECORD_END_KIND,
 
             WalKind::HeaderSet { .. } => WAL_RECORD_HEADER_SET_KIND,
-            WalKind::HeaderUndoSet { .. } => WAL_RECORD_HEADER_UNDO_SET_KIND,
+            WalKind::HeaderSetForUndo { .. } => WAL_RECORD_HEADER_SET_FOR_UNDO_KIND,
             WalKind::AllocPage { .. } => WAL_RECORD_ALLOC_PAGE_KIND,
             WalKind::DeallocPage { .. } => WAL_RECORD_DEALLOC_PAGE_KIND,
 
             WalKind::InteriorReset { .. } => WAL_RECORD_INTERIOR_RESET_KIND,
-            WalKind::InteriorUndoReset { .. } => WAL_RECORD_INTERIOR_UNDO_RESET_KIND,
+            WalKind::InteriorResetForUndo { .. } => WAL_RECORD_INTERIOR_RESET_FOR_UNDO_KIND,
             WalKind::InteriorSet { .. } => WAL_RECORD_INTERIOR_SET_KIND,
             WalKind::InteriorInit { .. } => WAL_RECORD_INTERIOR_INIT_KIND,
             WalKind::InteriorInsert { .. } => WAL_RECORD_INTERIOR_INSERT_KIND,
             WalKind::InteriorDelete { .. } => WAL_RECORD_INTERIOR_DELETE_KIND,
-            WalKind::InteriorUndoDelete { .. } => WAL_RECORD_INTERIOR_UNDO_DELETE_KIND,
+            WalKind::InteriorDeleteForUndo { .. } => WAL_RECORD_INTERIOR_DELETE_FOR_UNDO_KIND,
             WalKind::InteriorSetCellOverflow { .. } => WAL_RECORD_INTERIOR_SET_CELL_OVERFLOW_KIND,
             WalKind::InteriorSetCellPtr { .. } => WAL_RECORD_INTERIOR_SET_CELL_PTR_KIND,
             WalKind::InteriorSetLast { .. } => WAL_RECORD_INTERIOR_SET_LAST_KIND,
 
             WalKind::LeafReset { .. } => WAL_RECORD_LEAF_RESET_KIND,
-            WalKind::LeafUndoReset { .. } => WAL_RECORD_LEAF_UNDO_RESET_KIND,
+            WalKind::LeafResetForUndo { .. } => WAL_RECORD_LEAF_RESET_FOR_UNDO_KIND,
             WalKind::LeafSet { .. } => WAL_RECORD_LEAF_SET_KIND,
             WalKind::LeafInit { .. } => WAL_RECORD_LEAF_INIT_KIND,
             WalKind::LeafInsert { .. } => WAL_RECORD_LEAF_INSERT_KIND,
             WalKind::LeafDelete { .. } => WAL_RECORD_LEAF_DELETE_KIND,
-            WalKind::LeafUndoDelete { .. } => WAL_RECORD_LEAF_UNDO_DELETE_KIND,
+            WalKind::LeafDeleteForUndo { .. } => WAL_RECORD_LEAF_DELETE_FOR_UNDO_KIND,
             WalKind::LeafSetOverflow { .. } => WAL_RECORD_LEAF_SET_CELL_OVERFLOW_KIND,
             WalKind::LeafSetNext { .. } => WAL_RECORD_LEAF_SET_NEXT_KIND,
 
             WalKind::OverflowReset { .. } => WAL_RECORD_OVERFLOW_RESET_KIND,
-            WalKind::OverflowUndoReset { .. } => WAL_RECORD_OVERFLOW_UNDO_RESET_KIND,
+            WalKind::OverflowResetForUndo { .. } => WAL_RECORD_OVERFLOW_RESET_FOR_UNDO_KIND,
             WalKind::OverflowInit { .. } => WAL_RECORD_OVERFLOW_INIT_KIND,
             WalKind::OverflowSetContent { .. } => WAL_RECORD_OVERFLOW_SET_CONTENT_KIND,
-            WalKind::OverflowUndoSetContent { .. } => WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND,
+            WalKind::OverflowSetContentForUndo { .. } => {
+                WAL_RECORD_OVERFLOW_SET_CONTENT_FOR_UNDO_KIND
+            }
             WalKind::OverflowSetNext { .. } => WAL_RECORD_OVERFLOW_SET_NEXT_KIND,
 
             WalKind::Checkpoint { .. } => WAL_RECORD_CHECKPOINT_KIND,
@@ -443,36 +445,36 @@ impl<'a> WalKind<'a> {
             | WalKind::End { .. } => 8,
 
             WalKind::HeaderSet { .. } => 48,
-            WalKind::HeaderUndoSet { .. } => 32,
+            WalKind::HeaderSetForUndo { .. } => 32,
             WalKind::AllocPage { .. } => 16,
             WalKind::DeallocPage { .. } => 16,
 
             WalKind::InteriorReset { payload, .. } => 8 + 8 + 2 + 2 + payload.len(),
-            WalKind::InteriorUndoReset { .. } => 8 + 8,
+            WalKind::InteriorResetForUndo { .. } => 8 + 8,
             WalKind::InteriorSet { payload, .. } => 8 + 8 + 2 + 2 + payload.len(),
             WalKind::InteriorInit { .. } => 24,
             WalKind::InteriorInsert { raw, .. } => 40 + raw.len(),
             WalKind::InteriorDelete { old_raw, .. } => 40 + old_raw.len(),
-            WalKind::InteriorUndoDelete { .. } => 18,
+            WalKind::InteriorDeleteForUndo { .. } => 18,
             WalKind::InteriorSetCellOverflow { .. } => 34,
             WalKind::InteriorSetCellPtr { .. } => 34,
             WalKind::InteriorSetLast { .. } => 32,
 
             WalKind::LeafReset { payload, .. } => 8 + 8 + 2 + 2 + payload.len(),
-            WalKind::LeafUndoReset { .. } => 16,
+            WalKind::LeafResetForUndo { .. } => 16,
             WalKind::LeafSet { payload, .. } => 8 + 8 + 2 + 2 + payload.len(),
             WalKind::LeafInit { .. } => 16,
             WalKind::LeafInsert { raw, .. } => 36 + raw.len(),
             WalKind::LeafDelete { old_raw, .. } => 36 + old_raw.len(),
-            WalKind::LeafUndoDelete { .. } => 18,
+            WalKind::LeafDeleteForUndo { .. } => 18,
             WalKind::LeafSetOverflow { .. } => 34,
             WalKind::LeafSetNext { .. } => 32,
 
             WalKind::OverflowReset { payload, .. } => 8 + 8 + 2 + 2 + payload.len(),
-            WalKind::OverflowUndoReset { .. } => 16,
+            WalKind::OverflowResetForUndo { .. } => 16,
             WalKind::OverflowInit { .. } => 16,
             WalKind::OverflowSetContent { raw, .. } => 26 + raw.len(),
-            WalKind::OverflowUndoSetContent { .. } => 16,
+            WalKind::OverflowSetContentForUndo { .. } => 16,
             WalKind::OverflowSetNext { .. } => 32,
 
             WalKind::Checkpoint { .. } => 48,
@@ -503,7 +505,7 @@ impl<'a> WalKind<'a> {
                 buff[32..40].copy_from_slice(&page_count.to_be_bytes());
                 buff[40..48].copy_from_slice(&old_page_count.to_be_bytes());
             }
-            WalKind::HeaderUndoSet {
+            WalKind::HeaderSetForUndo {
                 txid,
                 root,
                 freelist,
@@ -534,9 +536,9 @@ impl<'a> WalKind<'a> {
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..18].copy_from_slice(&page_version.to_be_bytes());
                 buff[18..20].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[20..20 + payload.len()].copy_from_slice(payload);
+                buff[20..20 + payload.len()].copy_from_slice(payload.slice());
             }
-            WalKind::InteriorUndoReset { txid, pgid } => {
+            WalKind::InteriorResetForUndo { txid, pgid } => {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
             }
@@ -551,7 +553,7 @@ impl<'a> WalKind<'a> {
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..18].copy_from_slice(&page_version.to_be_bytes());
                 buff[18..20].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[20..20 + payload.len()].copy_from_slice(payload);
+                buff[20..20 + payload.len()].copy_from_slice(payload.slice());
             }
             WalKind::InteriorInit { txid, pgid, last } => {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
@@ -578,7 +580,7 @@ impl<'a> WalKind<'a> {
                 buff[22..24].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[24..32].copy_from_slice(&ptr.to_be_bytes());
                 buff[32..40].copy_from_slice(&overflow.to_be_bytes());
-                buff[40..40 + raw.len()].copy_from_slice(raw);
+                buff[40..40 + raw.len()].copy_from_slice(raw.slice());
             }
             WalKind::InteriorDelete {
                 txid,
@@ -600,9 +602,9 @@ impl<'a> WalKind<'a> {
                 buff[22..24].copy_from_slice(&(*index as u16).to_be_bytes());
                 buff[24..32].copy_from_slice(&old_ptr.to_be_bytes());
                 buff[32..40].copy_from_slice(&old_overflow.to_be_bytes());
-                buff[40..].copy_from_slice(old_raw);
+                buff[40..].copy_from_slice(old_raw.slice());
             }
-            WalKind::InteriorUndoDelete { txid, pgid, index } => {
+            WalKind::InteriorDeleteForUndo { txid, pgid, index } => {
                 assert!(*index <= u16::MAX as usize);
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
@@ -659,9 +661,9 @@ impl<'a> WalKind<'a> {
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..18].copy_from_slice(&page_version.to_be_bytes());
                 buff[18..20].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[20..20 + payload.len()].copy_from_slice(payload);
+                buff[20..20 + payload.len()].copy_from_slice(payload.slice());
             }
-            WalKind::LeafUndoReset { txid, pgid } => {
+            WalKind::LeafResetForUndo { txid, pgid } => {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
             }
@@ -676,7 +678,7 @@ impl<'a> WalKind<'a> {
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..18].copy_from_slice(&page_version.to_be_bytes());
                 buff[18..20].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[20..20 + payload.len()].copy_from_slice(payload);
+                buff[20..20 + payload.len()].copy_from_slice(payload.slice());
             }
             WalKind::LeafInit { txid, pgid } => {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
@@ -703,7 +705,7 @@ impl<'a> WalKind<'a> {
                 buff[20..24].copy_from_slice(&(*key_size as u32).to_be_bytes());
                 buff[24..32].copy_from_slice(&overflow.to_be_bytes());
                 buff[32..36].copy_from_slice(&(*value_size as u32).to_be_bytes());
-                buff[36..].copy_from_slice(raw);
+                buff[36..].copy_from_slice(raw.slice());
             }
             WalKind::LeafDelete {
                 txid,
@@ -726,9 +728,9 @@ impl<'a> WalKind<'a> {
                 buff[20..24].copy_from_slice(&(*old_key_size as u32).to_be_bytes());
                 buff[24..32].copy_from_slice(&old_overflow.to_be_bytes());
                 buff[32..36].copy_from_slice(&(*old_val_size as u32).to_be_bytes());
-                buff[36..].copy_from_slice(old_raw);
+                buff[36..].copy_from_slice(old_raw.slice());
             }
-            WalKind::LeafUndoDelete { txid, pgid, index } => {
+            WalKind::LeafDeleteForUndo { txid, pgid, index } => {
                 assert!(*index <= u16::MAX as usize);
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
@@ -771,9 +773,9 @@ impl<'a> WalKind<'a> {
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..18].copy_from_slice(&page_version.to_be_bytes());
                 buff[18..20].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[20..20 + payload.len()].copy_from_slice(payload);
+                buff[20..20 + payload.len()].copy_from_slice(payload.slice());
             }
-            WalKind::OverflowUndoReset { txid, pgid } => {
+            WalKind::OverflowResetForUndo { txid, pgid } => {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
             }
@@ -792,9 +794,9 @@ impl<'a> WalKind<'a> {
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
                 buff[16..24].copy_from_slice(&next.to_be_bytes());
                 buff[24..26].copy_from_slice(&(raw.len() as u16).to_be_bytes());
-                buff[26..26 + raw.len()].copy_from_slice(raw);
+                buff[26..26 + raw.len()].copy_from_slice(raw.slice());
             }
-            WalKind::OverflowUndoSetContent { txid, pgid } => {
+            WalKind::OverflowSetContentForUndo { txid, pgid } => {
                 buff[0..8].copy_from_slice(&txid.to_be_bytes());
                 buff[8..16].copy_from_slice(&pgid.to_be_bytes());
             }
@@ -885,14 +887,14 @@ impl<'a> WalKind<'a> {
                     old_page_count,
                 })
             }
-            WAL_RECORD_HEADER_UNDO_SET_KIND => {
+            WAL_RECORD_HEADER_SET_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
                 let page_count = buff[24..32].read_u64();
-                Ok(Self::HeaderUndoSet {
+                Ok(Self::HeaderSetForUndo {
                     txid,
                     root,
                     freelist,
@@ -931,17 +933,17 @@ impl<'a> WalKind<'a> {
                     txid,
                     pgid,
                     page_version,
-                    payload: &buff[20..20 + size as usize],
+                    payload: Bytes::new(&buff[20..20 + size as usize]),
                 })
             }
-            WAL_RECORD_INTERIOR_UNDO_RESET_KIND => {
+            WAL_RECORD_INTERIOR_RESET_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::InteriorUndoReset { txid, pgid })
+                Ok(Self::InteriorResetForUndo { txid, pgid })
             }
             WAL_RECORD_INTERIOR_SET_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
@@ -956,7 +958,7 @@ impl<'a> WalKind<'a> {
                     txid,
                     pgid,
                     page_version,
-                    payload: &buff[20..20 + size as usize],
+                    payload: Bytes::new(&buff[20..20 + size as usize]),
                 })
             }
             WAL_RECORD_INTERIOR_INIT_KIND => {
@@ -989,7 +991,7 @@ impl<'a> WalKind<'a> {
                     txid,
                     pgid,
                     index: index as usize,
-                    raw: &buff[40..40 + raw_size as usize],
+                    raw: Bytes::new(&buff[40..40 + raw_size as usize]),
                     ptr,
                     key_size: key_size as usize,
                     overflow,
@@ -1013,21 +1015,21 @@ impl<'a> WalKind<'a> {
                     txid,
                     pgid,
                     index: index as usize,
-                    old_raw: &buff[40..40 + raw_size as usize],
+                    old_raw: Bytes::new(&buff[40..40 + raw_size as usize]),
                     old_ptr,
                     old_overflow,
                     old_key_size: key_size as usize,
                 })
             }
-            WAL_RECORD_INTERIOR_UNDO_DELETE_KIND => {
+            WAL_RECORD_INTERIOR_DELETE_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let index = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                Ok(Self::InteriorUndoDelete {
+                let index = buff[16..18].read_u16();
+                Ok(Self::InteriorDeleteForUndo {
                     txid,
                     pgid,
                     index: index as usize,
@@ -1042,7 +1044,7 @@ impl<'a> WalKind<'a> {
                 };
                 let overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
                 let old_overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[32..34].try_into().unwrap());
+                let index = buff[32..34].read_u16();
                 Ok(Self::InteriorSetCellOverflow {
                     txid,
                     pgid,
@@ -1064,7 +1066,7 @@ impl<'a> WalKind<'a> {
                 let Some(old_ptr) = PageId::from_be_bytes(buff[24..32].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let index = u16::from_be_bytes(buff[32..34].try_into().unwrap());
+                let index = buff[32..34].read_u16();
                 Ok(Self::InteriorSetCellPtr {
                     txid,
                     pgid,
@@ -1101,23 +1103,23 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let page_version = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
+                let page_version = buff[16..18].read_u16();
+                let size = buff[18..20].read_u16();
                 Ok(Self::LeafReset {
                     txid,
                     pgid,
                     page_version,
-                    payload: &buff[20..20 + size as usize],
+                    payload: Bytes::new(&buff[20..20 + size as usize]),
                 })
             }
-            WAL_RECORD_LEAF_UNDO_RESET_KIND => {
+            WAL_RECORD_LEAF_RESET_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::LeafUndoReset { txid, pgid })
+                Ok(Self::LeafResetForUndo { txid, pgid })
             }
             WAL_RECORD_LEAF_SET_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
@@ -1126,13 +1128,13 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let page_version = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
+                let page_version = buff[16..18].read_u16();
+                let size = buff[18..20].read_u16();
                 Ok(Self::LeafSet {
                     txid,
                     pgid,
                     page_version,
-                    payload: &buff[20..20 + size as usize],
+                    payload: Bytes::new(&buff[20..20 + size as usize]),
                 })
             }
             WAL_RECORD_LEAF_INIT_KIND => {
@@ -1151,16 +1153,16 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let index = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
-                let key_size = u32::from_be_bytes(buff[20..24].try_into().unwrap());
+                let index = buff[16..18].read_u16();
+                let raw_size = buff[18..20].read_u16();
+                let key_size = buff[20..24].read_u32();
                 let overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let value_size = u32::from_be_bytes(buff[32..36].try_into().unwrap());
+                let value_size = buff[32..36].read_u32();
                 Ok(Self::LeafInsert {
                     txid,
                     pgid,
                     index: index as usize,
-                    raw: &buff[36..36 + raw_size as usize],
+                    raw: Bytes::new(&buff[36..36 + raw_size as usize]),
                     overflow,
                     key_size: key_size as usize,
                     value_size: value_size as usize,
@@ -1173,30 +1175,30 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let index = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
-                let old_key_size = u32::from_be_bytes(buff[20..24].try_into().unwrap());
+                let index = buff[16..18].read_u16();
+                let raw_size = buff[18..20].read_u16();
+                let old_key_size = buff[20..24].read_u32();
                 let old_overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let old_val_size = u32::from_be_bytes(buff[32..36].try_into().unwrap());
+                let old_val_size = buff[32..36].read_u32();
                 Ok(Self::LeafDelete {
                     txid,
                     pgid,
                     index: index as usize,
-                    old_raw: &buff[36..36 + raw_size as usize],
+                    old_raw: Bytes::new(&buff[36..36 + raw_size as usize]),
                     old_overflow,
                     old_key_size: old_key_size as usize,
                     old_val_size: old_val_size as usize,
                 })
             }
-            WAL_RECORD_LEAF_UNDO_DELETE_KIND => {
+            WAL_RECORD_LEAF_DELETE_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let index = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                Ok(Self::LeafUndoDelete {
+                let index = buff[16..18].read_u16();
+                Ok(Self::LeafDeleteForUndo {
                     txid,
                     pgid,
                     index: index as usize,
@@ -1211,7 +1213,7 @@ impl<'a> WalKind<'a> {
                 };
                 let overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
                 let old_overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[32..34].try_into().unwrap());
+                let index = buff[32..34].read_u16();
                 Ok(Self::LeafSetOverflow {
                     txid,
                     pgid,
@@ -1244,23 +1246,23 @@ impl<'a> WalKind<'a> {
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                let page_version = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[18..20].try_into().unwrap());
+                let page_version = buff[16..18].read_u16();
+                let size = buff[18..20].read_u16();
                 Ok(Self::OverflowReset {
                     txid,
                     pgid,
                     page_version,
-                    payload: &buff[20..20 + size as usize],
+                    payload: Bytes::new(&buff[20..20 + size as usize]),
                 })
             }
-            WAL_RECORD_OVERFLOW_UNDO_RESET_KIND => {
+            WAL_RECORD_OVERFLOW_RESET_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::OverflowUndoReset { txid, pgid })
+                Ok(Self::OverflowResetForUndo { txid, pgid })
             }
             WAL_RECORD_OVERFLOW_INIT_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
@@ -1279,22 +1281,22 @@ impl<'a> WalKind<'a> {
                     return Err(anyhow!("zero page id"));
                 };
                 let next = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[24..26].try_into().unwrap());
+                let size = buff[24..26].read_u16();
                 Ok(Self::OverflowSetContent {
                     txid,
                     pgid,
                     next,
-                    raw: &buff[26..26 + size as usize],
+                    raw: Bytes::new(&buff[26..26 + size as usize]),
                 })
             }
-            WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND => {
+            WAL_RECORD_OVERFLOW_SET_CONTENT_FOR_UNDO_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
                     return Err(anyhow!("empty transaction id"));
                 };
                 let Some(pgid) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
                     return Err(anyhow!("zero page id"));
                 };
-                Ok(Self::OverflowUndoSetContent { txid, pgid })
+                Ok(Self::OverflowSetContentForUndo { txid, pgid })
             }
             WAL_RECORD_OVERFLOW_SET_NEXT_KIND => {
                 let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
@@ -1338,7 +1340,7 @@ impl<'a> WalKind<'a> {
 
                 let root = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
                 let freelist = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
+                let page_count = buff[40..48].read_u64();
                 Ok(Self::Checkpoint {
                     active_tx,
                     root,
@@ -1435,7 +1437,7 @@ mod tests {
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::HeaderUndoSet {
+                kind: WalKind::HeaderSetForUndo {
                     txid: TxId::new(1011).unwrap(),
                     root: PageId::new(23),
                     freelist: PageId::new(101),
@@ -1462,12 +1464,12 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                     page_version: 12,
-                    payload: b"this_is_just_a_dummy_bytes",
+                    payload: Bytes::new(b"this_is_just_a_dummy_bytes"),
                 },
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::InteriorUndoReset {
+                kind: WalKind::InteriorResetForUndo {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                 },
@@ -1478,7 +1480,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                     page_version: 0,
-                    payload: b"this_is_just_a_dummy_bytes",
+                    payload: Bytes::new(b"this_is_just_a_dummy_bytes"),
                 },
             },
             WalEntry {
@@ -1495,7 +1497,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: 0,
-                    raw: b"content",
+                    raw: Bytes::new(b"content"),
                     ptr: PageId::new(101).unwrap(),
                     key_size: 2,
                     overflow: None,
@@ -1507,7 +1509,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: u16::MAX as usize,
-                    raw: b"key00000",
+                    raw: Bytes::new(b"key00000"),
                     ptr: PageId::new(101).unwrap(),
                     key_size: 123456789,
                     overflow: PageId::new(202),
@@ -1519,7 +1521,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(99).unwrap(),
                     index: 17,
-                    old_raw: b"the_old_raw_content",
+                    old_raw: Bytes::new(b"the_old_raw_content"),
                     old_ptr: PageId::new(10).unwrap(),
                     old_overflow: None,
                     old_key_size: 19,
@@ -1531,7 +1533,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(99).unwrap(),
                     index: 17,
-                    old_raw: b"the_old_raw_content",
+                    old_raw: Bytes::new(b"the_old_raw_content"),
                     old_ptr: PageId::new(10).unwrap(),
                     old_overflow: PageId::new(1),
                     old_key_size: 1000,
@@ -1539,7 +1541,7 @@ mod tests {
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::InteriorUndoDelete {
+                kind: WalKind::InteriorDeleteForUndo {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(99).unwrap(),
                     index: 17,
@@ -1600,12 +1602,12 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                     page_version: 12,
-                    payload: b"this_is_just_a_dummy_bytes",
+                    payload: Bytes::new(b"this_is_just_a_dummy_bytes"),
                 },
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::LeafUndoReset {
+                kind: WalKind::LeafResetForUndo {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                 },
@@ -1616,7 +1618,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                     page_version: 0,
-                    payload: b"this_is_just_a_dummy_bytes",
+                    payload: Bytes::new(b"this_is_just_a_dummy_bytes"),
                 },
             },
             WalEntry {
@@ -1632,7 +1634,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: 0,
-                    raw: b"key00000val00000",
+                    raw: Bytes::new(b"key00000val00000"),
                     overflow: None,
                     key_size: 8,
                     value_size: 8,
@@ -1644,7 +1646,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: 23,
-                    raw: b"key0",
+                    raw: Bytes::new(b"key0"),
                     overflow: PageId::new(101),
                     key_size: 8,
                     value_size: 8,
@@ -1656,7 +1658,7 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: 22,
-                    old_raw: b"key0",
+                    old_raw: Bytes::new(b"key0"),
                     old_overflow: PageId::new(101),
                     old_key_size: 8,
                     old_val_size: 8,
@@ -1664,7 +1666,7 @@ mod tests {
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::LeafUndoDelete {
+                kind: WalKind::LeafDeleteForUndo {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(100).unwrap(),
                     index: 22,
@@ -1733,12 +1735,12 @@ mod tests {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                     page_version: 0,
-                    payload: b"this_is_just_a_dummy_bytes",
+                    payload: Bytes::new(b"this_is_just_a_dummy_bytes"),
                 },
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::OverflowUndoReset {
+                kind: WalKind::OverflowResetForUndo {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                 },
@@ -1755,7 +1757,7 @@ mod tests {
                 kind: WalKind::OverflowSetContent {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
-                    raw: b"this_is_just_a_dummy_bytes",
+                    raw: Bytes::new(b"this_is_just_a_dummy_bytes"),
                     next: None,
                 },
             },
@@ -1764,13 +1766,13 @@ mod tests {
                 kind: WalKind::OverflowSetContent {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
-                    raw: b"this_is_just_a_dummy_bytes",
+                    raw: Bytes::new(b"this_is_just_a_dummy_bytes"),
                     next: PageId::new(912),
                 },
             },
             WalEntry {
                 clr: Some(Lsn::new(99)),
-                kind: WalKind::OverflowUndoSetContent {
+                kind: WalKind::OverflowSetContentForUndo {
                     txid: TxId::new(1011).unwrap(),
                     pgid: PageId::new(23).unwrap(),
                 },

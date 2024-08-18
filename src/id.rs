@@ -79,13 +79,14 @@ impl Lsn {
     }
 
     #[inline]
-    pub(crate) fn add(&self, rhs: u64) -> Self {
-        Self::new(self.0 + rhs)
+    pub(crate) fn sub(&self, rhs: u64) -> Self {
+        Self::new(self.0.checked_sub(rhs).unwrap())
     }
 
     #[inline]
-    pub(crate) fn sub(&self, rhs: u64) -> Self {
-        Self::new(self.0.checked_sub(rhs).unwrap())
+    pub(crate) fn sub_assign(&mut self, rhs: u64) {
+        self.0 -= rhs;
+        assert!(self.0 != u64::MAX);
     }
 }
 

@@ -46,11 +46,29 @@ pub(crate) trait Content {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub(crate) struct Bytes<'a>(&'a [u8]);
+
+impl<'a> std::fmt::Debug for Bytes<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for x in self.0 {
+            write!(f, "{:02x}", x)?;
+        }
+        Ok(())
+    }
+}
 
 impl Bytes<'_> {
     pub(crate) fn new(bytes: &[u8]) -> Bytes {
         Bytes(bytes)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn slice(&self) -> &[u8] {
+        self.0
     }
 }
 

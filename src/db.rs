@@ -3,14 +3,13 @@ use crate::btree::{BTreeRead, BTreeWrite, Cursor};
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
 use crate::pager::{DbState, LogContext, Pager};
-use crate::recovery_v2::{recover, undo_txn};
-use crate::wal_v2::Wal;
+use crate::recovery::{recover, undo_txn};
+use crate::wal::Wal;
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::ops::RangeBounds;
-use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -139,9 +138,7 @@ impl Db {
     }
 
     fn load_db_header(f: &mut File) -> anyhow::Result<Header> {
-        let meta = f.metadata()?;
-        let size = meta.size();
-
+        let size = f.metadata()?.len();
         if size < 2 * DB_HEADER_SIZE as u64 {
             return Self::init_db(f);
         }

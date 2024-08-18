@@ -1,1799 +1,1294 @@
-use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId, TxIdExt};
-use anyhow::anyhow;
+use crate::id::Lsn;
+use crate::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
+use crate::pager::MAXIMUM_PAGE_SIZE;
+use anyhow::{anyhow, Context};
 use parking_lot::{Mutex, RwLock};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
+use std::sync::Arc;
+use std::thread::spawn;
 
-// TODO: when a txn is committed, we need to flush their commit log record to disk. But,
-// we can actually start the next transaction right away without waiting for the flush to complete.
-// We just need to block the `commit()` call until the flush is done. This way, we can improve
-// the throughput of the system. Also flushing the log to disk can be done in a separate thread
-// making the flushing process non-blocking.
+const BUFFER_SIZE: usize = MAXIMUM_PAGE_SIZE * 20;
+
 pub(crate) struct Wal {
-    f: Mutex<File>,
-
-    relative_lsn_offset: u64,
-
-    internal: RwLock<WalInternal>,
+    f1: Arc<Mutex<WalFile>>,
+    f2: Arc<Mutex<WalFile>>,
+    buffer: Arc<RwLock<Buffer>>,
+    internal: Arc<RwLock<WalInternal>>,
+    flush_trigger: SyncSender<()>,
+    iter_backward_lock: Mutex<()>,
 }
 
-struct WalInternal {
-    buffer: Vec<u8>,
-    offset_end: usize,
-    first_lsn_in_buffer: Option<Lsn>,
-    next_lsn: Lsn,
+struct WalFile {
+    f: File,
+    relative_lsn: u64,
+    is_empty: bool,
+    checkpoint: bool,
 }
 
-impl Wal {
-    pub(crate) fn new(
-        f: File,
-        relative_lsn_offset: u64,
-        next_lsn: Lsn,
-        page_size: usize,
-    ) -> anyhow::Result<Self> {
-        let buff_size = page_size * 100;
-
-        let f = Mutex::new(f);
-
-        Ok(Wal {
-            f,
-
-            relative_lsn_offset,
-
-            internal: RwLock::new(WalInternal {
-                buffer: vec![0u8; buff_size],
-                offset_end: 0,
-                first_lsn_in_buffer: None,
-                next_lsn,
-            }),
-        })
-    }
-
-    // TODO: some entries like checkpoint begin and checkpoint end don't require transaction id
-    // since they are not associated with any transaction.
-    pub(crate) fn append(
-        &self,
-        txid: TxId,
-        clr: Option<Lsn>,
-        record: WalRecord,
-    ) -> anyhow::Result<Lsn> {
-        let entry = WalEntry { txid, clr, record };
-        let size = entry.size();
-
-        let mut internal = self.internal.write();
-        if internal.offset_end + size > internal.buffer.len() {
-            Self::flush(&mut self.f.lock(), &mut internal)?;
-        }
-
-        let offset_end = internal.offset_end;
-        let lsn = internal.next_lsn;
-        entry.encode(&mut internal.buffer[offset_end..offset_end + size]);
-        internal.offset_end += size;
-        internal.next_lsn.add_assign(size as u64);
-
-        if internal.first_lsn_in_buffer.is_none() {
-            internal.first_lsn_in_buffer = Some(lsn);
-        }
-
-        log::debug!("appended wal entry={entry:?} lsn={lsn:?}");
-        Ok(lsn)
-    }
-
-    // TODO: some entries like checkpoint begin and checkpoint end don't require transaction id
-    // since they are not associated with any transaction.
-    pub(crate) fn update_checkpoint(&self, checkpoint_begin_lsn: Lsn) -> anyhow::Result<()> {
-        let wal_header = WalHeader {
-            version: 0,
-            checkpoint: Some(checkpoint_begin_lsn),
-            relative_lsn_offset: 0,
-        };
-
-        let mut f = self.f.lock();
-        write_wal_header(&mut f, &wal_header)?;
-        drop(f);
-
-        Ok(())
-    }
-
-    pub(crate) fn sync(&self, _lsn: Lsn) -> anyhow::Result<()> {
-        // TODO: improve this to only flush necessary buffer that contains targetted lsn
-        let mut internal = self.internal.write();
-        Self::flush(&mut self.f.lock(), &mut internal)
-    }
-
-    fn flush(f: &mut File, internal: &mut WalInternal) -> anyhow::Result<()> {
-        // TODO(important): I think this is wrong, we should seek to the last log
-        f.seek(SeekFrom::End(0))?;
-        f.write_all(&internal.buffer[..internal.offset_end])?;
-        f.sync_all()?;
-        internal.offset_end = 0;
-        internal.first_lsn_in_buffer = None;
-        Ok(())
-    }
-
-    pub(crate) fn iterate_back(&self, upper_bound: Lsn) -> WalBackwardIterator {
-        let internal = self.internal.read();
-        let mut buffer = vec![0u8; internal.buffer.len()];
-        let buffer_len = buffer.len();
-        if let Some(first_lsn_in_buffer) = internal.first_lsn_in_buffer {
-            if upper_bound > first_lsn_in_buffer {
-                let offset = upper_bound.get() - first_lsn_in_buffer.get();
-                let to_copy = &internal.buffer[..offset as usize];
-                buffer[buffer_len - to_copy.len()..].copy_from_slice(to_copy);
-                return WalBackwardIterator {
-                    wal: self,
-                    lsn: upper_bound,
-                    buffer,
-                    start_offset: buffer_len - to_copy.len(),
-                    end_offset: buffer_len,
-                };
-            }
-        }
-
-        WalBackwardIterator {
-            wal: self,
-            lsn: upper_bound,
-            buffer,
-            start_offset: buffer_len,
-            end_offset: buffer_len,
-        }
-    }
-
-    pub(crate) fn shutdown(self) -> anyhow::Result<()> {
-        let internal = self.internal.into_inner();
-
-        let mut f = self.f.into_inner();
-        f.write_all(&internal.buffer[..internal.offset_end])?;
-        f.sync_all()?;
-
-        Ok(())
-    }
-}
-
-// TODO: check if we handle incomplete write when iterating the wal backward.
-
-pub(crate) struct WalBackwardIterator<'a> {
-    wal: &'a Wal,
-
-    lsn: Lsn,
-    buffer: Vec<u8>,
+struct Buffer {
+    buff: Vec<u8>,
     start_offset: usize,
     end_offset: usize,
 }
 
-impl<'a> WalBackwardIterator<'a> {
-    pub(crate) fn next(&mut self) -> anyhow::Result<Option<(Lsn, WalEntry)>> {
-        let offset = self.lsn.get() - self.wal.relative_lsn_offset;
-        if offset as usize <= 2 * WAL_HEADER_SIZE {
-            return Ok(None);
-        }
-
-        if self.end_offset < 16 {
-            self.reset();
-        }
-
-        let buff = &self.buffer[self.start_offset..self.end_offset];
-        if buff.len() < 16 {
-            let s = 16 - buff.len();
-            let mut f = self.wal.f.lock();
-            f.seek(SeekFrom::Start(offset - 16))?;
-            f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
-            self.start_offset -= s;
-        }
-
-        let recorded_checksum = u64::from_be_bytes(
-            self.buffer[self.end_offset - 8..self.end_offset]
-                .try_into()
-                .unwrap(),
-        );
-        let rec_size = u16::from_be_bytes(
-            self.buffer[self.end_offset - 16..self.end_offset - 16 + 2]
-                .try_into()
-                .unwrap(),
-        );
-        let magic_buff = &self.buffer[self.end_offset - 16 + 2..self.end_offset - 8];
-        assert!(magic_buff == b"abcxyz");
-
-        let size = WalEntry::size_by_record_size(rec_size as usize);
-        if self.end_offset < size {
-            self.reset();
-        }
-
-        let buff_len = self.end_offset - self.start_offset;
-        if buff_len < size {
-            let s = size - buff_len;
-            let mut f = self.wal.f.lock();
-            f.seek(SeekFrom::Start(offset - size as u64))?;
-            f.read_exact(&mut self.buffer[self.start_offset - s..self.start_offset])?;
-            self.start_offset -= s;
-        }
-
-        let calculated_checksum = crc64::crc64(
-            0x1d0f,
-            &self.buffer[self.end_offset - size..self.end_offset - 8],
-        );
-        if recorded_checksum != calculated_checksum {
-            // TODO: maybe we can consider this entry as "uncompleted" and then skip it? but if
-            // it's in the middle of the WAL, this entry should be considered broken.
-            // We might also need to consider double buffering for wal entries though.
-            todo!("mismatch checksum recorded_checksum:{recorded_checksum} calculated_checksum:{calculated_checksum}");
-        }
-
-        match WalEntry::decode(&self.buffer[self.end_offset - size..self.end_offset]) {
-            WalDecodeResult::Ok(entry) => {
-                self.lsn = Lsn::new(self.lsn.get() - size as u64);
-                self.end_offset -= size;
-                Ok(Some((self.lsn, entry)))
-            }
-
-            WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
-                Err(anyhow!("can't decode wal entry"))
-            }
-            WalDecodeResult::Err(err) => Err(err),
+impl Buffer {
+    #[inline]
+    fn len(&self) -> usize {
+        if self.start_offset <= self.end_offset {
+            self.end_offset - self.start_offset
+        } else {
+            self.end_offset + self.buff.len() - self.start_offset
         }
     }
 
-    fn reset(&mut self) {
-        let len = self.end_offset - self.start_offset;
-        let buffer_len = self.buffer.len();
-        for i in 0..len {
-            self.buffer[buffer_len - i] = self.buffer[self.end_offset - 1];
-        }
-        self.end_offset = buffer_len;
-        self.start_offset = buffer_len - len;
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum WalRecord<'a> {
-    Begin,
-    Commit,
-    Rollback,
-    End,
-
-    HeaderSet {
-        root: Option<PageId>,
-        old_root: Option<PageId>,
-
-        freelist: Option<PageId>,
-        old_freelist: Option<PageId>,
-
-        page_count: u64,
-        old_page_count: u64,
-    },
-    HeaderUndoSet {
-        root: Option<PageId>,
-        freelist: Option<PageId>,
-        page_count: u64,
-    },
-    AllocPage {
-        pgid: PageId,
-    },
-    DeallocPage {
-        pgid: PageId,
-    },
-
-    InteriorReset {
-        pgid: PageId,
-        page_version: u16,
-        payload: &'a [u8],
-    },
-    InteriorUndoReset {
-        pgid: PageId,
-    },
-    InteriorSet {
-        pgid: PageId,
-        page_version: u16,
-        payload: &'a [u8],
-    },
-    InteriorInit {
-        pgid: PageId,
-        last: PageId,
-    },
-    InteriorInsert {
-        pgid: PageId,
-        index: usize,
-        raw: &'a [u8],
-        ptr: PageId,
-        key_size: usize,
-        overflow: Option<PageId>,
-    },
-    InteriorDelete {
-        pgid: PageId,
-        index: usize,
-        old_raw: &'a [u8],
-        old_ptr: PageId,
-        old_overflow: Option<PageId>,
-        old_key_size: usize,
-    },
-    InteriorUndoDelete {
-        pgid: PageId,
-        index: usize,
-    },
-    InteriorSetCellOverflow {
-        pgid: PageId,
-        index: usize,
-        overflow: Option<PageId>,
-        old_overflow: Option<PageId>,
-    },
-    InteriorSetCellPtr {
-        pgid: PageId,
-        index: usize,
-        ptr: PageId,
-        old_ptr: PageId,
-    },
-    InteriorSetLast {
-        pgid: PageId,
-        last: PageId,
-        old_last: PageId,
-    },
-
-    LeafReset {
-        pgid: PageId,
-        page_version: u16,
-        payload: &'a [u8],
-    },
-    LeafUndoReset {
-        pgid: PageId,
-    },
-    LeafSet {
-        pgid: PageId,
-        page_version: u16,
-        payload: &'a [u8],
-    },
-    LeafInit {
-        pgid: PageId,
-    },
-    LeafInsert {
-        pgid: PageId,
-        index: usize,
-        raw: &'a [u8],
-        overflow: Option<PageId>,
-        key_size: usize,
-        value_size: usize,
-    },
-    LeafDelete {
-        pgid: PageId,
-        index: usize,
-        old_raw: &'a [u8],
-        old_overflow: Option<PageId>,
-        old_key_size: usize,
-        old_val_size: usize,
-    },
-    LeafUndoDelete {
-        pgid: PageId,
-        index: usize,
-    },
-    LeafSetOverflow {
-        pgid: PageId,
-        index: usize,
-        overflow: Option<PageId>,
-        old_overflow: Option<PageId>,
-    },
-    LeafSetNext {
-        pgid: PageId,
-        next: Option<PageId>,
-        old_next: Option<PageId>,
-    },
-
-    OverflowReset {
-        pgid: PageId,
-        page_version: u16,
-        payload: &'a [u8],
-    },
-    OverflowUndoReset {
-        pgid: PageId,
-    },
-    OverflowInit {
-        pgid: PageId,
-    },
-    OverflowSetContent {
-        pgid: PageId,
-        raw: &'a [u8],
-        next: Option<PageId>,
-    },
-    OverflowUndoSetContent {
-        pgid: PageId,
-    },
-    OverflowSetNext {
-        pgid: PageId,
-        next: Option<PageId>,
-        old_next: Option<PageId>,
-    },
-
-    CheckpointBegin {
-        active_tx: TxState,
-        root: Option<PageId>,
-        freelist: Option<PageId>,
-        page_count: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TxState {
-    None,
-    Active(TxId),
-    Committing(TxId),
-    // TODO: we may need to add last undone lsn here
-    Aborting {
-        txid: TxId,
-        rollback: Lsn,
-        last_undone: Lsn,
-    },
-}
-
-const WAL_RECORD_BEGIN_KIND: u8 = 1;
-const WAL_RECORD_COMMIT_KIND: u8 = 2;
-const WAL_RECORD_ROLLBACK_KIND: u8 = 3;
-const WAL_RECORD_END_KIND: u8 = 4;
-
-const WAL_RECORD_HEADER_SET_KIND: u8 = 10;
-const WAL_RECORD_HEADER_UNDO_SET_KIND: u8 = 11;
-const WAL_RECORD_ALLOC_PAGE_KIND: u8 = 12;
-const WAL_RECORD_DEALLOC_PAGE_KIND: u8 = 13;
-
-const WAL_RECORD_INTERIOR_RESET_KIND: u8 = 20;
-const WAL_RECORD_INTERIOR_UNDO_RESET_KIND: u8 = 21;
-const WAL_RECORD_INTERIOR_SET_KIND: u8 = 22;
-const WAL_RECORD_INTERIOR_INIT_KIND: u8 = 23;
-const WAL_RECORD_INTERIOR_INSERT_KIND: u8 = 24;
-const WAL_RECORD_INTERIOR_DELETE_KIND: u8 = 25;
-const WAL_RECORD_INTERIOR_UNDO_DELETE_KIND: u8 = 26;
-const WAL_RECORD_INTERIOR_SET_CELL_OVERFLOW_KIND: u8 = 27;
-const WAL_RECORD_INTERIOR_SET_CELL_PTR_KIND: u8 = 28;
-const WAL_RECORD_INTERIOR_SET_LAST_KIND: u8 = 29;
-
-const WAL_RECORD_LEAF_RESET_KIND: u8 = 30;
-const WAL_RECORD_LEAF_UNDO_RESET_KIND: u8 = 31;
-const WAL_RECORD_LEAF_SET_KIND: u8 = 32;
-const WAL_RECORD_LEAF_INIT_KIND: u8 = 33;
-const WAL_RECORD_LEAF_INSERT_KIND: u8 = 34;
-const WAL_RECORD_LEAF_DELETE_KIND: u8 = 35;
-const WAL_RECORD_LEAF_UNDO_DELETE_KIND: u8 = 36;
-const WAL_RECORD_LEAF_SET_CELL_OVERFLOW_KIND: u8 = 37;
-const WAL_RECORD_LEAF_SET_NEXT_KIND: u8 = 38;
-
-const WAL_RECORD_OVERFLOW_RESET_KIND: u8 = 40;
-const WAL_RECORD_OVERFLOW_UNDO_RESET_KIND: u8 = 41;
-const WAL_RECORD_OVERFLOW_INIT_KIND: u8 = 42;
-const WAL_RECORD_OVERFLOW_SET_CONTENT_KIND: u8 = 43;
-const WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND: u8 = 44;
-const WAL_RECORD_OVERFLOW_SET_NEXT_KIND: u8 = 45;
-
-const WAL_RECORD_CHECKPOINT_BEGIN_KIND: u8 = 100;
-
-impl<'a> WalRecord<'a> {
-    fn kind(&self) -> u8 {
-        match self {
-            WalRecord::Begin => WAL_RECORD_BEGIN_KIND,
-            WalRecord::Commit => WAL_RECORD_COMMIT_KIND,
-            WalRecord::Rollback => WAL_RECORD_ROLLBACK_KIND,
-            WalRecord::End => WAL_RECORD_END_KIND,
-
-            WalRecord::HeaderSet { .. } => WAL_RECORD_HEADER_SET_KIND,
-            WalRecord::HeaderUndoSet { .. } => WAL_RECORD_HEADER_UNDO_SET_KIND,
-            WalRecord::AllocPage { .. } => WAL_RECORD_ALLOC_PAGE_KIND,
-            WalRecord::DeallocPage { .. } => WAL_RECORD_DEALLOC_PAGE_KIND,
-
-            WalRecord::InteriorReset { .. } => WAL_RECORD_INTERIOR_RESET_KIND,
-            WalRecord::InteriorUndoReset { .. } => WAL_RECORD_INTERIOR_UNDO_RESET_KIND,
-            WalRecord::InteriorSet { .. } => WAL_RECORD_INTERIOR_SET_KIND,
-            WalRecord::InteriorInit { .. } => WAL_RECORD_INTERIOR_INIT_KIND,
-            WalRecord::InteriorInsert { .. } => WAL_RECORD_INTERIOR_INSERT_KIND,
-            WalRecord::InteriorDelete { .. } => WAL_RECORD_INTERIOR_DELETE_KIND,
-            WalRecord::InteriorUndoDelete { .. } => WAL_RECORD_INTERIOR_UNDO_DELETE_KIND,
-            WalRecord::InteriorSetCellOverflow { .. } => WAL_RECORD_INTERIOR_SET_CELL_OVERFLOW_KIND,
-            WalRecord::InteriorSetCellPtr { .. } => WAL_RECORD_INTERIOR_SET_CELL_PTR_KIND,
-            WalRecord::InteriorSetLast { .. } => WAL_RECORD_INTERIOR_SET_LAST_KIND,
-
-            WalRecord::LeafReset { .. } => WAL_RECORD_LEAF_RESET_KIND,
-            WalRecord::LeafUndoReset { .. } => WAL_RECORD_LEAF_UNDO_RESET_KIND,
-            WalRecord::LeafSet { .. } => WAL_RECORD_LEAF_SET_KIND,
-            WalRecord::LeafInit { .. } => WAL_RECORD_LEAF_INIT_KIND,
-            WalRecord::LeafInsert { .. } => WAL_RECORD_LEAF_INSERT_KIND,
-            WalRecord::LeafDelete { .. } => WAL_RECORD_LEAF_DELETE_KIND,
-            WalRecord::LeafUndoDelete { .. } => WAL_RECORD_LEAF_UNDO_DELETE_KIND,
-            WalRecord::LeafSetOverflow { .. } => WAL_RECORD_LEAF_SET_CELL_OVERFLOW_KIND,
-            WalRecord::LeafSetNext { .. } => WAL_RECORD_LEAF_SET_NEXT_KIND,
-
-            WalRecord::OverflowReset { .. } => WAL_RECORD_OVERFLOW_RESET_KIND,
-            WalRecord::OverflowUndoReset { .. } => WAL_RECORD_OVERFLOW_UNDO_RESET_KIND,
-            WalRecord::OverflowInit { .. } => WAL_RECORD_OVERFLOW_INIT_KIND,
-            WalRecord::OverflowSetContent { .. } => WAL_RECORD_OVERFLOW_SET_CONTENT_KIND,
-            WalRecord::OverflowUndoSetContent { .. } => WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND,
-            WalRecord::OverflowSetNext { .. } => WAL_RECORD_OVERFLOW_SET_NEXT_KIND,
-
-            WalRecord::CheckpointBegin { .. } => WAL_RECORD_CHECKPOINT_BEGIN_KIND,
-        }
-    }
-
+    #[inline]
     fn size(&self) -> usize {
-        match self {
-            WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => 0,
+        self.buff.len()
+    }
+}
 
-            WalRecord::HeaderSet { .. } => 48,
-            WalRecord::HeaderUndoSet { .. } => 24,
-            WalRecord::AllocPage { .. } => 8,
-            WalRecord::DeallocPage { .. } => 8,
+struct WalInternal {
+    temp_buffer: Vec<u8>,
+    use_wal_1: bool,
 
-            WalRecord::InteriorReset { payload, .. } => 8 + 2 + 2 + payload.len(),
-            WalRecord::InteriorUndoReset { .. } => 8,
-            WalRecord::InteriorSet { payload, .. } => 8 + 2 + 2 + payload.len(),
-            WalRecord::InteriorInit { .. } => 16,
-            WalRecord::InteriorInsert { raw, .. } => 32 + raw.len(),
-            WalRecord::InteriorDelete { old_raw, .. } => 32 + old_raw.len(),
-            WalRecord::InteriorUndoDelete { .. } => 10,
-            WalRecord::InteriorSetCellOverflow { .. } => 26,
-            WalRecord::InteriorSetCellPtr { .. } => 26,
-            WalRecord::InteriorSetLast { .. } => 24,
+    next: Lsn,
+    first_unflushed: Lsn,
+}
 
-            WalRecord::LeafReset { payload, .. } => 8 + 2 + 2 + payload.len(),
-            WalRecord::LeafUndoReset { .. } => 8,
-            WalRecord::LeafSet { payload, .. } => 8 + 2 + 2 + payload.len(),
-            WalRecord::LeafInit { .. } => 8,
-            WalRecord::LeafInsert { raw, .. } => 28 + raw.len(),
-            WalRecord::LeafDelete { old_raw, .. } => 28 + old_raw.len(),
-            WalRecord::LeafUndoDelete { .. } => 10,
-            WalRecord::LeafSetOverflow { .. } => 26,
-            WalRecord::LeafSetNext { .. } => 24,
+impl Wal {
+    fn new(f1: WalFile, f2: WalFile, use_wal_1: bool, next_lsn: Lsn) -> Self {
+        let internal = Arc::new(RwLock::new(WalInternal {
+            temp_buffer: vec![0u8; MAXIMUM_PAGE_SIZE],
+            use_wal_1,
+            next: next_lsn,
+            first_unflushed: next_lsn,
+        }));
+        let f1 = Arc::new(Mutex::new(f1));
+        let f2 = Arc::new(Mutex::new(f2));
+        let buffer = Arc::new(RwLock::new(Buffer {
+            buff: vec![0u8; BUFFER_SIZE],
+            start_offset: 0,
+            end_offset: 0,
+        }));
 
-            WalRecord::OverflowReset { payload, .. } => 8 + 2 + 2 + payload.len(),
-            WalRecord::OverflowUndoReset { .. } => 8,
-            WalRecord::OverflowInit { .. } => 8,
-            WalRecord::OverflowSetContent { raw, .. } => 18 + raw.len(),
-            WalRecord::OverflowUndoSetContent { .. } => 8,
-            WalRecord::OverflowSetNext { .. } => 24,
+        let (flush_trigger, flush_signal) = std::sync::mpsc::sync_channel::<()>(0);
+        {
+            let internal = internal.clone();
+            let buffer = buffer.clone();
+            let f1 = f1.clone();
+            let f2 = f2.clone();
+            spawn(move || loop {
+                let result = flush_signal.recv_timeout(std::time::Duration::from_secs(3600));
+                if result == Err(RecvTimeoutError::Disconnected) {
+                    return;
+                }
+                let mut internal = internal.write();
+                let mut buffer = buffer.write();
+                if let Err(err) = Wal::flush(&mut internal, &mut buffer, &f1, &f2) {
+                    log::error!("wal_flush_error err={err}");
+                }
+            });
+        }
 
-            WalRecord::CheckpointBegin { .. } => 56,
+        Wal {
+            f1,
+            f2,
+            buffer,
+            internal,
+            flush_trigger,
+            iter_backward_lock: Mutex::new(()),
         }
     }
 
-    fn encode(&self, buff: &mut [u8]) {
-        match self {
-            WalRecord::Begin | WalRecord::Commit | WalRecord::Rollback | WalRecord::End => (),
+    pub(crate) fn complete_checkpoint(&self, checkpoint_lsn: Lsn) -> anyhow::Result<()> {
+        self.sync(checkpoint_lsn)?;
 
-            WalRecord::HeaderSet {
-                root,
-                old_root,
-                freelist,
-                old_freelist,
-                page_count,
-                old_page_count,
-            } => {
-                buff[0..8].copy_from_slice(&root.to_be_bytes());
-                buff[8..16].copy_from_slice(&old_root.to_be_bytes());
-                buff[16..24].copy_from_slice(&freelist.to_be_bytes());
-                buff[24..32].copy_from_slice(&old_freelist.to_be_bytes());
-                buff[32..40].copy_from_slice(&page_count.to_be_bytes());
-                buff[40..48].copy_from_slice(&old_page_count.to_be_bytes());
-            }
-            WalRecord::HeaderUndoSet {
-                root,
-                freelist,
-                page_count,
-            } => {
-                buff[0..8].copy_from_slice(&root.to_be_bytes());
-                buff[8..16].copy_from_slice(&freelist.to_be_bytes());
-                buff[16..24].copy_from_slice(&page_count.to_be_bytes());
-            }
-            WalRecord::AllocPage { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.to_be_bytes());
-            }
-            WalRecord::DeallocPage { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.to_be_bytes());
-            }
+        let mut internal = self.internal.write();
+        let internal = &mut *internal;
 
-            WalRecord::InteriorReset {
-                pgid,
-                page_version,
-                payload,
-            } => {
-                assert!(payload.len() <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
-                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[12..12 + payload.len()].copy_from_slice(payload);
-            }
-            WalRecord::InteriorUndoReset { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-            }
-            WalRecord::InteriorSet {
-                pgid,
-                page_version,
-                payload,
-            } => {
-                assert!(payload.len() <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
-                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[12..12 + payload.len()].copy_from_slice(payload);
-            }
-            WalRecord::InteriorInit { pgid, last } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&last.get().to_be_bytes());
-            }
-            WalRecord::InteriorInsert {
-                pgid,
-                index,
-                raw,
-                ptr,
-                key_size,
-                overflow,
-            } => {
-                assert!(raw.len() <= u16::MAX as usize);
-                assert!(*key_size <= u32::MAX as usize);
-                assert!(*index <= u16::MAX as usize);
+        let f = if internal.use_wal_1 {
+            &self.f1
+        } else {
+            &self.f2
+        };
+        let mut old_f = f.lock();
 
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..12].copy_from_slice(&(*key_size as u32).to_be_bytes());
-                buff[12..14].copy_from_slice(&(raw.len() as u16).to_be_bytes());
-                buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
-                buff[16..24].copy_from_slice(&ptr.to_be_bytes());
-                buff[24..32].copy_from_slice(&overflow.to_be_bytes());
-                buff[32..32 + raw.len()].copy_from_slice(raw);
-            }
-            WalRecord::InteriorDelete {
-                pgid,
-                index,
-                old_raw,
-                old_ptr,
-                old_overflow,
-                old_key_size,
-            } => {
-                assert!(old_raw.len() <= u16::MAX as usize);
-                assert!(*old_key_size <= u32::MAX as usize);
-                assert!(*index <= u16::MAX as usize);
+        let header = WalHeader {
+            version: 0,
+            checkpoint: Some(checkpoint_lsn),
+            relative_lsn: old_f.relative_lsn,
+        };
 
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..12].copy_from_slice(&(*old_key_size as u32).to_be_bytes());
-                buff[12..14].copy_from_slice(&(old_raw.len() as u16).to_be_bytes());
-                buff[14..16].copy_from_slice(&(*index as u16).to_be_bytes());
-                buff[16..24].copy_from_slice(&old_ptr.to_be_bytes());
-                buff[24..32].copy_from_slice(&old_overflow.to_be_bytes());
-                buff[32..].copy_from_slice(old_raw);
-            }
-            WalRecord::InteriorUndoDelete { pgid, index } => {
-                assert!(*index <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
-            }
-            WalRecord::InteriorSetCellOverflow {
-                pgid,
-                index,
-                overflow,
-                old_overflow,
-            } => {
-                assert!(*index <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&overflow.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
-                buff[24..26].copy_from_slice(&(*index as u16).to_be_bytes());
-            }
-            WalRecord::InteriorSetCellPtr {
-                pgid,
-                index,
-                ptr,
-                old_ptr,
-            } => {
-                assert!(*index <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&ptr.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_ptr.to_be_bytes());
-                buff[24..26].copy_from_slice(&(*index as u16).to_be_bytes());
-            }
-            WalRecord::InteriorSetLast {
-                pgid,
-                last,
-                old_last,
-            } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&last.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_last.to_be_bytes());
-            }
+        let mut buff = [0u8; WAL_HEADER_SIZE * 2];
+        header.encode(&mut buff[..WAL_HEADER_SIZE]);
+        header.encode(&mut buff[WAL_HEADER_SIZE..]);
+        old_f.f.seek(SeekFrom::Start(0))?;
+        old_f.f.write_all(&buff)?;
+        old_f.f.sync_all()?;
+        old_f.is_empty = false;
+        old_f.checkpoint = true;
 
-            WalRecord::LeafReset {
-                pgid,
-                page_version,
-                payload,
-            } => {
-                assert!(payload.len() <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
-                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[12..12 + payload.len()].copy_from_slice(payload);
-            }
-            WalRecord::LeafUndoReset { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-            }
-            WalRecord::LeafSet {
-                pgid,
-                page_version,
-                payload,
-            } => {
-                assert!(payload.len() <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
-                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[12..12 + payload.len()].copy_from_slice(payload);
-            }
-            WalRecord::LeafInit { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-            }
-            WalRecord::LeafInsert {
-                pgid,
-                index,
-                raw,
-                overflow,
-                key_size,
-                value_size,
-            } => {
-                assert!(raw.len() <= u16::MAX as usize);
-                assert!(*index <= u16::MAX as usize);
-                assert!(*key_size <= u32::MAX as usize);
-                assert!(*value_size <= u32::MAX as usize);
+        Ok(())
+    }
 
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
-                buff[10..12].copy_from_slice(&(raw.len() as u16).to_be_bytes());
-                buff[12..16].copy_from_slice(&(*key_size as u32).to_be_bytes());
-                buff[16..24].copy_from_slice(&overflow.to_be_bytes());
-                buff[24..28].copy_from_slice(&(*value_size as u32).to_be_bytes());
-                buff[28..].copy_from_slice(raw);
-            }
-            WalRecord::LeafDelete {
-                pgid,
-                index,
-                old_raw,
-                old_overflow,
-                old_key_size,
-                old_val_size,
-            } => {
-                assert!(old_raw.len() <= u16::MAX as usize);
-                assert!(*index <= u16::MAX as usize);
-                assert!(*old_key_size <= u32::MAX as usize);
-                assert!(*old_val_size <= u32::MAX as usize);
+    fn end_transaction(
+        internal: &mut WalInternal,
+        f1: &Mutex<WalFile>,
+        f2: &Mutex<WalFile>,
+        buffer: &mut Buffer,
+        iter_backward_lock: &Mutex<()>,
+    ) -> anyhow::Result<()> {
+        let backward_iter_guard = iter_backward_lock.try_lock();
+        assert!(
+            backward_iter_guard.is_some(),
+            "cannot end transaction while iterating backward because the wal might be swapped and disrupt the backward iteration",
+        );
 
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
-                buff[10..12].copy_from_slice(&(old_raw.len() as u16).to_be_bytes());
-                buff[12..16].copy_from_slice(&(*old_key_size as u32).to_be_bytes());
-                buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
-                buff[24..28].copy_from_slice(&(*old_val_size as u32).to_be_bytes());
-                buff[28..].copy_from_slice(old_raw);
-            }
-            WalRecord::LeafUndoDelete { pgid, index } => {
-                assert!(*index <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&(*index as u16).to_be_bytes());
-            }
-            WalRecord::LeafSetOverflow {
-                pgid,
-                index,
-                overflow,
-                old_overflow,
-            } => {
-                assert!(*index <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&overflow.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_overflow.to_be_bytes());
-                buff[24..26].copy_from_slice(&(*index as u16).to_be_bytes());
-            }
-            WalRecord::LeafSetNext {
-                pgid,
-                next,
-                old_next,
-            } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&next.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_next.to_be_bytes());
-            }
+        let (old_f, new_f) = if internal.use_wal_1 {
+            (f1, f2)
+        } else {
+            (f2, f1)
+        };
 
-            WalRecord::OverflowReset {
-                pgid,
-                page_version,
-                payload,
-            } => {
-                assert!(payload.len() <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..10].copy_from_slice(&page_version.to_be_bytes());
-                buff[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                buff[12..12 + payload.len()].copy_from_slice(payload);
-            }
-            WalRecord::OverflowUndoReset { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-            }
-            WalRecord::OverflowInit { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-            }
-            WalRecord::OverflowSetContent { pgid, next, raw } => {
-                assert!(raw.len() <= u16::MAX as usize);
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&next.to_be_bytes());
-                buff[16..18].copy_from_slice(&(raw.len() as u16).to_be_bytes());
-                buff[18..18 + raw.len()].copy_from_slice(raw);
-            }
-            WalRecord::OverflowUndoSetContent { pgid } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-            }
-            WalRecord::OverflowSetNext {
-                pgid,
-                next,
-                old_next,
-            } => {
-                buff[0..8].copy_from_slice(&pgid.get().to_be_bytes());
-                buff[8..16].copy_from_slice(&next.to_be_bytes());
-                buff[16..24].copy_from_slice(&old_next.to_be_bytes());
+        let mut old_f = old_f.lock();
+        if !old_f.checkpoint {
+            log::debug!("wal_is_not_swapped no checkpoint yet");
+            return Ok(());
+        }
+
+        Self::flush_internal(internal, buffer, &mut old_f)?;
+
+        // the new wal file is marked empty so that the next time we flush to it,
+        // everything is resetted.
+        let mut new_f = new_f.lock();
+        internal.use_wal_1 = !internal.use_wal_1;
+        new_f.is_empty = true;
+        new_f.checkpoint = false;
+        new_f.relative_lsn = internal.first_unflushed.get();
+
+        Ok(())
+    }
+
+    pub(crate) fn append_log(&self, entry: WalEntry<'_>) -> anyhow::Result<Lsn> {
+        let size = entry.size();
+
+        let mut internal = self.internal.write();
+        let internal = &mut *internal;
+
+        let mut buffer = self.buffer.write();
+        if buffer.len() + size > buffer.size() {
+            Self::flush(internal, &mut buffer, &self.f1, &self.f2)?;
+        }
+
+        let end_offset = buffer.end_offset;
+        if end_offset + size > buffer.size() {
+            let part1 = buffer.size() - end_offset;
+            let part2 = size - part1;
+            entry.encode(&mut internal.temp_buffer[..size]);
+            buffer.buff[end_offset..].copy_from_slice(&internal.temp_buffer[..part1]);
+            buffer.buff[..part2].copy_from_slice(&internal.temp_buffer[part1..size]);
+            buffer.end_offset = part2;
+        } else {
+            entry.encode(&mut buffer.buff[end_offset..end_offset + size]);
+            buffer.end_offset += size;
+        }
+        let lsn = internal.next;
+        internal.next.add_assign(size as u64);
+
+        if buffer.len() > buffer.size() / 4 {
+            let _ = self.flush_trigger.try_send(());
+        }
+
+        if matches!(entry.kind, WalKind::End { .. }) {
+            Self::end_transaction(
+                internal,
+                &self.f1,
+                &self.f2,
+                &mut buffer,
+                &self.iter_backward_lock,
+            )?;
+        }
+
+        log::debug!("wal_appended {lsn:?} {entry:?}");
+        Ok(lsn)
+    }
+
+    fn flush(
+        internal: &mut WalInternal,
+        buffer: &mut Buffer,
+        f1: &Mutex<WalFile>,
+        f2: &Mutex<WalFile>,
+    ) -> anyhow::Result<()> {
+        let f = if internal.use_wal_1 { f1 } else { f2 };
+        let mut f = f.lock();
+        Self::flush_internal(internal, buffer, &mut f)
+    }
+
+    fn flush_internal(
+        internal: &mut WalInternal,
+        buffer: &mut Buffer,
+        f: &mut WalFile,
+    ) -> anyhow::Result<()> {
+        log::debug!(
+            "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={}",
+            internal.use_wal_1,
+            buffer.len(),
+            f.is_empty,
+            f.checkpoint,
+            f.relative_lsn,
+        );
+
+        if f.is_empty {
+            let mut buff = [0u8; WAL_HEADER_SIZE * 2];
+            let header = WalHeader {
+                version: 0,
+                checkpoint: None,
+                relative_lsn: f.relative_lsn,
+            };
+            header.encode(&mut buff[..WAL_HEADER_SIZE]);
+            header.encode(&mut buff[WAL_HEADER_SIZE..]);
+            f.f.set_len(0)?;
+            f.f.seek(SeekFrom::Start(0))?;
+            f.f.write_all(&buff)?;
+            f.is_empty = false;
+        }
+
+        let offset = internal.first_unflushed.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2;
+        f.f.seek(SeekFrom::Start(offset))?;
+
+        if buffer.end_offset < buffer.start_offset {
+            f.f.write_all(&buffer.buff[buffer.start_offset..])?;
+            f.f.write_all(&buffer.buff[..buffer.end_offset])?;
+        } else {
+            f.f.write_all(&buffer.buff[buffer.start_offset..buffer.end_offset])?;
+        }
+        f.f.sync_all()?;
+
+        buffer.start_offset = buffer.end_offset;
+        internal.first_unflushed = internal.next;
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn trigger_flush(&self) -> anyhow::Result<()> {
+        Wal::flush(
+            &mut self.internal.write(),
+            &mut self.buffer.write(),
+            &self.f1,
+            &self.f2,
+        )
+    }
+
+    pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
+        let internal = self.internal.read();
+        assert!(lsn < internal.next);
+        if internal.first_unflushed > lsn {
+            return Ok(());
+        }
+        drop(internal);
+
+        let mut internal = self.internal.write();
+        if internal.first_unflushed > lsn {
+            return Ok(());
+        }
+
+        let mut buffer = self.buffer.write();
+        Self::flush(&mut internal, &mut buffer, &self.f1, &self.f2)?;
+        Ok(())
+    }
+
+    pub(crate) fn iter_back<F>(&self, upper_bound: Lsn, mut handler: F) -> anyhow::Result<()>
+    where
+        F: FnMut(Lsn, WalEntry) -> anyhow::Result<bool>,
+    {
+        let _guard = self.iter_backward_lock.lock();
+
+        let wal_buffer = self.buffer.read();
+        let internal = self.internal.read();
+        let mut buffer = vec![0u8; wal_buffer.size()];
+        let buffer_len = buffer.len();
+
+        let filled = if upper_bound > internal.first_unflushed {
+            let offset = upper_bound.get() - internal.first_unflushed.get();
+            let to_copy = &wal_buffer.buff[..offset as usize];
+            buffer[buffer_len - to_copy.len()..].copy_from_slice(to_copy);
+            to_copy.len()
+        } else {
+            0
+        };
+        drop(wal_buffer);
+
+        // This is ok because:
+        // * All log record of a transaction always comes from a single WAL file or a temporary
+        //   buffer. We will never swap a wal file if there is an active or aborting transaction.
+        // * The database never undo non-last transaction, so the logs must always
+        //   comes from the latest wal file.
+        // * The wal will never be swapped during `iter_back` because in order to swap the WAL, a
+        //   transaction end should be called and it will never happen in the middle of
+        //   `iter_back`.
+        let f = if internal.use_wal_1 {
+            &self.f1
+        } else {
+            &self.f2
+        };
+        drop(internal);
+
+        // Note that it's possible that some entries might not even on `f`, but on the buffer
+
+        let mut current_end_lsn = upper_bound;
+        let mut start_offset = buffer_len - filled;
+        let mut end_offset = buffer_len;
+
+        loop {
+            let mut entry = WalEntry::decode_backward(&buffer[start_offset..end_offset]);
+            if let WalDecodeResult::NeedMoreBytes = entry {
+                let len = end_offset - start_offset;
+                for i in 0..len {
+                    buffer[buffer_len - 1 - i] = buffer[end_offset - 1 - i];
+                }
+                start_offset = buffer_len - len;
+                end_offset = buffer_len;
+
+                let f: &mut WalFile = &mut f.lock();
+                if f.is_empty {
+                    break;
+                }
+
+                let buffer_remaining = start_offset;
+                let f_remaining = current_end_lsn.get() - f.relative_lsn - len as u64;
+                let n_to_read = std::cmp::min(buffer_remaining as u64, f_remaining);
+                if n_to_read == 0 {
+                    break;
+                }
+                let seek_offset = WAL_HEADER_SIZE as u64 * 2 + f_remaining - n_to_read;
+                f.f.seek(SeekFrom::Start(seek_offset))?;
+                f.f.read_exact(&mut buffer[start_offset - n_to_read as usize..start_offset])?;
+                start_offset -= n_to_read as usize;
+                entry = WalEntry::decode_backward(&buffer[start_offset..end_offset]);
             }
 
-            WalRecord::CheckpointBegin {
-                active_tx,
-                root,
-                freelist,
-                page_count,
-            } => {
-                match active_tx {
-                    TxState::None => {
-                        buff[0] = 1;
-                        buff[8..16].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-                    }
-                    TxState::Active(txid) => {
-                        buff[0] = 2;
-                        buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                    }
-                    TxState::Committing(txid) => {
-                        buff[0] = 3;
-                        buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                    }
-                    TxState::Aborting {
-                        txid,
-                        rollback,
-                        last_undone,
-                    } => {
-                        buff[0] = 4;
-                        buff[8..16].copy_from_slice(&txid.to_be_bytes());
-                        buff[16..24].copy_from_slice(&rollback.to_be_bytes());
-                        buff[24..32].copy_from_slice(&last_undone.to_be_bytes());
+            match entry {
+                WalDecodeResult::Ok(entry) => {
+                    let entry_size = entry.size();
+                    let lsn = current_end_lsn.sub(entry_size as u64);
+                    end_offset -= entry_size;
+                    current_end_lsn.sub_assign(entry_size as u64);
+                    if handler(lsn, entry)? {
+                        break;
                     }
                 }
-                buff[32..40].copy_from_slice(&root.to_be_bytes());
-                buff[40..48].copy_from_slice(&freelist.to_be_bytes());
-                buff[48..56].copy_from_slice(&page_count.to_be_bytes());
+                WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
+                    break;
+                }
+                WalDecodeResult::Err(err) => return Err(err),
             }
         }
+
+        Ok(())
     }
 
-    fn decode(buff: &'a [u8], kind: u8) -> anyhow::Result<Self> {
-        match kind {
-            WAL_RECORD_BEGIN_KIND => Ok(Self::Begin),
-            WAL_RECORD_COMMIT_KIND => Ok(Self::Commit),
-            WAL_RECORD_ROLLBACK_KIND => Ok(Self::Rollback),
-            WAL_RECORD_END_KIND => Ok(Self::End),
+    pub(crate) fn shutdown(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
-            WAL_RECORD_HEADER_SET_KIND => {
-                let root = PageId::from_be_bytes(buff[0..8].try_into().unwrap());
-                let old_root = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let freelist = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let old_freelist = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[32..40].try_into().unwrap());
-                let old_page_count = u64::from_be_bytes(buff[40..48].try_into().unwrap());
-                Ok(Self::HeaderSet {
-                    root,
-                    old_root,
-                    freelist,
-                    old_freelist,
-                    page_count,
-                    old_page_count,
-                })
-            }
-            WAL_RECORD_HEADER_UNDO_SET_KIND => {
-                let root = PageId::from_be_bytes(buff[0..8].try_into().unwrap());
-                let freelist = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[16..24].try_into().unwrap());
-                Ok(Self::HeaderUndoSet {
-                    root,
-                    freelist,
-                    page_count,
-                })
-            }
-            WAL_RECORD_ALLOC_PAGE_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::AllocPage { pgid })
-            }
-            WAL_RECORD_DEALLOC_PAGE_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::DeallocPage { pgid })
-            }
+pub(crate) fn recover<F>(path: &Path, mut handler: F) -> anyhow::Result<Wal>
+where
+    F: FnMut(Lsn, WalEntry) -> anyhow::Result<()>,
+{
+    let wal_path_1 = path.join("wal_1");
+    let wal_file_1 = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&wal_path_1)?;
+    if !wal_file_1.metadata()?.is_file() {
+        return Err(anyhow!("{wal_path_1:?} is not a regular file"));
+    }
+    let mut f1 = recover_wal_file(wal_file_1).context("cannot init wal file {wal_path_1:?}")?;
 
-            WAL_RECORD_INTERIOR_RESET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                Ok(Self::InteriorReset {
-                    pgid,
-                    page_version,
-                    payload: &buff[12..12 + size as usize],
-                })
-            }
-            WAL_RECORD_INTERIOR_UNDO_RESET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::InteriorUndoReset { pgid })
-            }
-            WAL_RECORD_INTERIOR_SET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                Ok(Self::InteriorSet {
-                    pgid,
-                    page_version,
-                    payload: &buff[12..12 + size as usize],
-                })
-            }
-            WAL_RECORD_INTERIOR_INIT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let Some(last) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
-                    return Err(anyhow!("zero last pointer in interior node"));
-                };
-                Ok(Self::InteriorInit { pgid, last })
-            }
-            WAL_RECORD_INTERIOR_INSERT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let key_size = u32::from_be_bytes(buff[8..12].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[12..14].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[14..16].try_into().unwrap());
-                let Some(ptr) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
-                    return Err(anyhow!("zero pointer in interior cell"));
-                };
-                let overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                Ok(Self::InteriorInsert {
-                    pgid,
-                    index: index as usize,
-                    raw: &buff[32..32 + raw_size as usize],
-                    ptr,
-                    key_size: key_size as usize,
-                    overflow,
-                })
-            }
-            WAL_RECORD_INTERIOR_DELETE_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let key_size = u32::from_be_bytes(buff[8..12].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[12..14].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[14..16].try_into().unwrap());
-                let Some(old_ptr) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
-                    return Err(anyhow!("zero pointer in interior cell"));
-                };
-                let old_overflow = PageId::from_be_bytes(buff[24..32].try_into().unwrap());
-                Ok(Self::InteriorDelete {
-                    pgid,
-                    index: index as usize,
-                    old_raw: &buff[32..32 + raw_size as usize],
-                    old_ptr,
-                    old_overflow,
-                    old_key_size: key_size as usize,
-                })
-            }
-            WAL_RECORD_INTERIOR_UNDO_DELETE_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                Ok(Self::InteriorUndoDelete {
-                    pgid,
-                    index: index as usize,
-                })
-            }
-            WAL_RECORD_INTERIOR_SET_CELL_OVERFLOW_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let overflow = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let old_overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[24..26].try_into().unwrap());
-                Ok(Self::InteriorSetCellOverflow {
-                    pgid,
-                    index: index as usize,
-                    overflow,
-                    old_overflow,
-                })
-            }
-            WAL_RECORD_INTERIOR_SET_CELL_PTR_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let Some(ptr) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let Some(old_ptr) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let index = u16::from_be_bytes(buff[24..26].try_into().unwrap());
-                Ok(Self::InteriorSetCellPtr {
-                    pgid,
-                    index: index as usize,
-                    ptr,
-                    old_ptr,
-                })
-            }
-            WAL_RECORD_INTERIOR_SET_LAST_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let Some(last) = PageId::from_be_bytes(buff[8..16].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let Some(old_last) = PageId::from_be_bytes(buff[16..24].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::InteriorSetLast {
-                    pgid,
-                    last,
-                    old_last,
-                })
-            }
+    let wal_path_2 = path.join("wal_2");
+    let wal_file_2 = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&wal_path_2)?;
+    if !wal_file_2.metadata()?.is_file() {
+        return Err(anyhow!("{wal_path_2:?} is not a regular file"));
+    }
+    let mut f2 = recover_wal_file(wal_file_2).context("cannot init wal file {wal_path_2:?}")?;
 
-            WAL_RECORD_LEAF_RESET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                Ok(Self::LeafReset {
-                    pgid,
-                    page_version,
-                    payload: &buff[12..12 + size as usize],
-                })
+    let (mut use_wal_1, checkpoint) = match (f1.checkpoint, f2.checkpoint) {
+        (Some(f1_lsn), Some(f2_lsn)) => {
+            if f1_lsn >= f2_lsn {
+                (true, f1_lsn)
+            } else {
+                (false, f2_lsn)
             }
-            WAL_RECORD_LEAF_UNDO_RESET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::LeafUndoReset { pgid })
-            }
-            WAL_RECORD_LEAF_SET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                Ok(Self::LeafSet {
-                    pgid,
-                    page_version,
-                    payload: &buff[12..12 + size as usize],
-                })
-            }
-            WAL_RECORD_LEAF_INIT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::LeafInit { pgid })
-            }
-            WAL_RECORD_LEAF_INSERT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                let key_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
-                let overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let value_size = u32::from_be_bytes(buff[24..28].try_into().unwrap());
-                Ok(Self::LeafInsert {
-                    pgid,
-                    index: index as usize,
-                    raw: &buff[28..28 + raw_size as usize],
-                    overflow,
-                    key_size: key_size as usize,
-                    value_size: value_size as usize,
-                })
-            }
-            WAL_RECORD_LEAF_DELETE_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let raw_size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                let old_key_size = u32::from_be_bytes(buff[12..16].try_into().unwrap());
-                let old_overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let old_val_size = u32::from_be_bytes(buff[24..28].try_into().unwrap());
-                Ok(Self::LeafDelete {
-                    pgid,
-                    index: index as usize,
-                    old_raw: &buff[28..28 + raw_size as usize],
-                    old_overflow,
-                    old_key_size: old_key_size as usize,
-                    old_val_size: old_val_size as usize,
-                })
-            }
-            WAL_RECORD_LEAF_UNDO_DELETE_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let index = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                Ok(Self::LeafUndoDelete {
-                    pgid,
-                    index: index as usize,
-                })
-            }
-            WAL_RECORD_LEAF_SET_CELL_OVERFLOW_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let overflow = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let old_overflow = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                let index = u16::from_be_bytes(buff[24..26].try_into().unwrap());
-                Ok(Self::LeafSetOverflow {
-                    pgid,
-                    index: index as usize,
-                    overflow,
-                    old_overflow,
-                })
-            }
-            WAL_RECORD_LEAF_SET_NEXT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let next = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let old_next = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                Ok(Self::LeafSetNext {
-                    pgid,
-                    next,
-                    old_next,
-                })
-            }
-
-            WAL_RECORD_OVERFLOW_RESET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let page_version = u16::from_be_bytes(buff[8..10].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[10..12].try_into().unwrap());
-                Ok(Self::OverflowReset {
-                    pgid,
-                    page_version,
-                    payload: &buff[12..12 + size as usize],
-                })
-            }
-            WAL_RECORD_OVERFLOW_UNDO_RESET_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::OverflowUndoReset { pgid })
-            }
-            WAL_RECORD_OVERFLOW_INIT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::OverflowInit { pgid })
-            }
-            WAL_RECORD_OVERFLOW_SET_CONTENT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let next = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let size = u16::from_be_bytes(buff[16..18].try_into().unwrap());
-                Ok(Self::OverflowSetContent {
-                    pgid,
-                    next,
-                    raw: &buff[18..18 + size as usize],
-                })
-            }
-            WAL_RECORD_OVERFLOW_UNDO_SET_CONTENT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                Ok(Self::OverflowUndoSetContent { pgid })
-            }
-            WAL_RECORD_OVERFLOW_SET_NEXT_KIND => {
-                let Some(pgid) = PageId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-                    return Err(anyhow!("zero page id"));
-                };
-                let next = PageId::from_be_bytes(buff[8..16].try_into().unwrap());
-                let old_next = PageId::from_be_bytes(buff[16..24].try_into().unwrap());
-                Ok(Self::OverflowSetNext {
-                    pgid,
-                    next,
-                    old_next,
-                })
-            }
-
-            WAL_RECORD_CHECKPOINT_BEGIN_KIND => {
-                let active_tx = match buff[0] {
-                    1 => TxState::None,
-                    2 => {
-                        let txid = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
-                            .ok_or(anyhow!("found zero transaction id"))?;
-                        TxState::Active(txid)
-                    }
-                    3 => {
-                        let txid = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
-                            .ok_or(anyhow!("found zero transaction id"))?;
-                        TxState::Committing(txid)
-                    }
-                    4 => {
-                        let txid = TxId::from_be_bytes(buff[8..16].try_into().unwrap())
-                            .ok_or(anyhow!("found zero transaction id"))?;
-                        let rollback = Lsn::from_be_bytes(buff[16..24].try_into().unwrap())
-                            .ok_or(anyhow!("found zero lsn"))?;
-                        let last_undone = Lsn::from_be_bytes(buff[24..32].try_into().unwrap())
-                            .ok_or(anyhow!("found zero lsn"))?;
-                        TxState::Aborting {
-                            txid,
-                            rollback,
-                            last_undone,
-                        }
-                    }
-                    kind => return Err(anyhow!("invalid checkout end kind {kind}")),
-                };
-
-                let root = PageId::from_be_bytes(buff[32..40].try_into().unwrap());
-                let freelist = PageId::from_be_bytes(buff[40..48].try_into().unwrap());
-                let page_count = u64::from_be_bytes(buff[48..56].try_into().unwrap());
-                Ok(Self::CheckpointBegin {
-                    active_tx,
-                    root,
-                    freelist,
-                    page_count,
-                })
-            }
-            _ => Err(anyhow!("invalid wal record kind {kind}")),
         }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct WalEntry<'a> {
-    pub(crate) txid: TxId,
-    pub(crate) clr: Option<Lsn>,
-    pub(crate) record: WalRecord<'a>,
-}
-
-impl<'a> WalEntry<'a> {
-    pub(crate) fn size(&self) -> usize {
-        Self::size_by_record_size(self.record.size())
-    }
-
-    fn size_by_record_size(record_size: usize) -> usize {
-        // (8 bytes for txid) +
-        // (8 bytes for clr)
-        // (2 bytes for entry size) +
-        // (1 bytes for kind)
-        // (entry) +
-        // (padding 8) +
-        // (2 bytes for entry size for backward iteration) +
-        // (padding 8) +
-        // (8 bytes checksum) +
-        // 8 + 8 + 2 + 1 + pad8(2 + record_size) + 8 + 8
-        pad8(8 + 8 + 2 + 1 + record_size) + 2 + 6 + 8
-    }
-
-    fn encode(&self, buff: &mut [u8]) {
-        buff[0..8].copy_from_slice(&self.txid.to_be_bytes());
-        buff[8..16].copy_from_slice(&self.clr.to_be_bytes());
-
-        let record_size = self.record.size();
-        assert!(
-            record_size < 1 << 16,
-            "record size should be less than a page"
-        );
-        buff[16..18].copy_from_slice(&(record_size as u16).to_be_bytes());
-        buff[18] = self.record.kind();
-
-        self.record.encode(&mut buff[19..19 + record_size]);
-
-        let next = pad8(19 + record_size);
-        buff[19 + record_size..next].fill(0);
-
-        buff[next..next + 2].copy_from_slice(&(record_size as u16).to_be_bytes());
-        buff[next + 2..next + 8].copy_from_slice(b"abcxyz");
-
-        let next = next + 8;
-        let checksum = crc64::crc64(0x1d0f, &buff[0..next]);
-        buff[next..next + 8].copy_from_slice(&checksum.to_be_bytes());
-    }
-
-    pub(crate) fn decode(buff: &[u8]) -> WalDecodeResult<'_> {
-        if buff.len() < 19 {
-            return WalDecodeResult::NeedMoreBytes;
-        }
-
-        let Some(txid) = TxId::from_be_bytes(buff[0..8].try_into().unwrap()) else {
-            return WalDecodeResult::Err(anyhow!("wal record is corrupted"));
-        };
-        let clr = Lsn::from_be_bytes(buff[8..16].try_into().unwrap());
-        let record_size = u16::from_be_bytes(buff[16..18].try_into().unwrap()) as usize;
-        let kind = buff[18];
-
-        let total_length = Self::size_by_record_size(record_size);
-        if buff.len() < total_length {
-            return WalDecodeResult::NeedMoreBytes;
-        }
-        assert!(total_length < 1 << 16);
-
-        let record = match WalRecord::decode(&buff[19..19 + record_size], kind) {
-            Ok(record) => record,
-            Err(e) => return WalDecodeResult::Err(e),
-        };
-        let next = pad8(19 + record_size);
-
-        let record_size_2 = u16::from_be_bytes(buff[next..next + 2].try_into().unwrap());
-        assert_eq!(record_size, record_size_2 as usize);
-
-        let magic_bytes = &buff[next + 2..next + 8];
-        assert_eq!(magic_bytes, b"abcxyz");
-
-        let next = pad8(next + 2);
-        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..next]);
-        let stored_checksum = u64::from_be_bytes(buff[next..next + 8].try_into().unwrap());
-        if calculated_checksum != stored_checksum {
-            // TODO: if there is an incomplete record, followed by complete record, it means
-            // something is wrong and we should warn the user
-            return WalDecodeResult::Incomplete;
-        }
-
-        WalDecodeResult::Ok(WalEntry { txid, clr, record })
-    }
-}
-
-pub(crate) enum WalDecodeResult<'a> {
-    Ok(WalEntry<'a>),
-    NeedMoreBytes,
-    Incomplete,
-    Err(anyhow::Error),
-}
-
-impl<'a> WalDecodeResult<'a> {
-    #[cfg(test)]
-    pub(crate) fn unwrap(self) -> WalEntry<'a> {
-        if let Self::Ok(entry) = self {
-            entry
-        } else {
-            panic!("calling unwrap on non-ok WalDecodeResult");
-        }
-    }
-}
-
-fn pad8(size: usize) -> usize {
-    (size + 7) & !7
-}
-
-pub(crate) const WAL_HEADER_SIZE: usize = 32;
-
-#[derive(Debug)]
-pub(crate) struct WalHeader {
-    pub(crate) version: u16,
-    pub(crate) checkpoint: Option<Lsn>,
-    pub(crate) relative_lsn_offset: u64,
-}
-
-impl WalHeader {
-    pub(crate) fn decode(buff: &[u8]) -> Option<Self> {
-        let version = u16::from_be_bytes(buff[6..8].try_into().unwrap());
-        let relative_lsn_offset = u64::from_be_bytes(buff[8..16].try_into().unwrap());
-        let checkpoint = Lsn::from_be_bytes(buff[16..24].try_into().unwrap());
-
-        let stored_checksum = u64::from_be_bytes(buff[24..32].try_into().unwrap());
-        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..24]);
-        if stored_checksum != calculated_checksum {
-            return None;
-        }
-
-        Some(WalHeader {
-            version,
-            checkpoint,
-            relative_lsn_offset,
-        })
-    }
-
-    pub(crate) fn encode(&self, buff: &mut [u8]) {
-        buff[0..6].copy_from_slice(b"db_wal");
-        buff[6..8].copy_from_slice(&self.version.to_be_bytes());
-        buff[8..16].copy_from_slice(&self.relative_lsn_offset.to_be_bytes());
-        buff[16..24].copy_from_slice(&self.checkpoint.to_be_bytes());
-        let checksum = crc64::crc64(0x1d0f, &buff[0..24]);
-        buff[24..32].copy_from_slice(&checksum.to_be_bytes());
-    }
-}
-
-pub(crate) fn build_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
-    let header = WalHeader {
-        version: 0,
-        relative_lsn_offset: 0,
-        checkpoint: None,
+        (Some(f1_lsn), None) => (true, f1_lsn),
+        (None, Some(f2_lsn)) => (false, f2_lsn),
+        (None, None) => (true, Lsn::new(0)),
     };
-    write_wal_header(f, &header)?;
-    Ok(header)
-}
 
-fn write_wal_header(f: &mut File, header: &WalHeader) -> anyhow::Result<()> {
-    f.seek(SeekFrom::Start(0))?;
-    let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
-    header.encode(&mut header_buff[..WAL_HEADER_SIZE]);
-    header.encode(&mut header_buff[WAL_HEADER_SIZE..]);
-    f.write_all(&header_buff)?;
-    f.sync_all()?;
-    Ok(())
-}
+    log::debug!(
+        "recovering f1={f1:?} f2={f2:?} start_with_1={use_wal_1} checkpoint={checkpoint:?}"
+    );
 
-pub(crate) fn load_wal_header(f: &mut File) -> anyhow::Result<WalHeader> {
-    f.seek(SeekFrom::Start(0))?;
-    let mut header_buff = vec![0u8; 2 * WAL_HEADER_SIZE];
-    f.read_exact(&mut header_buff)?;
-    if header_buff[0..6].cmp(b"db_wal").is_ne() {
-        return Err(anyhow!("the file is not a wal file"));
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut next_lsn = Lsn::new(0);
+    {
+        let mut start_offset = 0;
+        let mut end_offset = 0;
+        let mut current_lsn = checkpoint;
+        loop {
+            let buff = &buffer[start_offset..end_offset];
+            let mut entry = WalEntry::decode(buff);
+
+            let f = if use_wal_1 { &mut f1 } else { &mut f2 };
+
+            if let WalDecodeResult::NeedMoreBytes = entry {
+                let len = end_offset - start_offset;
+                for i in 0..len {
+                    buffer[i] = buffer[start_offset + i];
+                }
+                start_offset = 0;
+                end_offset = len;
+
+                if f.is_empty {
+                    break;
+                }
+                f.f.seek(SeekFrom::Start(
+                    current_lsn.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2 + len as u64,
+                ))?;
+                let n = f.f.read(&mut buffer[end_offset..])?;
+                if n == 0 {
+                    let next_f = if use_wal_1 { &f2 } else { &f1 };
+                    if next_f.relative_lsn < current_lsn.get() {
+                        break;
+                    }
+                    use_wal_1 = !use_wal_1;
+                    start_offset = 0;
+                    end_offset = 0;
+                    continue;
+                }
+
+                end_offset += n;
+                entry = WalEntry::decode(&buffer[start_offset..end_offset]);
+            };
+
+            match entry {
+                WalDecodeResult::Ok(entry) => {
+                    let lsn = current_lsn;
+                    let entry_size = entry.size();
+                    start_offset += entry_size;
+                    current_lsn.add_assign(entry_size as u64);
+                    next_lsn = current_lsn;
+                    handler(lsn, entry)?;
+                }
+                WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
+                    let next_f = if use_wal_1 { &f2 } else { &f1 };
+                    if next_f.relative_lsn < current_lsn.get() {
+                        break;
+                    }
+                    use_wal_1 = !use_wal_1;
+                    start_offset = 0;
+                    end_offset = 0;
+                }
+                WalDecodeResult::Err(err) => return Err(err),
+            }
+        }
     }
 
-    let wal_header = WalHeader::decode(&header_buff[..WAL_HEADER_SIZE])
-        .or_else(|| WalHeader::decode(&header_buff[WAL_HEADER_SIZE..]))
-        .ok_or_else(|| anyhow!("corrupted wal file"))?;
+    Ok(Wal::new(f1.into(), f2.into(), use_wal_1, next_lsn))
+}
 
-    if wal_header.version != 0 {
-        return Err(anyhow!("unsupported WAL version: {}", wal_header.version));
+fn recover_wal_file(mut f: File) -> anyhow::Result<RecoveringWalFile> {
+    let file_size = f.metadata()?.len();
+    if file_size < WAL_HEADER_SIZE as u64 * 2 {
+        return Ok(RecoveringWalFile {
+            f,
+            relative_lsn: 0,
+            checkpoint: None,
+            is_empty: true,
+        });
     }
 
-    Ok(wal_header)
+    let mut buff = [0u8; WAL_HEADER_SIZE * 2];
+    f.seek(SeekFrom::Start(0))?;
+    f.read_exact(&mut buff)?;
+
+    let Some(header) = WalHeader::decode(&buff[..WAL_HEADER_SIZE])
+        .or_else(|| WalHeader::decode(&buff[WAL_HEADER_SIZE..]))
+    else {
+        return Err(anyhow!(
+            "corrupted wal file header, both header segment are corrupted"
+        ));
+    };
+
+    log::debug!("wal_header_decoded header={header:?}");
+
+    if header.version != 0 {
+        return Err(anyhow!("only wal version 0 is supported"));
+    }
+
+    Ok(RecoveringWalFile {
+        f,
+        relative_lsn: header.relative_lsn,
+        checkpoint: header.checkpoint,
+        is_empty: false,
+    })
+}
+
+struct RecoveringWalFile {
+    f: File,
+    relative_lsn: u64,
+    checkpoint: Option<Lsn>,
+    is_empty: bool,
+}
+
+impl From<RecoveringWalFile> for WalFile {
+    fn from(value: RecoveringWalFile) -> Self {
+        Self {
+            f: value.f,
+            relative_lsn: value.relative_lsn,
+            is_empty: value.is_empty,
+            checkpoint: value.checkpoint.is_some(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RecoveringWalFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RecoveringWalFile{{relative_lsn={},checkpoint={:?},is_empty={}}}",
+            self.relative_lsn, self.checkpoint, self.is_empty
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::{PageId, TxId};
+    use crate::log::TxState;
+    use rand::Rng;
 
     #[test]
-    fn test_pad8() {
-        for i in 0..10000 {
-            let result = pad8(i);
-            assert!(result % 8 == 0);
-            assert!(result >= i);
-            assert!(result - i < 8);
+    fn test_flushing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        for i in 1..=10 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
         }
+        drop(wal);
+
+        let wal = recover(dir.path(), |_, _| {
+            panic!("since the wal is not flushed yet, there should be no entry")
+        })?;
+
+        for i in 1..=10 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.trigger_flush()?;
+        drop(wal);
+
+        let mut i = 1;
+        let wal = recover(dir.path(), |_, entry| {
+            assert!(entry.clr.is_none());
+            let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                panic!("the entry should be a leaf init");
+            };
+            assert_eq!(TxId::new(i).unwrap(), txid);
+            assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+            i += 1;
+            Ok(())
+        })?;
+        assert_eq!(11, i);
+        drop(wal);
+
+        Ok(())
     }
 
-    // #[test]
-    // fn test_txid() {
-    //     assert_eq!(None, TxId::new(0), "txid cannot be zero");
-    //     assert_eq!(1, TxId::new(1).unwrap().get());
-    //     assert_eq!(10, TxId::new(10).unwrap().get());
-    //     assert_eq!(10, TxId::new(10).unwrap().get());
-    // }
-
-    // #[test]
-    // fn test_encode() {
-    //     let entry = WalEntry {
-    //         txid: TxId::new(1).unwrap(),
-    //         clr: None,
-    //         record: WalRecord::Begin,
-    //     };
-    //     let mut buff = vec![0u8; entry.size()];
-    //     entry.encode(&mut buff);
-    //     assert_eq!(
-    //         &[
-    //             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // txid=1
-    //             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // clr=None
-    //             0x00, 0x00, // rec_size=0
-    //             0x01, // kind=1
-    //             // entry is zero bytes
-    //             0x00, 0x00, 0x00, 0x00, 0x00, // pad to 8 bytes
-    //             0x00, 0x00, // rec_size=0
-    //             0x61, 0x62, 0x63, 0x78, 0x79, 0x7a, // pad to 8 byutes
-    //             0x12, 0x45, 0x2d, 0x80, 0x75, 0x21, 0xaf, 0x4a // checksum
-    //         ],
-    //         buff.as_slice()
-    //     );
-    //
-    //     let decoded_entry = WalEntry::decode(&buff).unwrap();
-    //     assert_eq!(entry, decoded_entry);
-    // }
-
-    // #[test]
-    // fn test_encode_decode() {
-    //     let testcases = vec![
-    //         WalEntry {
-    //             txid: TxId::new(1).unwrap(),
-    //             clr: None,
-    //             record: WalRecord::Begin,
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(2).unwrap(),
-    //             clr: Lsn::new(1),
-    //             record: WalRecord::Commit,
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(2).unwrap(),
-    //             clr: Lsn::new(121),
-    //             record: WalRecord::Rollback,
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(2).unwrap(),
-    //             clr: None,
-    //             record: WalRecord::End,
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(2).unwrap(),
-    //             clr: None,
-    //             record: WalRecord::HeaderSet {
-    //                 root: None,
-    //                 old_root: PageId::new(1),
-    //                 freelist: PageId::new(101),
-    //                 old_freelist: None,
-    //                 page_count: 10,
-    //                 old_page_count: 0,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::HeaderSet {
-    //                 root: PageId::new(23),
-    //                 old_root: PageId::new(1),
-    //                 freelist: PageId::new(101),
-    //                 old_freelist: PageId::new(33),
-    //                 page_count: 0,
-    //                 old_page_count: 10,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::HeaderUndoSet {
-    //                 root: PageId::new(23),
-    //                 freelist: PageId::new(101),
-    //                 page_count: 10,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::AllocPage {
-    //                 pgid: PageId::new(23).unwrap(),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::DeallocPage {
-    //                 pgid: PageId::new(23).unwrap(),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorReset {
-    //                 pgid: PageId::new(23).unwrap(),
-    //                 page_version: 12,
-    //                 payload: b"this_is_just_a_dummy_bytes",
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorUndoReset {
-    //                 pgid: PageId::new(23).unwrap(),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorInit {
-    //                 pgid: PageId::new(23).unwrap(),
-    //                 last: PageId::new(24).unwrap(),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorInsert {
-    //                 pgid: PageId::new(100).unwrap(),
-    //                 index: 0,
-    //                 raw: b"content",
-    //                 ptr: PageId::new(101).unwrap(),
-    //                 key_size: 2,
-    //                 overflow: None,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorInsert {
-    //                 pgid: PageId::new(100).unwrap(),
-    //                 index: u16::MAX as usize,
-    //                 raw: b"key00000",
-    //                 ptr: PageId::new(101).unwrap(),
-    //                 key_size: 123456789,
-    //                 overflow: PageId::new(202),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorDelete {
-    //                 pgid: PageId::new(99).unwrap(),
-    //                 index: 17,
-    //                 old_raw: b"the_old_raw_content",
-    //                 old_ptr: PageId::new(10).unwrap(),
-    //                 old_overflow: None,
-    //                 old_key_size: 19,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorDelete {
-    //                 pgid: PageId::new(99).unwrap(),
-    //                 index: 17,
-    //                 old_raw: b"the_old_raw_content",
-    //                 old_ptr: PageId::new(10).unwrap(),
-    //                 old_overflow: PageId::new(1),
-    //                 old_key_size: 1000,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::InteriorUndoDelete {
-    //                 pgid: PageId::new(99).unwrap(),
-    //                 index: 17,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafReset {
-    //                 pgid: PageId::new(23).unwrap(),
-    //                 page_version: 12,
-    //                 payload: b"this_is_just_a_dummy_bytes",
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafUndoReset {
-    //                 pgid: PageId::new(23).unwrap(),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafInit {
-    //                 pgid: PageId::new(23).unwrap(),
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafInsert {
-    //                 pgid: PageId::new(100).unwrap(),
-    //                 index: 0,
-    //                 raw: b"key00000val00000",
-    //                 overflow: None,
-    //                 key_size: 8,
-    //                 value_size: 8,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafInsert {
-    //                 pgid: PageId::new(100).unwrap(),
-    //                 index: 23,
-    //                 raw: b"key0",
-    //                 overflow: PageId::new(101),
-    //                 key_size: 8,
-    //                 value_size: 8,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafDelete {
-    //                 pgid: PageId::new(100).unwrap(),
-    //                 index: 22,
-    //                 old_raw: b"key0",
-    //                 old_overflow: PageId::new(101),
-    //                 old_key_size: 8,
-    //                 old_val_size: 8,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::LeafUndoDelete {
-    //                 pgid: PageId::new(100).unwrap(),
-    //                 index: 22,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::CheckpointBegin {
-    //                 active_tx: TxState::None,
-    //                 root: None,
-    //                 freelist: PageId::new(100),
-    //                 page_count: 10,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Lsn::new(99),
-    //             record: WalRecord::CheckpointBegin {
-    //                 active_tx: TxState::Active(TxId::new(12).unwrap()),
-    //                 root: PageId::new(100),
-    //                 freelist: None,
-    //                 page_count: 10,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Some(Lsn::new(99)),
-    //             record: WalRecord::CheckpointBegin {
-    //                 active_tx: TxState::Committing(TxId::new(12).unwrap()),
-    //                 root: PageId::new(100),
-    //                 freelist: PageId::new(200),
-    //                 page_count: 10,
-    //             },
-    //         },
-    //         WalEntry {
-    //             txid: TxId::new(1011).unwrap(),
-    //             clr: Some(Lsn::new(99)),
-    //             record: WalRecord::CheckpointBegin {
-    //                 active_tx: TxState::Aborting {
-    //                     txid: TxId::new(12).unwrap(),
-    //                     rollback: Lsn::new(10),
-    //                     last_undone: Lsn::new(11),
-    //                 },
-    //                 root: PageId::new(100),
-    //                 freelist: PageId::new(200),
-    //                 page_count: 10,
-    //             },
-    //         },
-    //     ];
-    //
-    //     for testcase in testcases {
-    //         let mut buff = vec![0u8; testcase.size()];
-    //         testcase.encode(&mut buff);
-    //         let decoded_entry = WalEntry::decode(&buff).unwrap();
-    //         assert_eq!(testcase, decoded_entry);
-    //     }
-    // }
     #[test]
-    fn test_wal() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_checkpoint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
 
-        let file_path = dir.path().join("test.wal");
-        let file = File::create(file_path).unwrap();
-
-        let page_size = 256;
-        let wal = Wal::new(file, 0, Lsn::new(64), page_size).unwrap();
-
-        let lsn = wal
-            .append(TxId::new(1).unwrap(), None, WalRecord::Begin)
-            .unwrap();
-        assert_eq!(64, lsn.get());
-
-        let lsn = wal
-            .append(
-                TxId::new(1).unwrap(),
-                None,
-                WalRecord::InteriorInit {
-                    pgid: PageId::new(10).unwrap(),
-                    last: PageId::new(10).unwrap(),
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        for i in 1..=10 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
                 },
-            )
-            .unwrap();
-        assert_eq!(104, lsn.get());
+            })?;
+        }
+        let checkpoint_lsn = wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: TxState::None,
+                root: PageId::new(123),
+                freelist: PageId::new(321),
+                page_count: 99,
+            },
+        })?;
+        for i in 11..=15 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+        for i in 16..=20 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        drop(wal);
 
-        dir.close().unwrap();
+        let mut i = 11;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if matches!(entry.kind, WalKind::End { .. }) {
+                return Ok(());
+            }
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                    page_count,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(PageId::new(123), root);
+                assert_eq!(PageId::new(321), freelist);
+                assert_eq!(99u64, page_count);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+
+            Ok(())
+        })?;
+        assert_eq!(16, i);
+        drop(wal);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_recovering_from_wal_1_and_2() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        for i in 1..=10 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        let checkpoint_lsn = wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: TxState::None,
+                root: PageId::new(123),
+                freelist: PageId::new(321),
+                page_count: 99,
+            },
+        })?;
+        for i in 11..=15 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.trigger_flush()?;
+        for i in 16..=20 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+        for i in 21..=25 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.trigger_flush()?;
+        for i in 26..=30 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        drop(wal);
+
+        let mut i = 11;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if matches!(entry.kind, WalKind::End { .. }) {
+                return Ok(());
+            }
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                    page_count,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(PageId::new(123), root);
+                assert_eq!(PageId::new(321), freelist);
+                assert_eq!(99u64, page_count);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+
+            Ok(())
+        })?;
+        assert_eq!(26, i);
+
+        for i in 26..=30 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        let checkpoint_lsn = wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: TxState::None,
+                root: None,
+                freelist: None,
+                page_count: 99,
+            },
+        })?;
+        for i in 31..=35 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+        for i in 36..=40 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        wal.trigger_flush()?;
+        for i in 41..=45 {
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafInit {
+                    txid: TxId::new(i).unwrap(),
+                    pgid: PageId::new(1000 + i).unwrap(),
+                },
+            })?;
+        }
+        drop(wal);
+
+        let mut i = 31;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if matches!(entry.kind, WalKind::End { .. }) {
+                return Ok(());
+            }
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                    page_count,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(None, root);
+                assert_eq!(None, freelist);
+                assert_eq!(99u64, page_count);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+
+            Ok(())
+        })?;
+        assert_eq!(41, i);
+        drop(wal);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_1_and_2_have_checkpoint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let dummy_entry = |i: u64| WalEntry {
+            clr: None,
+            kind: WalKind::LeafInit {
+                txid: TxId::new(i).unwrap(),
+                pgid: PageId::new(1000 + i).unwrap(),
+            },
+        };
+        let checkpoint_entry = || WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: TxState::None,
+                root: None,
+                freelist: None,
+                page_count: 99,
+            },
+        };
+
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        for i in 1..=5 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 6..=10 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+        for i in 11..=15 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 16..=20 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.trigger_flush()?;
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+        drop(wal);
+
+        let mut i = 16;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if matches!(entry.kind, WalKind::End { .. }) {
+                return Ok(());
+            }
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                    page_count,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(None, root);
+                assert_eq!(None, freelist);
+                assert_eq!(99u64, page_count);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+
+            Ok(())
+        })?;
+        assert_eq!(21, i);
+
+        for i in 21..=25 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 26..=30 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+        for i in 31..=35 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        let checkpoint_lsn = wal.append_log(checkpoint_entry())?;
+        for i in 36..=40 {
+            wal.append_log(dummy_entry(i))?;
+        }
+        wal.trigger_flush()?;
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+
+        drop(wal);
+
+        let mut i = 36;
+        let mut checkpoint_consumed = false;
+        let wal = recover(dir.path(), |lsn, entry| {
+            assert!(entry.clr.is_none());
+
+            if matches!(entry.kind, WalKind::End { .. }) {
+                return Ok(());
+            }
+
+            if !checkpoint_consumed {
+                assert_eq!(checkpoint_lsn, lsn);
+                let WalKind::Checkpoint {
+                    ref active_tx,
+                    root,
+                    freelist,
+                    page_count,
+                } = entry.kind
+                else {
+                    panic!("the entry should be a checkpoint");
+                };
+                assert_eq!(TxState::None, *active_tx);
+                assert_eq!(None, root);
+                assert_eq!(None, freelist);
+                assert_eq!(99u64, page_count);
+                checkpoint_consumed = true;
+            } else {
+                let WalKind::LeafInit { txid, pgid } = entry.kind else {
+                    panic!("the entry should be a leaf init");
+                };
+                assert_eq!(TxId::new(i).unwrap(), txid);
+                assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
+                i += 1;
+            }
+
+            Ok(())
+        })?;
+        assert_eq!(41, i);
+        drop(wal);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_million_logs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let mut r = rand::thread_rng();
+        let mut i = 1;
+        let mut last_lsn = Lsn::new(0);
+        let mut last_checkpoint = None;
+
+        for _ in 0..100 {
+            let mut checkpoint_consumed = false;
+            let wal = recover(dir.path(), |lsn, entry| {
+                assert!(lsn >= last_lsn);
+                last_lsn = lsn;
+                assert!(entry.clr.is_none());
+
+                if matches!(entry.kind, WalKind::End { .. }) {
+                    return Ok(());
+                }
+
+                if !checkpoint_consumed {
+                    assert_eq!(last_checkpoint.unwrap(), lsn);
+                    let WalKind::Checkpoint {
+                        ref active_tx,
+                        root,
+                        freelist,
+                        page_count,
+                    } = entry.kind
+                    else {
+                        panic!(
+                            "the entry should be a checkpoint, but found a {:?}",
+                            entry.kind
+                        );
+                    };
+                    assert_eq!(TxState::None, *active_tx);
+                    assert_eq!(None, root);
+                    assert_eq!(None, freelist);
+                    assert_eq!(99u64, page_count);
+                    checkpoint_consumed = true;
+                } else {
+                    let WalKind::LeafInit { .. } = entry.kind else {
+                        panic!("the entry should be a leaf init");
+                    };
+                }
+
+                Ok(())
+            })?;
+
+            for _ in 0..r.gen_range(1..=8000) {
+                wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::LeafInit {
+                        txid: TxId::new(i).unwrap(),
+                        pgid: PageId::new(1000 + i).unwrap(),
+                    },
+                })?;
+                i += 1;
+            }
+            wal.trigger_flush()?;
+            for _ in 0..r.gen_range(1..=8000) {
+                wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::LeafInit {
+                        txid: TxId::new(i).unwrap(),
+                        pgid: PageId::new(1000 + i).unwrap(),
+                    },
+                })?;
+                i += 1;
+            }
+            let checkpoint_lsn = wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::Checkpoint {
+                    active_tx: TxState::None,
+                    root: None,
+                    freelist: None,
+                    page_count: 99,
+                },
+            })?;
+            for _ in 0..r.gen_range(1..=8000) {
+                wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::LeafInit {
+                        txid: TxId::new(i).unwrap(),
+                        pgid: PageId::new(1000 + i).unwrap(),
+                    },
+                })?;
+                i += 1;
+            }
+            wal.complete_checkpoint(checkpoint_lsn)?;
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::End {
+                    txid: TxId::new(1).unwrap(),
+                },
+            })?;
+            last_checkpoint = Some(checkpoint_lsn);
+            for _ in 0..r.gen_range(1..=8000) {
+                wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::LeafInit {
+                        txid: TxId::new(i).unwrap(),
+                        pgid: PageId::new(1000 + i).unwrap(),
+                    },
+                })?;
+                i += 1;
+            }
+            wal.trigger_flush()?;
+            for _ in 0..r.gen_range(1..=8000) {
+                wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::LeafInit {
+                        txid: TxId::new(i).unwrap(),
+                        pgid: PageId::new(1000 + i).unwrap(),
+                    },
+                })?;
+                i += 1;
+            }
+            drop(wal);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_iterate_backward() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let dummy_entry = |i: u64| WalEntry {
+            clr: None,
+            kind: WalKind::LeafInit {
+                txid: TxId::new(i).unwrap(),
+                pgid: PageId::new(1000 + i).unwrap(),
+            },
+        };
+        let checkpoint_entry = || WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: TxState::None,
+                root: None,
+                freelist: None,
+                page_count: 99,
+            },
+        };
+
+        let mut entries = vec![];
+
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        for i in 1..=5 {
+            let entry = dummy_entry(i);
+            let lsn = wal.append_log(entry.clone())?;
+            entries.push((lsn, entry));
+        }
+        let entry = checkpoint_entry();
+        let checkpoint_lsn = wal.append_log(entry.clone())?;
+        entries.push((checkpoint_lsn, entry));
+        for i in 6..=10 {
+            let entry = dummy_entry(i);
+            let lsn = wal.append_log(entry.clone())?;
+            entries.push((lsn, entry));
+        }
+        wal.complete_checkpoint(checkpoint_lsn)?;
+        let rollback_lsn = wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Rollback {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+
+        wal.iter_back(rollback_lsn, |lsn, entry| {
+            let Some((expected_lsn, expected_entry)) = entries.pop() else {
+                return Ok(true);
+            };
+            assert_eq!(expected_lsn, lsn);
+            assert_eq!(expected_entry, entry);
+
+            wal.append_log(WalEntry {
+                clr: Some(lsn),
+                kind: WalKind::LeafResetForUndo {
+                    txid: TxId::new(1).unwrap(),
+                    pgid: PageId::new(1000).unwrap(),
+                },
+            })?;
+
+            Ok(false)
+        })?;
+        assert!(entries.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_incomplete_entry() -> anyhow::Result<()> {
+        // test if the last entry is not completed.
+        // case 1: the bytes are there, but the checksum is wrong
+        // case 2: the bytes are not there
+        // might need to mock the file system
+        // todo!();
+        Ok(())
     }
 }

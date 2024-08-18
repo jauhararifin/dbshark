@@ -21,6 +21,7 @@
 // TODO: don't use anyhow for the error handling
 // TODO: setup CI
 
+mod bins;
 mod btree;
 mod content;
 mod db;
@@ -28,9 +29,6 @@ mod id;
 mod log;
 mod pager;
 mod recovery;
-mod recovery_v2;
 mod wal;
-mod wal_v2;
-mod bins;
 
 pub use db::{Db, Setting};
