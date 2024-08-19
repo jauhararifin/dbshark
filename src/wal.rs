@@ -18,7 +18,7 @@ pub(crate) struct Wal {
     buffer: Arc<RwLock<Buffer>>,
     internal: Arc<RwLock<WalInternal>>,
     flush_trigger: SyncSender<()>,
-    iter_backward_lock: Mutex<()>,
+    iter_backward_lock: Mutex<Vec<u8>>,
 }
 
 struct WalFile {
@@ -93,13 +93,14 @@ impl Wal {
             });
         }
 
+        let backward_buffer = vec![0u8; buffer.read().size()];
         Wal {
             f1,
             f2,
             buffer,
             internal,
             flush_trigger,
-            iter_backward_lock: Mutex::new(()),
+            iter_backward_lock: Mutex::new(backward_buffer),
         }
     }
 
@@ -139,7 +140,7 @@ impl Wal {
         f1: &Mutex<WalFile>,
         f2: &Mutex<WalFile>,
         buffer: &mut Buffer,
-        iter_backward_lock: &Mutex<()>,
+        iter_backward_lock: &Mutex<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let backward_iter_guard = iter_backward_lock.try_lock();
         assert!(
@@ -305,11 +306,10 @@ impl Wal {
     where
         F: FnMut(Lsn, WalEntry) -> anyhow::Result<bool>,
     {
-        let _guard = self.iter_backward_lock.lock();
+        let mut buffer = self.iter_backward_lock.lock();
 
         let wal_buffer = self.buffer.read();
         let internal = self.internal.read();
-        let mut buffer = vec![0u8; wal_buffer.size()];
         let buffer_len = buffer.len();
 
         let filled = if upper_bound > internal.first_unflushed {
@@ -319,11 +319,11 @@ impl Wal {
             let end = wal_buffer.start_offset + offset as usize;
 
             if end > wal_buffer.size() {
-                let to_copy = &wal_buffer.buff[start..];
-                let n1 = to_copy.len();
-                buffer[buffer_len - n1..].copy_from_slice(to_copy);
-
                 let to_copy = &wal_buffer.buff[..end % wal_buffer.size()];
+                let n1 = to_copy.len();
+                buffer[buffer_len - n1..buffer_len].copy_from_slice(to_copy);
+
+                let to_copy = &wal_buffer.buff[start..];
                 let n2 = to_copy.len();
                 buffer[buffer_len - n1 - n2..buffer_len - n1].copy_from_slice(to_copy);
 
