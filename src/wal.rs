@@ -314,9 +314,25 @@ impl Wal {
 
         let filled = if upper_bound > internal.first_unflushed {
             let offset = upper_bound.get() - internal.first_unflushed.get();
-            let to_copy = &wal_buffer.buff[..offset as usize];
-            buffer[buffer_len - to_copy.len()..].copy_from_slice(to_copy);
-            to_copy.len()
+
+            let start = wal_buffer.start_offset;
+            let end = wal_buffer.start_offset + offset as usize;
+
+            if end > wal_buffer.size() {
+                let to_copy = &wal_buffer.buff[start..];
+                let n1 = to_copy.len();
+                buffer[buffer_len - n1..].copy_from_slice(to_copy);
+
+                let to_copy = &wal_buffer.buff[..end % wal_buffer.size()];
+                let n2 = to_copy.len();
+                buffer[buffer_len - n1 - n2..buffer_len - n1].copy_from_slice(to_copy);
+
+                n1 + n2
+            } else {
+                let to_copy = &wal_buffer.buff[start..end];
+                buffer[buffer_len - to_copy.len()..].copy_from_slice(to_copy);
+                to_copy.len()
+            }
         } else {
             0
         };
@@ -1261,6 +1277,62 @@ mod tests {
         })?;
 
         wal.iter_back(rollback_lsn, |lsn, entry| {
+            let Some((expected_lsn, expected_entry)) = entries.pop() else {
+                return Ok(true);
+            };
+            assert_eq!(expected_lsn, lsn);
+            assert_eq!(expected_entry, entry);
+
+            wal.append_log(WalEntry {
+                clr: Some(lsn),
+                kind: WalKind::LeafResetForUndo {
+                    txid: TxId::new(1).unwrap(),
+                    pgid: PageId::new(1000).unwrap(),
+                },
+            })?;
+
+            Ok(false)
+        })?;
+        assert!(entries.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_iterate_backward_from_buffer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let dummy_entry = |i: u64| WalEntry {
+            clr: None,
+            kind: WalKind::LeafInit {
+                txid: TxId::new(i).unwrap(),
+                pgid: PageId::new(1000 + i).unwrap(),
+            },
+        };
+
+        let mut entries = vec![];
+
+        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        for i in 1..=5 {
+            let entry = dummy_entry(i);
+            let lsn = wal.append_log(entry.clone())?;
+            entries.push((lsn, entry));
+        }
+        wal.trigger_flush()?;
+        for i in 6..=10 {
+            let entry = dummy_entry(i);
+            let lsn = wal.append_log(entry.clone())?;
+            entries.push((lsn, entry));
+        }
+        let rollback_lsn = wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Rollback {
+                txid: TxId::new(1).unwrap(),
+            },
+        })?;
+
+        wal.iter_back(rollback_lsn, |lsn, entry| {
+            println!("item> {lsn:?} {entry:?}");
             let Some((expected_lsn, expected_entry)) = entries.pop() else {
                 return Ok(true);
             };
