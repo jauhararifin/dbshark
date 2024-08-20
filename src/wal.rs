@@ -604,14 +604,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
 
         let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let mut last_seen_lsn = None;
         for i in 1..=10 {
-            wal.append_log(WalEntry {
+            let lsn = wal.append_log(WalEntry {
                 clr: None,
                 kind: WalKind::LeafInit {
                     txid: TxId::new(i).unwrap(),
                     pgid: PageId::new(1000 + i).unwrap(),
                 },
             })?;
+            if let Some(last_seen_lsn) = last_seen_lsn {
+                assert!(
+                    lsn > last_seen_lsn,
+                    "last_seen_lsn={last_seen_lsn:?} lsn={lsn:?}"
+                );
+            }
+            last_seen_lsn = Some(lsn);
         }
         drop(wal);
 
@@ -619,20 +627,36 @@ mod tests {
             panic!("since the wal is not flushed yet, there should be no entry")
         })?;
 
+        let mut last_seen_lsn = None;
         for i in 1..=10 {
-            wal.append_log(WalEntry {
+            let lsn = wal.append_log(WalEntry {
                 clr: None,
                 kind: WalKind::LeafInit {
                     txid: TxId::new(i).unwrap(),
                     pgid: PageId::new(1000 + i).unwrap(),
                 },
             })?;
+            if let Some(last_seen_lsn) = last_seen_lsn {
+                assert!(
+                    lsn > last_seen_lsn,
+                    "last_seen_lsn={last_seen_lsn:?} lsn={lsn:?}"
+                );
+            }
+            last_seen_lsn = Some(lsn);
         }
         wal.trigger_flush()?;
         drop(wal);
 
         let mut i = 1;
-        let wal = recover(dir.path(), |_, entry| {
+        let mut last_seen_lsn = None;
+        let wal = recover(dir.path(), |lsn, entry| {
+            if let Some(last_seen_lsn) = last_seen_lsn {
+                assert!(
+                    lsn > last_seen_lsn,
+                    "last_seen_lsn={last_seen_lsn:?} lsn={lsn:?}"
+                );
+            }
+            last_seen_lsn = Some(lsn);
             assert!(entry.clr.is_none());
             let WalKind::LeafInit { txid, pgid } = entry.kind else {
                 panic!("the entry should be a leaf init");

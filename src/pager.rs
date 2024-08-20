@@ -399,7 +399,9 @@ impl Pager {
         let internal = self.internal.write();
         assert!(
             pgid.get() < internal.db_state.page_count,
-            "page is out of bound"
+            "page {:?} is out of bound for reading since page_count={}",
+            pgid,
+            internal.db_state.page_count
         );
         let (frame_id, meta, buffer) = self.acquire(internal, pgid, None)?;
 
@@ -420,7 +422,9 @@ impl Pager {
         let internal = self.internal.write();
         assert!(
             pgid.get() < internal.db_state.page_count,
-            "page is out of bound for writing"
+            "page {:?} is out of bound for writing since page_count={}",
+            pgid,
+            internal.db_state.page_count
         );
         let (frame_id, meta, buffer) = self.acquire(internal, pgid, None)?;
         let meta = meta.write();
@@ -445,7 +449,9 @@ impl Pager {
         let mut internal = self.internal.write();
         assert!(
             pgid.get() <= internal.db_state.page_count,
-            "page is out of bound for redoing alloc"
+            "page {:?} is out of bound for redoing alloc since page_count={}",
+            pgid,
+            internal.db_state.page_count
         );
         if pgid.get() == internal.db_state.page_count {
             internal.db_state.page_count += 1;
@@ -528,7 +534,8 @@ impl Pager {
     ) -> anyhow::Result<(usize, &RwLock<PageMeta>, *mut u8)> {
         assert!(
             pgid.get() <= internal.db_state.page_count,
-            "page {pgid:?} out of bound when acquiring page. total_page={}",
+            "page {:?} is out of bound when acquiring page since page_count={}",
+            pgid,
             internal.db_state.page_count
         );
 
