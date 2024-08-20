@@ -15,12 +15,14 @@ pub(crate) fn recover(path: &Path, pager: &Pager) -> anyhow::Result<RecoveryResu
     let mut analyzer = Analyzer::new();
     let mut redoer = Redoer::new(pager);
 
+    log::debug!("aries_recover start");
     let wal = crate::wal::recover(path, |lsn, entry| {
         log::debug!("aries_recover {lsn:?} entry={entry:?}");
         analyzer.analyze(lsn, &entry);
         redoer.redo(lsn, &entry)?;
         Ok(())
     })?;
+    log::debug!("aries_recover analyze and redo finish");
 
     let analyze_result = analyzer.take_result();
 
@@ -49,6 +51,19 @@ impl Analyzer {
     }
 
     fn analyze(&mut self, lsn: Lsn, entry: &WalEntry) {
+        if let Some(clr) = entry.clr {
+            let TxState::Aborting {
+                ref mut last_undone,
+                ..
+            } = self.tx_state
+            else {
+                panic!(
+                    "when found a clr entry, we should be in the middle of aborting a transaction"
+                );
+            };
+            *last_undone = clr;
+        }
+
         match entry.kind {
             WalKind::Begin { txid } => {
                 assert_eq!(
@@ -302,7 +317,8 @@ impl<'a> Redoer<'a> {
                 ));
                 }
             }
-            WalKind::InteriorDelete { index, .. } | WalKind::InteriorDeleteForUndo { index, .. } => {
+            WalKind::InteriorDelete { index, .. }
+            | WalKind::InteriorDeleteForUndo { index, .. } => {
                 let Some(mut page) = page.into_interior() else {
                     return Err(anyhow!(
                         "redo failed on interior delete because page {pgid:?} is not an interior"
@@ -789,4 +805,20 @@ pub(crate) fn undo_txn(
     log::debug!("undo_txn_finished");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_recovering_failing_abort() -> anyhow::Result<()> {
+        // TODO:
+        // 1. Create a transaction
+        // 2. Do some operations that triggers the wal
+        // 3. Abort it
+        // 4. Wait until some of the logs are undone
+        // 5. But, don't undo all of them
+        // 6. Fail in the middle, but make sure some of the undo logs are written.
+        // 7. Recover
+        Ok(())
+    }
 }

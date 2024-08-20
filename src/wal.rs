@@ -234,12 +234,14 @@ impl Wal {
         f: &mut WalFile,
     ) -> anyhow::Result<()> {
         log::debug!(
-            "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={}",
+            "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={} first_unflushed={:?} next={:?}",
             internal.use_wal_1,
             buffer.len(),
             f.is_empty,
             f.checkpoint,
             f.relative_lsn,
+            internal.first_unflushed,
+            internal.next,
         );
 
         if f.is_empty {
@@ -275,7 +277,7 @@ impl Wal {
     }
 
     #[cfg(test)]
-    fn trigger_flush(&self) -> anyhow::Result<()> {
+    pub(crate) fn trigger_flush(&self) -> anyhow::Result<()> {
         Wal::flush(
             &mut self.internal.write(),
             &mut self.buffer.write(),
@@ -458,7 +460,7 @@ where
     );
 
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut next_lsn = Lsn::new(0);
+    let mut next_lsn = checkpoint;
     {
         let mut start_offset = 0;
         let mut end_offset = 0;

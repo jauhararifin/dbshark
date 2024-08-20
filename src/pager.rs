@@ -2356,7 +2356,9 @@ impl<'a> LeafPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     index,
-                    old_raw: Bytes::new(&self.0.buffer[content_offset..content_offset + content_size]),
+                    old_raw: Bytes::new(
+                        &self.0.buffer[content_offset..content_offset + content_size],
+                    ),
                     old_overflow: cell.overflow(),
                     old_key_size: cell.key_size(),
                     old_val_size: cell.val_size(),
@@ -3044,8 +3046,9 @@ impl<'a> OverflowPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     page_version: 0,
-                    payload: Bytes::new(&self.0.buffer
-                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE]),
+                    payload: Bytes::new(
+                        &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    ),
                 },
             },
             WalEntry {
@@ -3064,8 +3067,9 @@ impl<'a> OverflowPageWrite<'a> {
                     txid: self.0.txid,
                     pgid,
                     page_version: 0,
-                    payload: Bytes::new(&self.0.buffer
-                        [PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE]),
+                    payload: Bytes::new(
+                        &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
+                    ),
                 },
             },
             WalEntry {
