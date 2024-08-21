@@ -1,7 +1,8 @@
 use crate::file_lock::FileLock;
-use crate::id::PageId;
+use crate::id::{Lsn, PageId};
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
-use crate::pager_v2::page::PageMeta;
+use crate::pager_v2::evictor::Evictor;
+use crate::pager_v2::page::{PageKind, PageMeta};
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -23,6 +24,7 @@ pub(crate) struct Pager {
 
 struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
+    evictor: Evictor,
 }
 
 impl Pager {
@@ -70,6 +72,7 @@ impl Pager {
             pool: BufferPool::new(page_size, n),
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
+                evictor: Evictor::new(n),
             }),
         })
     }
@@ -154,8 +157,8 @@ impl Pager {
         todo!();
     }
 
-    fn acquire(&self, pgid: PageId) -> anyhow::Result<usize> {
-        let internal = self.internal.write();
+    fn acquire(&self, pgid: PageId) -> anyhow::Result<ReadFrame> {
+        let mut internal = self.internal.write();
         let page_count = self.state.read().page_count;
         assert!(
             pgid.get() <= page_count,
@@ -164,11 +167,39 @@ impl Pager {
             page_count,
         );
 
-        if let Some(frame_id) = internal.page_to_frame.get(&pgid) {
-            todo!();
-        } else {
-            todo!();
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            internal.evictor.acquired(frame_id);
+            return Ok(self.pool.read(frame_id));
         }
+
+        let frame = self.pool.alloc(PageMeta::empty(pgid));
+        if let Some(frame) = frame {
+            *frame.meta = Self::fetch_page(frame.buffer)?;
+            internal.evictor.acquired(frame.index);
+            internal.page_to_frame.insert(pgid, frame.index);
+            return Ok(frame.into());
+        }
+
+        let (frame_id, dirty) = internal.evictor.evict()?;
+        let frame = self.pool.write(frame_id);
+        let old_pgid = frame.meta.id;
+        if dirty {
+            Self::spill_page(&frame.meta, frame.buffer)?;
+        }
+        *frame.meta = Self::fetch_page(frame.buffer)?;
+        internal.page_to_frame.remove(&old_pgid);
+        internal.page_to_frame.insert(pgid, frame_id);
+        internal.evictor.reset(frame_id);
+
+        Ok(frame.into())
+    }
+
+    fn spill_page(meta: &PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
+        todo!();
+    }
+
+    fn fetch_page(buff: &mut [u8]) -> anyhow::Result<PageMeta> {
+        todo!();
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {

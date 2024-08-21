@@ -40,6 +40,11 @@ impl Evictor {
         }
     }
 
+    pub(crate) fn reset(&mut self, frame_id: usize) {
+        self.released(frame_id, false);
+        self.acquired(frame_id);
+    }
+
     pub(crate) fn evict(&mut self) -> anyhow::Result<(usize, bool)> {
         if let Some(frame_id) = self.free_and_clean.iter().next().copied() {
             Ok((frame_id, false))

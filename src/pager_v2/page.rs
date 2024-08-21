@@ -5,20 +5,19 @@ use std::ops::Range;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PageMeta {
-    id: PageId,
-    kind: PageKind,
-    lsn: Lsn,
-    is_dirty: bool,
+    pub(crate) id: PageId,
+    pub(crate) kind: PageKind,
+    pub(crate) lsn: Lsn,
+    pub(crate) dirty: bool,
 }
 
-#[cfg(test)]
 impl PageMeta {
-    pub(crate) fn dummy(id: PageId, kind: PageKind, lsn: Lsn, is_dirty: bool) -> Self {
+    pub(crate) fn empty(pgid: PageId) -> Self {
         Self {
-            id,
-            kind,
-            lsn,
-            is_dirty,
+            id: pgid,
+            kind: PageKind::None,
+            lsn: Lsn::new(0),
+            dirty: false,
         }
     }
 }
@@ -197,7 +196,7 @@ impl PageMeta {
             id: page_id,
             kind,
             lsn: page_lsn,
-            is_dirty: false,
+            dirty: false,
         }))
     }
 
@@ -406,7 +405,7 @@ mod tests {
                 id: PageId::new(1).unwrap(),
                 kind: PageKind::None,
                 lsn: Lsn::new(1),
-                is_dirty: false,
+                dirty: false,
             },
             // TODO: test interior and leaf kind
             PageMeta {
@@ -416,7 +415,7 @@ mod tests {
                     size: 100,
                 }),
                 lsn: Lsn::new(99),
-                is_dirty: false,
+                dirty: false,
             },
             PageMeta {
                 id: PageId::new(112314).unwrap(),
@@ -425,7 +424,7 @@ mod tests {
                     size: 100,
                 }),
                 lsn: Lsn::new(99),
-                is_dirty: false,
+                dirty: false,
             },
             PageMeta {
                 id: PageId::new(112314).unwrap(),
@@ -434,7 +433,7 @@ mod tests {
                     count: 10,
                 }),
                 lsn: Lsn::new(99),
-                is_dirty: false,
+                dirty: false,
             },
             PageMeta {
                 id: PageId::new(112314).unwrap(),
@@ -443,7 +442,7 @@ mod tests {
                     count: 10,
                 }),
                 lsn: Lsn::new(99),
-                is_dirty: false,
+                dirty: false,
             },
         ];
 

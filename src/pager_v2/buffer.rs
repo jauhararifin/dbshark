@@ -169,6 +169,17 @@ pub(crate) struct ReadFrame<'a> {
     pub(crate) buffer: &'a [u8],
 }
 
+impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
+    fn from(value: WriteFrame<'a>) -> Self {
+        Self {
+            index: value.index,
+            guard: RwLockWriteGuard::downgrade(value.guard),
+            meta: value.meta,
+            buffer: value.buffer,
+        }
+    }
+}
+
 pub(crate) struct WriteFrame<'a> {
     pub(crate) index: usize,
     pub(crate) guard: RwLockWriteGuard<'a, ()>,
@@ -195,13 +206,15 @@ mod tests {
             std::thread::scope(|scope| {
                 for _ in 0..150 {
                     scope.spawn(|| {
-                        let meta = PageMeta::dummy(
-                            PageId::new(1).unwrap(),
-                            PageKind::None,
-                            Lsn::new(1),
-                            false,
-                        );
-                        if pool.alloc(meta).is_some() {
+                        let success = pool
+                            .alloc(PageMeta {
+                                id: PageId::new(1).unwrap(),
+                                kind: PageKind::None,
+                                lsn: Lsn::new(1),
+                                dirty: false,
+                            })
+                            .is_some();
+                        if success {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         } else {
                             failed_count.fetch_add(1, Ordering::SeqCst);
@@ -220,13 +233,12 @@ mod tests {
         let n = 100;
         let pool = BufferPool::new(128, n);
         for i in 0u64..n as u64 {
-            let meta = PageMeta::dummy(
-                PageId::new(1000 + i).unwrap(),
-                PageKind::None,
-                Lsn::new(100 + i),
-                false,
-            );
-            let result = pool.alloc(meta);
+            let result = pool.alloc(PageMeta {
+                id: PageId::new(1000 + i).unwrap(),
+                kind: PageKind::None,
+                lsn: Lsn::new(100 + i),
+                dirty: false,
+            });
             assert!(result.is_some());
         }
 
@@ -272,12 +284,12 @@ mod tests {
                             pool.read(index);
                         }
                         2 => {
-                            pool.alloc(PageMeta::dummy(
-                                PageId::new(1).unwrap(),
-                                PageKind::None,
-                                Lsn::new(1),
-                                false,
-                            ));
+                            pool.alloc(PageMeta {
+                                id: PageId::new(1).unwrap(),
+                                kind: PageKind::None,
+                                lsn: Lsn::new(1),
+                                dirty: false,
+                            });
                         }
                         _ => unreachable!(),
                     });
