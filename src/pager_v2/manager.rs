@@ -1,11 +1,11 @@
 use crate::file_lock::FileLock;
-use crate::id::{Lsn, PageId};
+use crate::id::PageId;
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
-use crate::pager_v2::page::{PageKind, PageMeta};
+use crate::pager_v2::page::PageMeta;
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use anyhow::anyhow;
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -154,10 +154,14 @@ impl Pager {
         }
         drop(internal);
 
-        todo!();
+        let frame = self.acquire::<ReadFrame>(pgid)?;
+        Ok(PageRead { pager: self, frame })
     }
 
-    fn acquire(&self, pgid: PageId) -> anyhow::Result<ReadFrame> {
+    fn acquire<'a, T>(&'a self, pgid: PageId) -> anyhow::Result<T>
+    where
+        T: BufferPoolFrame<'a> + From<WriteFrame<'a>>,
+    {
         let mut internal = self.internal.write();
         let page_count = self.state.read().page_count;
         assert!(
@@ -169,7 +173,7 @@ impl Pager {
 
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
             internal.evictor.acquired(frame_id);
-            return Ok(self.pool.read(frame_id));
+            return Ok(T::get(&self.pool, frame_id));
         }
 
         let frame = self.pool.alloc(PageMeta::empty(pgid));
@@ -212,6 +216,22 @@ pub(crate) struct DbState {
     pub(crate) root: Option<PageId>,
     pub(crate) freelist: Option<PageId>,
     pub(crate) page_count: u64,
+}
+
+pub(crate) trait BufferPoolFrame<'a> {
+    fn get(pool: &'a BufferPool, index: usize) -> Self;
+}
+
+impl<'a> BufferPoolFrame<'a> for ReadFrame<'a> {
+    fn get(pool: &'a BufferPool, index: usize) -> Self {
+        pool.read(index)
+    }
+}
+
+impl<'a> BufferPoolFrame<'a> for WriteFrame<'a> {
+    fn get(pool: &'a BufferPool, index: usize) -> Self {
+        pool.write(index)
+    }
 }
 
 pub(crate) struct PageRead<'a> {
