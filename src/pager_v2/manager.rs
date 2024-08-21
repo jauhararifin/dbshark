@@ -1,7 +1,8 @@
-use crate::id::{Lsn, PageId};
+use crate::id::{Lsn, PageId, TxId};
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
+use crate::pager_v2::log::LogContext;
 use crate::pager_v2::page::{PageKind, PageMeta};
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
@@ -180,6 +181,38 @@ impl Pager {
         }
 
         Ok(meta)
+    }
+
+    pub(crate) fn alloc(&self, ctx: LogContext, txid: TxId) -> anyhow::Result<PageWrite> {
+        let pgid = {
+            let mut state = self.state.write();
+            state.page_count += 1;
+            PageId::new(state.page_count - 1).unwrap()
+        };
+
+        let lsn = ctx.record_alloc(txid, pgid)?;
+
+        let mut internal = self.internal.write();
+        let mut evictor = self.evictor.lock();
+        let frame = if let Some(frame) = self.pool.alloc(PageMeta::init(pgid, lsn)) {
+            evictor.acquired(frame.index);
+            internal.page_to_frame.insert(pgid, frame.index);
+            frame
+        } else {
+            let (frame_id, dirty) = evictor.evict()?;
+            let frame = self.pool.write(frame_id);
+            let old_pgid = frame.meta.id;
+            if dirty {
+                internal.file.spill(frame.meta, frame.buffer)?;
+            }
+            *frame.meta = PageMeta::init(pgid, lsn);
+            internal.page_to_frame.remove(&old_pgid);
+            internal.page_to_frame.insert(pgid, frame_id);
+            evictor.reset(frame_id);
+            frame
+        };
+
+        Ok(PageWrite { pager: self, frame })
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {

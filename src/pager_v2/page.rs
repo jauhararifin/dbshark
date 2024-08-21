@@ -20,6 +20,15 @@ impl PageMeta {
             dirty: false,
         }
     }
+
+    pub(crate) fn init(pgid: PageId, lsn: Lsn) -> Self {
+        Self {
+            id: pgid,
+            kind: PageKind::None,
+            lsn,
+            dirty: false,
+        }
+    }
 }
 
 const PAGE_HEADER_SIZE: usize = 24;
