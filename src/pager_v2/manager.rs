@@ -1,12 +1,12 @@
-use crate::id::PageId;
+use crate::id::{Lsn, PageId};
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
-use crate::pager_v2::page::PageMeta;
+use crate::pager_v2::page::{PageKind, PageMeta};
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
 use anyhow::anyhow;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,11 +18,11 @@ pub(crate) struct Pager {
     state: RwLock<DbState>,
     pool: BufferPool,
     internal: RwLock<PagerInternal>,
+    evictor: Mutex<Evictor>,
 }
 
 struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
-    evictor: Evictor,
     file: FileManager,
 }
 
@@ -48,9 +48,9 @@ impl Pager {
             pool: BufferPool::new(page_size, n),
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
-                evictor: Evictor::new(n),
                 file: FileManager::new(path, wal, page_size, 10)?,
             }),
+            evictor: Mutex::new(Evictor::new(n)),
         })
     }
 
@@ -130,35 +130,60 @@ impl Pager {
             "page {pgid:?} is out of bound when acquiring page since page_count={page_count}",
         );
 
+        let mut evictor = self.evictor.lock();
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
-            internal.evictor.acquired(frame_id);
+            evictor.acquired(frame_id);
             return Ok(T::get(&self.pool, frame_id));
         } else if let Some(frame) = self.pool.alloc(PageMeta::empty(pgid)) {
-            *frame.meta = Self::fetch_page(frame.buffer)?;
-            internal.evictor.acquired(frame.index);
+            *frame.meta = Self::fetch_page(&mut internal, pgid, frame.buffer)?;
+            evictor.acquired(frame.index);
             internal.page_to_frame.insert(pgid, frame.index);
             return Ok(frame.into());
         } else {
-            let (frame_id, dirty) = internal.evictor.evict()?;
+            let (frame_id, dirty) = evictor.evict()?;
             let frame = self.pool.write(frame_id);
             let old_pgid = frame.meta.id;
             if dirty {
                 internal.file.spill(frame.meta, frame.buffer)?;
             }
-            *frame.meta = Self::fetch_page(frame.buffer)?;
+            *frame.meta = Self::fetch_page(&mut internal, pgid, frame.buffer)?;
             internal.page_to_frame.remove(&old_pgid);
             internal.page_to_frame.insert(pgid, frame_id);
-            internal.evictor.reset(frame_id);
+            evictor.reset(frame_id);
             Ok(frame.into())
         }
     }
 
-    fn fetch_page(buff: &mut [u8]) -> anyhow::Result<PageMeta> {
-        todo!();
+    fn fetch_page(
+        internal: &mut PagerInternal,
+        pgid: PageId,
+        buff: &mut [u8],
+    ) -> anyhow::Result<PageMeta> {
+        let found = internal.file.get(pgid, buff)?;
+        let default_page = PageMeta {
+            id: pgid,
+            kind: PageKind::None,
+            lsn: Lsn::new(0),
+            dirty: false,
+        };
+        let meta = if found {
+            PageMeta::decode(buff)?.unwrap_or(default_page)
+        } else {
+            default_page
+        };
+
+        if meta.id != pgid {
+            return Err(anyhow!(
+                "page {pgid:?} was written with invalid pgid information {:?}",
+                meta.id,
+            ));
+        }
+
+        Ok(meta)
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {
-        todo!();
+        self.evictor.lock().released(frame_id, is_dirty);
     }
 }
 

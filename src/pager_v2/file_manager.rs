@@ -139,30 +139,39 @@ impl FileManager {
             self.wal.sync(max_lsn)?;
         }
 
-        // TODO: maybe we can use vectorized write to write them all in one single syscall
         for (i, pgid) in self.pgids.iter().enumerate() {
-            write_page(
-                &mut self.main,
-                *pgid,
-                self.page_size,
-                &self.pages[i * self.page_size..(i + 1) * self.page_size],
-            )?;
+            // TODO: maybe we can use vectorized write to write them all in one single syscall
+            let page_size = self.page_size as u64;
+            let file_size = self.main.metadata()?.len();
+            let min_size = pgid.get() * page_size + page_size;
+            if min_size > file_size {
+                self.main.set_len(pgid.get() * page_size + page_size)?;
+            }
+            self.main.seek(SeekFrom::Start(pgid.get() * page_size))?;
+            let buff = &self.pages[i * self.page_size..(i + 1) * self.page_size];
+            self.main.write_all(buff)?;
         }
         self.main.sync_all()?;
         self.pgids.clear();
 
         Ok(())
     }
+
+    pub(crate) fn get(&mut self, pgid: PageId, buff: &mut [u8]) -> anyhow::Result<bool> {
+        if let Some((i, _)) = self.pgids.get_full(&pgid) {
+            buff.copy_from_slice(&self.pages[i * self.page_size..(i + 1) * self.page_size]);
+            Ok(true)
+        } else {
+            let page_size = self.page_size as u64;
+            let file_size = self.main.metadata()?.len();
+            let min_size = pgid.get() * page_size + page_size;
+            if min_size > file_size {
+                return Ok(false);
+            }
+            self.main.seek(SeekFrom::Start(pgid.get() * page_size))?;
+            self.main.read_exact(buff)?;
+            Ok(true)
+        }
+    }
 }
 
-fn write_page(f: &mut File, id: PageId, page_size: usize, buff: &[u8]) -> anyhow::Result<()> {
-    let page_size = page_size as u64;
-    let file_size = f.metadata()?.len();
-    let min_size = id.get() * page_size + page_size;
-    if min_size > file_size {
-        f.set_len(id.get() * page_size + page_size)?;
-    }
-    f.seek(SeekFrom::Start(id.get() * page_size))?;
-    f.write_all(buff)?;
-    Ok(())
-}
