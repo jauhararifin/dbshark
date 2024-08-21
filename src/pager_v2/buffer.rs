@@ -163,17 +163,17 @@ impl Drop for BufferPool {
 }
 
 pub(crate) struct ReadFrame<'a> {
-    index: usize,
-    guard: RwLockReadGuard<'a, ()>,
-    meta: &'a PageMeta,
-    buffer: &'a [u8],
+    pub(crate) index: usize,
+    pub(crate) guard: RwLockReadGuard<'a, ()>,
+    pub(crate) meta: &'a PageMeta,
+    pub(crate) buffer: &'a [u8],
 }
 
 pub(crate) struct WriteFrame<'a> {
-    index: usize,
-    guard: RwLockWriteGuard<'a, ()>,
-    meta: &'a mut PageMeta,
-    buffer: &'a mut [u8],
+    pub(crate) index: usize,
+    pub(crate) guard: RwLockWriteGuard<'a, ()>,
+    pub(crate) meta: &'a mut PageMeta,
+    pub(crate) buffer: &'a mut [u8],
 }
 
 #[cfg(test)]

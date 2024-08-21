@@ -1,5 +1,6 @@
 use crate::file_lock::FileLock;
 use crate::id::PageId;
+use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::page::PageMeta;
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use anyhow::anyhow;
@@ -16,8 +17,7 @@ pub(crate) struct Pager {
     n: usize,
 
     state: RwLock<DbState>,
-    metas: Vec<RwLock<PageMeta>>,
-    buffer: *mut u8,
+    pool: BufferPool,
     internal: RwLock<PagerInternal>,
 }
 
@@ -67,8 +67,7 @@ impl Pager {
             n,
 
             state: RwLock::new(DbState::default()),
-            metas: Vec::with_capacity(n),
-            buffer: vec![0u8; n * page_size].leak().as_mut_ptr(),
+            pool: BufferPool::new(page_size, n),
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
             }),
@@ -147,10 +146,29 @@ impl Pager {
 
         let internal = self.internal.read();
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
-            let meta = self.metas[frame_id].read();
+            let frame = self.pool.read(frame_id);
+            return Ok(PageRead { pager: self, frame });
         }
+        drop(internal);
 
         todo!();
+    }
+
+    fn acquire(&self, pgid: PageId) -> anyhow::Result<usize> {
+        let internal = self.internal.write();
+        let page_count = self.state.read().page_count;
+        assert!(
+            pgid.get() <= page_count,
+            "page {:?} is out of bound when acquiring page since page_count={}",
+            pgid,
+            page_count,
+        );
+
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid) {
+            todo!();
+        } else {
+            todo!();
+        }
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {
@@ -167,13 +185,11 @@ pub(crate) struct DbState {
 
 pub(crate) struct PageRead<'a> {
     pager: &'a Pager,
-    frame_id: usize,
-    meta: RwLockReadGuard<'a, PageMeta>,
-    buffer: &'a [u8],
+    frame: ReadFrame<'a>,
 }
 
 impl<'a> Drop for PageRead<'a> {
     fn drop(&mut self) {
-        self.pager.release(self.frame_id, false);
+        self.pager.release(self.frame.index, false);
     }
 }
