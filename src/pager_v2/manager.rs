@@ -1,20 +1,17 @@
-use crate::file_lock::FileLock;
 use crate::id::PageId;
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
+use crate::pager_v2::file_manager::FileManager;
 use crate::pager_v2::page::PageMeta;
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
+use crate::wal::Wal;
 use anyhow::anyhow;
-use indexmap::IndexSet;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) struct Pager {
-    f: Mutex<File>,
-    dbuff: Mutex<File>,
     page_size: usize,
     n: usize,
 
@@ -30,31 +27,12 @@ struct PagerInternal {
 }
 
 impl Pager {
-    pub(crate) fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
-        let db_path = path.join("main");
-        let double_buff_path = path.join("dbuff");
-
-        let mut db_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(db_path)?
-            .lock()?;
-        if !db_file.metadata()?.is_file() {
-            return Err(anyhow!("db file is not a regular file"));
-        }
-        let mut double_buff_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(double_buff_path)?
-            .lock()?;
-        if !double_buff_file.metadata()?.is_file() {
-            return Err(anyhow!("double buffer file is not a regular file"));
-        }
-
+    pub(crate) fn new(
+        path: &Path,
+        wal: Arc<Wal>,
+        page_size: usize,
+        n: usize,
+    ) -> anyhow::Result<Self> {
         Self::check_page_size(page_size)?;
         if n < 10 {
             return Err(anyhow!(
@@ -62,11 +40,7 @@ impl Pager {
             ));
         }
 
-        Self::recover_non_atomic_writes(&mut db_file, &mut double_buff_file, page_size)?;
-
         Ok(Self {
-            f: Mutex::new(db_file),
-            dbuff: Mutex::new(double_buff_file),
             page_size,
             n,
 
@@ -75,7 +49,7 @@ impl Pager {
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
                 evictor: Evictor::new(n),
-                file: FileManager::new(page_size, 10),
+                file: FileManager::new(path, wal, page_size, 10)?,
             }),
         })
     }
@@ -102,42 +76,6 @@ impl Pager {
             ));
         }
 
-        Ok(())
-    }
-
-    fn recover_non_atomic_writes(
-        f: &mut File,
-        dbuff: &mut File,
-        page_size: usize,
-    ) -> anyhow::Result<()> {
-        let size = dbuff.metadata()?.len();
-        let count = (size as usize) / page_size;
-
-        let mut buff = vec![0u8; page_size * count];
-        dbuff.seek(SeekFrom::Start(0))?;
-        dbuff.read_exact(&mut buff)?;
-
-        for i in 0..count {
-            let buff = &buff[i * page_size..(i + 1) * page_size];
-            let Some(meta) = PageMeta::decode(buff)? else {
-                continue;
-            };
-            Self::write_page_no_sync(f, meta.id(), buff)?;
-        }
-
-        f.sync_all()?;
-        Ok(())
-    }
-
-    fn write_page_no_sync(f: &mut File, id: PageId, buff: &[u8]) -> anyhow::Result<()> {
-        let page_size = buff.len() as u64;
-        let file_size = f.metadata()?.len();
-        let min_size = id.get() * page_size + page_size;
-        if min_size > file_size {
-            f.set_len(id.get() * page_size + page_size)?;
-        }
-        f.seek(SeekFrom::Start(id.get() * page_size))?;
-        f.write_all(buff)?;
         Ok(())
     }
 
@@ -244,43 +182,6 @@ impl<'a> BufferPoolFrame<'a> for ReadFrame<'a> {
 impl<'a> BufferPoolFrame<'a> for WriteFrame<'a> {
     fn get(pool: &'a BufferPool, index: usize) -> Self {
         pool.write(index)
-    }
-}
-
-struct FileManager {
-    n: usize,
-    pages: Box<[u8]>,
-    pgids: IndexSet<PageId>,
-}
-
-impl FileManager {
-    fn new(page_size: usize, n: usize) -> Self {
-        Self {
-            n,
-            pages: vec![0u8; page_size * n].into_boxed_slice(),
-            pgids: IndexSet::with_capacity(n),
-        }
-    }
-
-    fn spill(&mut self, meta: &PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
-        let page_size = buff.len();
-        meta.encode(buff)?;
-
-        let index = if let Some((i, _)) = self.pgids.get_full(&meta.id) {
-            i
-        } else {
-            let is_full = self.pgids.len() >= self.n;
-            if is_full {
-                todo!("flush to actual disk");
-            }
-
-            let i = self.pgids.len();
-            self.pgids.insert(meta.id);
-            i
-        };
-        self.pages[index * page_size..(index + 1) * page_size].copy_from_slice(buff);
-
-        Ok(())
     }
 }
 
