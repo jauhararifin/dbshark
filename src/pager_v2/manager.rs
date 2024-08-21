@@ -5,6 +5,7 @@ use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::page::PageMeta;
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use anyhow::anyhow;
+use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -25,6 +26,7 @@ pub(crate) struct Pager {
 struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
     evictor: Evictor,
+    file: FileManager,
 }
 
 impl Pager {
@@ -73,6 +75,7 @@ impl Pager {
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
                 evictor: Evictor::new(n),
+                file: FileManager::new(page_size, 10),
             }),
         })
     }
@@ -158,6 +161,26 @@ impl Pager {
         Ok(PageRead { pager: self, frame })
     }
 
+    pub(crate) fn write(&self, pgid: PageId) -> anyhow::Result<PageWrite> {
+        let page_count = self.state.read().page_count;
+        assert!(
+            pgid.get() < page_count,
+            "page {:?} is out of bound for writing since page_count={}",
+            pgid,
+            page_count,
+        );
+
+        let internal = self.internal.read();
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            let frame = self.pool.write(frame_id);
+            return Ok(PageWrite { pager: self, frame });
+        }
+        drop(internal);
+
+        let frame = self.acquire::<WriteFrame>(pgid)?;
+        Ok(PageWrite { pager: self, frame })
+    }
+
     fn acquire<'a, T>(&'a self, pgid: PageId) -> anyhow::Result<T>
     where
         T: BufferPoolFrame<'a> + From<WriteFrame<'a>>,
@@ -166,40 +189,30 @@ impl Pager {
         let page_count = self.state.read().page_count;
         assert!(
             pgid.get() <= page_count,
-            "page {:?} is out of bound when acquiring page since page_count={}",
-            pgid,
-            page_count,
+            "page {pgid:?} is out of bound when acquiring page since page_count={page_count}",
         );
 
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
             internal.evictor.acquired(frame_id);
             return Ok(T::get(&self.pool, frame_id));
-        }
-
-        let frame = self.pool.alloc(PageMeta::empty(pgid));
-        if let Some(frame) = frame {
+        } else if let Some(frame) = self.pool.alloc(PageMeta::empty(pgid)) {
             *frame.meta = Self::fetch_page(frame.buffer)?;
             internal.evictor.acquired(frame.index);
             internal.page_to_frame.insert(pgid, frame.index);
             return Ok(frame.into());
+        } else {
+            let (frame_id, dirty) = internal.evictor.evict()?;
+            let frame = self.pool.write(frame_id);
+            let old_pgid = frame.meta.id;
+            if dirty {
+                internal.file.spill(frame.meta, frame.buffer)?;
+            }
+            *frame.meta = Self::fetch_page(frame.buffer)?;
+            internal.page_to_frame.remove(&old_pgid);
+            internal.page_to_frame.insert(pgid, frame_id);
+            internal.evictor.reset(frame_id);
+            Ok(frame.into())
         }
-
-        let (frame_id, dirty) = internal.evictor.evict()?;
-        let frame = self.pool.write(frame_id);
-        let old_pgid = frame.meta.id;
-        if dirty {
-            Self::spill_page(&frame.meta, frame.buffer)?;
-        }
-        *frame.meta = Self::fetch_page(frame.buffer)?;
-        internal.page_to_frame.remove(&old_pgid);
-        internal.page_to_frame.insert(pgid, frame_id);
-        internal.evictor.reset(frame_id);
-
-        Ok(frame.into())
-    }
-
-    fn spill_page(meta: &PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
-        todo!();
     }
 
     fn fetch_page(buff: &mut [u8]) -> anyhow::Result<PageMeta> {
@@ -234,12 +247,60 @@ impl<'a> BufferPoolFrame<'a> for WriteFrame<'a> {
     }
 }
 
+struct FileManager {
+    n: usize,
+    pages: Box<[u8]>,
+    pgids: IndexSet<PageId>,
+}
+
+impl FileManager {
+    fn new(page_size: usize, n: usize) -> Self {
+        Self {
+            n,
+            pages: vec![0u8; page_size * n].into_boxed_slice(),
+            pgids: IndexSet::with_capacity(n),
+        }
+    }
+
+    fn spill(&mut self, meta: &PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
+        let page_size = buff.len();
+        meta.encode(buff)?;
+
+        let index = if let Some((i, _)) = self.pgids.get_full(&meta.id) {
+            i
+        } else {
+            let is_full = self.pgids.len() >= self.n;
+            if is_full {
+                todo!("flush to actual disk");
+            }
+
+            let i = self.pgids.len();
+            self.pgids.insert(meta.id);
+            i
+        };
+        self.pages[index * page_size..(index + 1) * page_size].copy_from_slice(buff);
+
+        Ok(())
+    }
+}
+
 pub(crate) struct PageRead<'a> {
     pager: &'a Pager,
     frame: ReadFrame<'a>,
 }
 
 impl<'a> Drop for PageRead<'a> {
+    fn drop(&mut self) {
+        self.pager.release(self.frame.index, false);
+    }
+}
+
+pub(crate) struct PageWrite<'a> {
+    pager: &'a Pager,
+    frame: WriteFrame<'a>,
+}
+
+impl<'a> Drop for PageWrite<'a> {
     fn drop(&mut self) {
         self.pager.release(self.frame.index, false);
     }

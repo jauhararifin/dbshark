@@ -446,7 +446,7 @@ mod tests {
             },
         ];
 
-        let page_sizes = vec![256usize, 512, 4096, 8192, 16384];
+        let page_sizes = [256usize, 512, 4096, 8192, 16384];
         let mut global_buff = vec![0u8; MAXIMUM_PAGE_SIZE];
         for testcase in testcases {
             for page_size in page_sizes.iter().copied() {
