@@ -8,6 +8,19 @@ pub(crate) struct PageMeta {
     id: PageId,
     kind: PageKind,
     lsn: Lsn,
+    is_dirty: bool,
+}
+
+#[cfg(test)]
+impl PageMeta {
+    pub(crate) fn dummy(id: PageId, kind: PageKind, lsn: Lsn, is_dirty: bool) -> Self {
+        Self {
+            id,
+            kind,
+            lsn,
+            is_dirty,
+        }
+    }
 }
 
 const PAGE_HEADER_SIZE: usize = 24;
@@ -184,6 +197,7 @@ impl PageMeta {
             id: page_id,
             kind,
             lsn: page_lsn,
+            is_dirty: false,
         }))
     }
 
@@ -354,8 +368,8 @@ impl OverflowKind {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FreelistKind {
-    next: Option<PageId>,
-    count: usize,
+    pub(crate) next: Option<PageId>,
+    pub(crate) count: usize,
 }
 
 impl FreelistKind {
@@ -383,7 +397,7 @@ impl FreelistKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pager_v2::pager::MAXIMUM_PAGE_SIZE;
+    use crate::pager_v2::MAXIMUM_PAGE_SIZE;
 
     #[test]
     fn test_encode_decode() -> anyhow::Result<()> {
@@ -392,6 +406,7 @@ mod tests {
                 id: PageId::new(1).unwrap(),
                 kind: PageKind::None,
                 lsn: Lsn::new(1),
+                is_dirty: false,
             },
             // TODO: test interior and leaf kind
             PageMeta {
@@ -401,6 +416,7 @@ mod tests {
                     size: 100,
                 }),
                 lsn: Lsn::new(99),
+                is_dirty: false,
             },
             PageMeta {
                 id: PageId::new(112314).unwrap(),
@@ -409,6 +425,7 @@ mod tests {
                     size: 100,
                 }),
                 lsn: Lsn::new(99),
+                is_dirty: false,
             },
             PageMeta {
                 id: PageId::new(112314).unwrap(),
@@ -417,6 +434,7 @@ mod tests {
                     count: 10,
                 }),
                 lsn: Lsn::new(99),
+                is_dirty: false,
             },
             PageMeta {
                 id: PageId::new(112314).unwrap(),
@@ -425,6 +443,7 @@ mod tests {
                     count: 10,
                 }),
                 lsn: Lsn::new(99),
+                is_dirty: false,
             },
         ];
 

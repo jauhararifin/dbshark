@@ -1,7 +1,9 @@
 use crate::id::PageId;
 use crate::pager_v2::page::PageMeta;
+use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use anyhow::anyhow;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -9,10 +11,18 @@ use std::path::Path;
 pub(crate) struct Pager {
     f: Mutex<File>,
     dbuff: Mutex<File>,
+    page_size: usize,
+    n: usize,
+
+    state: RwLock<DbState>,
+    metas: Vec<RwLock<PageMeta>>,
+    buffer: *mut u8,
+    internal: RwLock<PagerInternal>,
 }
 
-const MINIMUM_PAGE_SIZE: usize = 256;
-pub(crate) const MAXIMUM_PAGE_SIZE: usize = 0x4000;
+struct PagerInternal {
+    page_to_frame: HashMap<PageId, usize>,
+}
 
 impl Pager {
     pub(crate) fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
@@ -50,6 +60,15 @@ impl Pager {
         Ok(Self {
             f: Mutex::new(db_file),
             dbuff: Mutex::new(double_buff_file),
+            page_size,
+            n,
+
+            state: RwLock::new(DbState::default()),
+            metas: Vec::with_capacity(n),
+            buffer: vec![0u8; n * page_size].leak().as_mut_ptr(),
+            internal: RwLock::new(PagerInternal {
+                page_to_frame: HashMap::with_capacity(n),
+            }),
         })
     }
 
@@ -92,7 +111,7 @@ impl Pager {
 
         for i in 0..count {
             let buff = &buff[i * page_size..(i + 1) * page_size];
-            let Some(meta) = Self::decode_page(buff)? else {
+            let Some(meta) = PageMeta::decode(buff)? else {
                 continue;
             };
             Self::write_page_no_sync(f, meta.id(), buff)?;
@@ -100,10 +119,6 @@ impl Pager {
 
         f.sync_all()?;
         Ok(())
-    }
-
-    fn decode_page(buff: &[u8]) -> anyhow::Result<Option<PageMeta>> {
-        todo!();
     }
 
     fn write_page_no_sync(f: &mut File, id: PageId, buff: &[u8]) -> anyhow::Result<()> {
@@ -116,5 +131,46 @@ impl Pager {
         f.seek(SeekFrom::Start(id.get() * page_size))?;
         f.write_all(buff)?;
         Ok(())
+    }
+
+    pub(crate) fn read(&self, pgid: PageId) -> anyhow::Result<PageRead> {
+        let page_count = self.state.read().page_count;
+        assert!(
+            pgid.get() < page_count,
+            "page {:?} is out of bound for reading since page_count={}",
+            pgid,
+            page_count,
+        );
+
+        let internal = self.internal.read();
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            let meta = self.metas[frame_id].read();
+        }
+
+        todo!();
+    }
+
+    fn release(&self, frame_id: usize, is_dirty: bool) {
+        todo!();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DbState {
+    pub(crate) root: Option<PageId>,
+    pub(crate) freelist: Option<PageId>,
+    pub(crate) page_count: u64,
+}
+
+pub(crate) struct PageRead<'a> {
+    pager: &'a Pager,
+    frame_id: usize,
+    meta: RwLockReadGuard<'a, PageMeta>,
+    buffer: &'a [u8],
+}
+
+impl<'a> Drop for PageRead<'a> {
+    fn drop(&mut self) {
+        self.pager.release(self.frame_id, false);
     }
 }
