@@ -3122,6 +3122,7 @@ fn write_page(f: &mut File, id: PageId, page_size: usize, buff: &[u8]) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_lock::FileLock;
     use std::fs::OpenOptions;
 
     #[test]
@@ -3136,6 +3137,8 @@ mod tests {
             .create(true)
             .truncate(false)
             .open(file_path)
+            .unwrap()
+            .lock()
             .unwrap();
 
         let double_buff_file_path = dir.path().join("test.wal");

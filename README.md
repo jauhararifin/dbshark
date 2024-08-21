@@ -15,3 +15,8 @@ Some of key features are:
 - Allow rollback
 - Concurrent read transaction
 - Write transactions are exclusive
+
+Limitation:
+- Currently, it's only working for linux
+- No delete operation yet
+- Only allow single instance

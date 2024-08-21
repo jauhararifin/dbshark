@@ -31,5 +31,6 @@ mod pager;
 mod pager_v2;
 mod recovery;
 mod wal;
+mod file_lock;
 
 pub use db::{Db, Setting};

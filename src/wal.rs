@@ -1,3 +1,4 @@
+use crate::file_lock::FileLock;
 use crate::id::Lsn;
 use crate::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
 use crate::pager::MAXIMUM_PAGE_SIZE;
@@ -424,7 +425,8 @@ where
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&wal_path_1)?;
+        .open(&wal_path_1)?
+        .lock()?;
     if !wal_file_1.metadata()?.is_file() {
         return Err(anyhow!("{wal_path_1:?} is not a regular file"));
     }
@@ -436,7 +438,8 @@ where
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&wal_path_2)?;
+        .open(&wal_path_2)?
+        .lock()?;
     if !wal_file_2.metadata()?.is_file() {
         return Err(anyhow!("{wal_path_2:?} is not a regular file"));
     }

@@ -1,5 +1,6 @@
 use crate::bins::SliceExt;
 use crate::btree::{BTreeRead, BTreeWrite, Cursor};
+use crate::file_lock::FileLock;
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
 use crate::pager::{DbState, LogContext, Pager};
@@ -73,7 +74,8 @@ impl Db {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(db_path)?;
+            .open(db_path)?
+            .lock()?;
         if !db_file.metadata()?.is_file() {
             return Err(anyhow!("db file is not a regular file"));
         }
@@ -84,7 +86,8 @@ impl Db {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(double_buff_path)?;
+            .open(double_buff_path)?
+            .lock()?;
         if !double_buff_file.metadata()?.is_file() {
             return Err(anyhow!("double buffer file is not a regular file"));
         }
