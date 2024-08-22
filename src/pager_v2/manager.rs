@@ -1,4 +1,5 @@
 use crate::id::{Lsn, PageId, TxId};
+use crate::log::{WalEntry, WalKind};
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
@@ -7,7 +8,7 @@ use crate::pager_v2::page::{get_interior_cell_range, PageKind, PageMeta, PageOps
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
 use anyhow::anyhow;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,11 +21,11 @@ pub(crate) struct Pager {
     pool: BufferPool,
     internal: RwLock<PagerInternal>,
     evictor: Mutex<Evictor>,
+    file: RwLock<FileManager>,
 }
 
 struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
-    file: FileManager,
 }
 
 impl Pager {
@@ -49,9 +50,9 @@ impl Pager {
             pool: BufferPool::new(page_size, n),
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
-                file: FileManager::new(path, wal, page_size, 10)?,
             }),
             evictor: Mutex::new(Evictor::new(n)),
+            file: RwLock::new(FileManager::new(path, wal, page_size, 10)?),
         })
     }
 
@@ -136,7 +137,8 @@ impl Pager {
             evictor.acquired(frame_id);
             return Ok(T::get(&self.pool, txid, frame_id));
         } else if let Some(frame) = self.pool.alloc(txid, PageMeta::empty(pgid)) {
-            *frame.meta = Self::fetch_page(&mut internal, pgid, frame.buffer)?;
+            let mut file = self.file.write();
+            *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer)?;
             evictor.acquired(frame.index);
             internal.page_to_frame.insert(pgid, frame.index);
             return Ok(frame.into());
@@ -144,10 +146,11 @@ impl Pager {
             let (frame_id, dirty) = evictor.evict()?;
             let frame = self.pool.write(txid, frame_id);
             let old_pgid = frame.meta.id;
+            let mut file = self.file.write();
             if dirty {
-                internal.file.spill(frame.meta, frame.buffer)?;
+                file.spill(frame.meta, frame.buffer)?;
             }
-            *frame.meta = Self::fetch_page(&mut internal, pgid, frame.buffer)?;
+            *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer)?;
             internal.page_to_frame.remove(&old_pgid);
             internal.page_to_frame.insert(pgid, frame_id);
             evictor.reset(frame_id);
@@ -156,11 +159,11 @@ impl Pager {
     }
 
     fn fetch_page(
-        internal: &mut PagerInternal,
+        file: &mut FileManager,
         pgid: PageId,
         buff: &mut [u8],
     ) -> anyhow::Result<PageMeta> {
-        let found = internal.file.get(pgid, buff)?;
+        let found = file.get(pgid, buff)?;
         let default_page = PageMeta {
             id: pgid,
             kind: PageKind::None,
@@ -203,7 +206,8 @@ impl Pager {
             let frame = self.pool.write(txid, frame_id);
             let old_pgid = frame.meta.id;
             if dirty {
-                internal.file.spill(frame.meta, frame.buffer)?;
+                let mut file = self.file.write();
+                file.spill(frame.meta, frame.buffer)?;
             }
             *frame.meta = PageMeta::init(pgid, lsn);
             internal.page_to_frame.remove(&old_pgid);
@@ -213,6 +217,34 @@ impl Pager {
         };
 
         Ok(PageWrite { pager: self, frame })
+    }
+
+    pub(crate) fn read_state(&self) -> RwLockReadGuard<DbState> {
+        self.state.read()
+    }
+
+    // Note: unlike the original aries design where the flushing process and checkpoint are
+    // considered different component, this DB combines them together. During checkpoint, all
+    // dirty pages are flushed. This makes the checkpoint process longer, but simpler. We also
+    // don't need checkpoint-end log record.
+    pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
+        let mut first_unflushed = None;
+        for item in self.pool.walk() {
+            let should_flush = first_unflushed
+                .map(|first_unflushed| item.meta.lsn >= first_unflushed)
+                .unwrap_or(true);
+            if should_flush {
+                let new_first_unflushed = wal.sync(item.meta.lsn)?;
+                first_unflushed = Some(new_first_unflushed);
+            }
+
+            let mut file = self.file.write();
+            file.spill(item.meta, item.buffer)?;
+        }
+
+        let mut file = self.file.write();
+        file.sync()?;
+        Ok(())
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {

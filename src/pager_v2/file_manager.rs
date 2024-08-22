@@ -117,7 +117,7 @@ impl FileManager {
         } else {
             let is_full = self.pgids.len() >= self.n;
             if is_full {
-                self.flush_and_clear_flushing_pages()?;
+                self.sync()?;
             }
             let i = self.pgids.len();
             self.pgids.insert(meta.id);
@@ -129,7 +129,7 @@ impl FileManager {
         Ok(())
     }
 
-    fn flush_and_clear_flushing_pages(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn sync(&mut self) -> anyhow::Result<()> {
         self.double_buff.set_len(0)?;
         self.double_buff.seek(SeekFrom::Start(0))?;
         self.double_buff.write_all(&self.pages)?;
@@ -174,4 +174,3 @@ impl FileManager {
         }
     }
 }
-

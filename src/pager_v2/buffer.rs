@@ -1,6 +1,7 @@
 use crate::id::TxId;
 use crate::pager_v2::page::PageMeta;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::iter::Iterator;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -71,6 +72,17 @@ impl BufferPool {
     }
 
     pub(crate) fn write(&self, txid: TxId, index: usize) -> WriteFrame {
+        let item = self.write_internal(index);
+        WriteFrame {
+            index,
+            guard: item.guard,
+            txid,
+            meta: item.meta,
+            buffer: item.buffer,
+        }
+    }
+
+    pub(crate) fn write_internal(&self, index: usize) -> BufferPoolItem {
         assert!(index < self.allocated.load(Ordering::SeqCst));
         assert!(index < self.n);
 
@@ -94,10 +106,8 @@ impl BufferPool {
         // is locked with exclusive-lock and we always lock the meta first before grabbing the buffer.
         let buffer = unsafe { std::slice::from_raw_parts_mut(buffer, self.page_size) };
 
-        WriteFrame {
-            index,
+        BufferPoolItem {
             guard,
-            txid,
             meta,
             buffer,
         }
@@ -167,8 +177,8 @@ impl Drop for BufferPool {
 }
 
 pub(crate) struct ReadFrame<'a> {
-    pub(super) index: usize,
-    pub(super) guard: RwLockReadGuard<'a, ()>,
+    pub(crate) index: usize,
+    guard: RwLockReadGuard<'a, ()>,
     pub(super) txid: TxId,
     pub(super) meta: &'a PageMeta,
     pub(super) buffer: &'a [u8],
@@ -188,10 +198,48 @@ impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
 
 pub(crate) struct WriteFrame<'a> {
     pub(super) index: usize,
-    pub(super) guard: RwLockWriteGuard<'a, ()>,
+    guard: RwLockWriteGuard<'a, ()>,
     pub(super) txid: TxId,
     pub(super) meta: &'a mut PageMeta,
     pub(super) buffer: &'a mut [u8],
+}
+
+impl BufferPool {
+    pub(crate) fn walk(&self) -> impl Iterator<Item = BufferPoolItem> {
+        let allocated = self.allocated.load(Ordering::SeqCst);
+        let allocated = std::cmp::min(allocated, self.n);
+        BufferPoolWalk {
+            pool: self,
+            i: 0,
+            count: allocated,
+        }
+    }
+}
+
+pub(crate) struct BufferPoolWalk<'a> {
+    pool: &'a BufferPool,
+    i: usize,
+    count: usize,
+}
+
+pub(crate) struct BufferPoolItem<'a> {
+    guard: RwLockWriteGuard<'a, ()>,
+    pub(super) meta: &'a mut PageMeta,
+    pub(super) buffer: &'a mut [u8],
+}
+
+impl<'a> Iterator for BufferPoolWalk<'a> {
+    type Item = BufferPoolItem<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.count {
+            return None;
+        }
+
+        let item = self.pool.write_internal(self.i);
+        self.i += 1;
+        Some(item)
+    }
 }
 
 #[cfg(test)]

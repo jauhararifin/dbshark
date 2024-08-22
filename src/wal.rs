@@ -287,22 +287,26 @@ impl Wal {
         )
     }
 
-    pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
+    pub(crate) fn first_unflushed(&self) -> Lsn {
+        self.internal.read().first_unflushed
+    }
+
+    pub(crate) fn sync(&self, lsn: Lsn) -> anyhow::Result<Lsn> {
         let internal = self.internal.read();
         assert!(lsn < internal.next);
         if internal.first_unflushed > lsn {
-            return Ok(());
+            return Ok(internal.first_unflushed);
         }
         drop(internal);
 
         let mut internal = self.internal.write();
         if internal.first_unflushed > lsn {
-            return Ok(());
+            return Ok(internal.first_unflushed);
         }
 
         let mut buffer = self.buffer.write();
         Self::flush(&mut internal, &mut buffer, &self.f1, &self.f2)?;
-        Ok(())
+        Ok(internal.first_unflushed)
     }
 
     pub(crate) fn iter_back<F>(&self, upper_bound: Lsn, mut handler: F) -> anyhow::Result<()>
