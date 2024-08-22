@@ -1,3 +1,4 @@
+use crate::id::TxId;
 use crate::pager_v2::page::PageMeta;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::mem::MaybeUninit;
@@ -36,7 +37,7 @@ impl BufferPool {
         }
     }
 
-    pub(crate) fn read(&self, index: usize) -> ReadFrame {
+    pub(crate) fn read(&self, txid: TxId, index: usize) -> ReadFrame {
         assert!(index < self.allocated.load(Ordering::SeqCst));
         assert!(index < self.n);
 
@@ -63,12 +64,13 @@ impl BufferPool {
         ReadFrame {
             index,
             guard,
+            txid,
             meta,
             buffer,
         }
     }
 
-    pub(crate) fn write(&self, index: usize) -> WriteFrame {
+    pub(crate) fn write(&self, txid: TxId, index: usize) -> WriteFrame {
         assert!(index < self.allocated.load(Ordering::SeqCst));
         assert!(index < self.n);
 
@@ -95,12 +97,13 @@ impl BufferPool {
         WriteFrame {
             index,
             guard,
+            txid,
             meta,
             buffer,
         }
     }
 
-    pub(crate) fn alloc(&self, init: PageMeta) -> Option<WriteFrame> {
+    pub(crate) fn alloc(&self, txid: TxId, init: PageMeta) -> Option<WriteFrame> {
         let (guard, index) = loop {
             let allocated = self.allocated.load(Ordering::SeqCst);
             if allocated >= self.n {
@@ -143,6 +146,7 @@ impl BufferPool {
         Some(WriteFrame {
             index,
             guard,
+            txid,
             meta,
             buffer,
         })
@@ -163,10 +167,11 @@ impl Drop for BufferPool {
 }
 
 pub(crate) struct ReadFrame<'a> {
-    pub(crate) index: usize,
-    pub(crate) guard: RwLockReadGuard<'a, ()>,
-    pub(crate) meta: &'a PageMeta,
-    pub(crate) buffer: &'a [u8],
+    pub(super) index: usize,
+    pub(super) guard: RwLockReadGuard<'a, ()>,
+    pub(super) txid: TxId,
+    pub(super) meta: &'a PageMeta,
+    pub(super) buffer: &'a [u8],
 }
 
 impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
@@ -174,6 +179,7 @@ impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
         Self {
             index: value.index,
             guard: RwLockWriteGuard::downgrade(value.guard),
+            txid: value.txid,
             meta: value.meta,
             buffer: value.buffer,
         }
@@ -181,10 +187,11 @@ impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
 }
 
 pub(crate) struct WriteFrame<'a> {
-    pub(crate) index: usize,
-    pub(crate) guard: RwLockWriteGuard<'a, ()>,
-    pub(crate) meta: &'a mut PageMeta,
-    pub(crate) buffer: &'a mut [u8],
+    pub(super) index: usize,
+    pub(super) guard: RwLockWriteGuard<'a, ()>,
+    pub(super) txid: TxId,
+    pub(super) meta: &'a mut PageMeta,
+    pub(super) buffer: &'a mut [u8],
 }
 
 #[cfg(test)]
@@ -198,6 +205,7 @@ mod tests {
     #[test]
     fn test_allocation() {
         let iteration = 100;
+        let txid = TxId::new(1).unwrap();
         for _ in 0..iteration {
             let pool = BufferPool::new(128, 100);
             let success_count = AtomicI32::new(0);
@@ -207,12 +215,15 @@ mod tests {
                 for _ in 0..150 {
                     scope.spawn(|| {
                         let success = pool
-                            .alloc(PageMeta {
-                                id: PageId::new(1).unwrap(),
-                                kind: PageKind::None,
-                                lsn: Lsn::new(1),
-                                dirty: false,
-                            })
+                            .alloc(
+                                txid,
+                                PageMeta {
+                                    id: PageId::new(1).unwrap(),
+                                    kind: PageKind::None,
+                                    lsn: Lsn::new(1),
+                                    dirty: false,
+                                },
+                            )
                             .is_some();
                         if success {
                             success_count.fetch_add(1, Ordering::SeqCst);
@@ -232,13 +243,17 @@ mod tests {
     fn test_concurrent_read_write() {
         let n = 100;
         let pool = BufferPool::new(128, n);
+        let txid = TxId::new(1).unwrap();
         for i in 0u64..n as u64 {
-            let result = pool.alloc(PageMeta {
-                id: PageId::new(1000 + i).unwrap(),
-                kind: PageKind::None,
-                lsn: Lsn::new(100 + i),
-                dirty: false,
-            });
+            let result = pool.alloc(
+                txid,
+                PageMeta {
+                    id: PageId::new(1000 + i).unwrap(),
+                    kind: PageKind::None,
+                    lsn: Lsn::new(100 + i),
+                    dirty: false,
+                },
+            );
             assert!(result.is_some());
         }
 
@@ -250,11 +265,11 @@ mod tests {
                 let is_read = randomizer.gen_bool(0.5);
                 scope.spawn(move || {
                     if is_read {
-                        let buff = pool.read(index);
+                        let buff = pool.read(txid, index);
                         let x = buff.buffer[0];
                         assert!(buff.buffer.iter().all(|y| *y == x));
                     } else {
-                        let buff = pool.write(index);
+                        let buff = pool.write(txid, index);
                         let x = buff.buffer[0];
                         assert!(buff.buffer.iter().all(|y| *y == x));
                         buff.buffer.fill(1);
@@ -268,6 +283,7 @@ mod tests {
     #[should_panic]
     fn test_read_write_unallocated_frame() {
         let n = 100;
+        let txid = TxId::new(1).unwrap();
         loop {
             let pool = BufferPool::new(128, n);
             std::thread::scope(|scope| {
@@ -278,18 +294,21 @@ mod tests {
                     let action = randomizer.gen_range(0..3);
                     scope.spawn(move || match action {
                         0 => {
-                            pool.write(index);
+                            pool.write(txid, index);
                         }
                         1 => {
-                            pool.read(index);
+                            pool.read(txid, index);
                         }
                         2 => {
-                            pool.alloc(PageMeta {
-                                id: PageId::new(1).unwrap(),
-                                kind: PageKind::None,
-                                lsn: Lsn::new(1),
-                                dirty: false,
-                            });
+                            pool.alloc(
+                                txid,
+                                PageMeta {
+                                    id: PageId::new(1).unwrap(),
+                                    kind: PageKind::None,
+                                    lsn: Lsn::new(1),
+                                    dirty: false,
+                                },
+                            );
                         }
                         _ => unreachable!(),
                     });

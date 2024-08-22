@@ -1,4 +1,7 @@
+use super::buffer::{ReadFrame, WriteFrame};
+use super::log::LogContext;
 use crate::bins::SliceExt;
+use crate::content::{Bytes, Content};
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt};
 use anyhow::anyhow;
 use std::ops::Range;
@@ -294,7 +297,7 @@ impl InteriorKind {
 }
 
 #[inline]
-const fn get_interior_cell_range(index: usize) -> Range<usize> {
+pub(super) const fn get_interior_cell_range(index: usize) -> Range<usize> {
     let cell_offset = INTERIOR_PAGE_HEADER_SIZE + INTERIOR_CELL_SIZE * index;
     cell_offset..cell_offset + INTERIOR_CELL_SIZE
 }
@@ -399,6 +402,654 @@ impl FreelistKind {
             next,
             count: count as usize,
         })
+    }
+}
+
+pub(crate) trait PageOps<'a>: Sized {
+    fn frame(&self) -> &ReadFrame<'a>;
+
+    fn is_none(&self) -> bool {
+        matches!(self.frame().meta.kind, PageKind::None)
+    }
+
+    fn id(&self) -> PageId {
+        self.frame().meta.id()
+    }
+
+    fn is_interior(&self) -> bool {
+        matches!(&self.frame().meta.kind, PageKind::Interior { .. })
+    }
+
+    fn page_lsn(&self) -> Lsn {
+        self.frame().meta.lsn
+    }
+
+    fn into_interior(self) -> Option<InteriorOps<Self>> {
+        if let PageKind::Interior { .. } = &self.frame().meta.kind {
+            Some(InteriorOps(self))
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
+    fn frame_mut(&mut self) -> &mut WriteFrame<'a>;
+
+    fn init_interior(
+        mut self,
+        ctx: LogContext<'_>,
+        last: PageId,
+    ) -> anyhow::Result<Option<InteriorWriteOps<Self>>> {
+        let page_size = self.frame().buffer.len();
+        if let PageKind::None = self.frame().meta.kind {
+            let pgid = self.id();
+            let frame = self.frame_mut();
+            frame.meta.lsn = ctx.record_interior_init(frame.txid, pgid, last)?;
+            frame.meta.dirty = true;
+            frame.meta.kind = PageKind::Interior(InteriorKind {
+                count: 0,
+                offset: page_size - PAGE_FOOTER_SIZE,
+                remaining: page_size
+                    - PAGE_HEADER_SIZE
+                    - PAGE_FOOTER_SIZE
+                    - INTERIOR_PAGE_HEADER_SIZE,
+                last,
+            });
+        }
+
+        Ok(self.into_write_interior())
+    }
+
+    fn into_write_interior(self) -> Option<InteriorWriteOps<Self>> {
+        if let PageKind::Interior { .. } = &self.frame().meta.kind {
+            Some(InteriorWriteOps(self))
+        } else {
+            None
+        }
+    }
+
+    fn set_interior(
+        mut self,
+        ctx: LogContext<'_>,
+        payload: &'a [u8],
+    ) -> anyhow::Result<InteriorWriteOps<Self>> {
+        assert!(
+            matches!(self.frame().meta.kind, PageKind::None),
+            "page is not empty"
+        );
+
+        let pgid = self.id();
+        let frame = self.frame_mut();
+        frame.meta.lsn = ctx.record_interior_set(frame.txid, pgid, Bytes::new(payload))?;
+        frame.meta.dirty = true;
+
+        let page_size = frame.buffer.len();
+        frame.meta.kind = PageKind::Interior(InteriorKind::decode(payload)?);
+        frame.buffer[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE].copy_from_slice(payload);
+
+        Ok(self
+            .into_write_interior()
+            .expect("the page should be an interior now"))
+    }
+}
+
+pub(crate) struct InteriorOps<T>(T);
+
+trait InteriorOpsExt<'a>: PageOps<'a> {
+    fn kind(&self) -> &'a InteriorKind;
+
+    fn last(&self) -> PageId {
+        self.kind().last
+    }
+
+    fn might_split(&self) -> bool {
+        let kind = self.kind();
+        let page_size = self.frame().buffer.len();
+
+        let payload_size =
+            page_size - PAGE_HEADER_SIZE - INTERIOR_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+        let max_before_overflow = payload_size / 4 - INTERIOR_CELL_SIZE;
+        let min_content_not_overflow = max_before_overflow / 2;
+        let remaining = if kind.remaining < INTERIOR_CELL_SIZE {
+            0
+        } else {
+            kind.remaining - INTERIOR_CELL_SIZE
+        };
+        remaining < min_content_not_overflow
+    }
+}
+
+impl<'a, T> InteriorOps<T>
+where
+    T: PageOps<'a>,
+{
+    pub(crate) fn last(&self) -> PageId {
+        let PageKind::Interior(ref kind) = self.0.frame().meta.kind else {
+            unreachable!();
+        };
+        kind.last
+    }
+}
+
+pub(crate) trait BTreePage<'a> {
+    type Cell: BTreeCell<'a>;
+    fn count(&self) -> usize;
+    fn get(&'a self, index: usize) -> Self::Cell;
+}
+
+pub(crate) trait BTreeCell<'a> {
+    fn raw(&self) -> &'a [u8];
+    fn key_size(&self) -> usize;
+    fn overflow(&self) -> Option<PageId>;
+}
+
+impl<'a, T> PageOps<'a> for InteriorOps<T>
+where
+    T: PageOps<'a>,
+{
+    fn frame(&self) -> &ReadFrame<'a> {
+        self.0.frame()
+    }
+}
+
+impl<'a, T> InteriorOpsExt<'a> for InteriorOps<T>
+where
+    T: PageOps<'a>,
+{
+    fn kind(&self) -> &'a InteriorKind {
+        let PageKind::Interior(ref kind) = self.0.frame().meta.kind else {
+            unreachable!()
+        };
+        kind
+    }
+}
+
+impl<'a: 'b, 'b, T> BTreePage<'b> for T
+where
+    T: InteriorOpsExt<'a>,
+{
+    type Cell = InteriorCell<'b>;
+
+    fn count(&self) -> usize {
+        let PageKind::Interior(ref kind) = self.frame().meta.kind else {
+            unreachable!();
+        };
+        kind.count
+    }
+
+    fn get(&'b self, index: usize) -> Self::Cell {
+        let payload =
+            &self.frame().buffer[PAGE_HEADER_SIZE..self.frame().buffer.len() - PAGE_FOOTER_SIZE];
+        get_interior_cell(payload, index)
+    }
+}
+
+fn get_interior_cell(buff: &[u8], index: usize) -> InteriorCell<'_> {
+    let cell_offset = INTERIOR_PAGE_HEADER_SIZE + INTERIOR_CELL_SIZE * index;
+    let cell = &buff[cell_offset..cell_offset + INTERIOR_CELL_SIZE];
+    let offset = cell[INTERIOR_CELL_OFFSET_RANGE].read_u16() as usize;
+    let size = cell[INTERIOR_CELL_SIZE_RANGE].read_u16() as usize;
+    let offset = offset - PAGE_HEADER_SIZE;
+    let raw = &buff[offset..offset + size];
+    InteriorCell { cell, raw }
+}
+
+pub(crate) struct InteriorCell<'a> {
+    cell: &'a [u8],
+    raw: &'a [u8],
+}
+
+impl<'a> BTreeCell<'a> for InteriorCell<'a> {
+    fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    fn key_size(&self) -> usize {
+        self.cell[INTERIOR_CELL_KEY_SIZE_RANGE].read_u32() as usize
+    }
+
+    fn overflow(&self) -> Option<PageId> {
+        PageId::from_be_bytes(self.cell[INTERIOR_CELL_OVERFLOW_RANGE].try_into().unwrap())
+    }
+}
+
+impl<'a> InteriorCell<'a> {
+    pub(crate) fn ptr(&self) -> PageId {
+        PageId::from_be_bytes(self.cell[INTERIOR_CELL_PTR_RANGE].try_into().unwrap()).unwrap()
+    }
+}
+
+pub(crate) struct InteriorWriteOps<T>(T);
+
+impl<'a, T> PageOps<'a> for InteriorWriteOps<T>
+where
+    T: PageOps<'a>,
+{
+    fn frame(&self) -> &ReadFrame<'a> {
+        self.0.frame()
+    }
+}
+
+impl<'a, T> PageWriteOps<'a> for InteriorWriteOps<T>
+where
+    T: PageWriteOps<'a>,
+{
+    fn frame_mut(&mut self) -> &mut WriteFrame<'a> {
+        self.0.frame_mut()
+    }
+}
+
+impl<'a, T> InteriorOpsExt<'a> for InteriorWriteOps<T>
+where
+    T: PageWriteOps<'a>,
+{
+    fn kind(&self) -> &'a InteriorKind {
+        let PageKind::Interior(ref kind) = self.frame().meta.kind else {
+            unreachable!();
+        };
+        kind
+    }
+}
+
+impl<'a, T> InteriorWriteOps<T>
+where
+    T: PageWriteOps<'a>,
+{
+    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
+        let pgid = self.id();
+        let frame = self.frame_mut();
+        frame.meta.encode(frame.buffer)?;
+
+        let payload =
+            Bytes::new(&frame.buffer[PAGE_HEADER_SIZE..frame.buffer.len() - PAGE_FOOTER_SIZE]);
+        frame.meta.lsn = ctx.record_interior_reset(frame.txid, pgid, payload)?;
+        frame.meta.dirty = true;
+        frame.meta.kind = PageKind::None;
+        Ok(self.0)
+    }
+
+    pub(crate) fn set_last(&mut self, ctx: LogContext<'_>, new_last: PageId) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let frame = self.frame_mut();
+        let PageKind::Interior(ref mut kind) = frame.meta.kind else {
+            unreachable!();
+        };
+        let old_last = kind.last;
+        frame.meta.lsn = ctx.record_interior_set_last(frame.txid, pgid, new_last, old_last)?;
+        frame.meta.dirty = true;
+        kind.last = new_last;
+        Ok(())
+    }
+
+    pub(crate) fn set_cell_ptr(
+        &mut self,
+        ctx: LogContext<'_>,
+        index: usize,
+        ptr: PageId,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let frame = self.frame_mut();
+        let cell = &mut frame.buffer[get_interior_cell_range(index)];
+        let old_ptr =
+            PageId::from_be_bytes(cell[INTERIOR_CELL_PTR_RANGE].try_into().unwrap()).unwrap();
+        if old_ptr == ptr {
+            return Ok(());
+        }
+        frame.meta.lsn = ctx.record_interior_set_cell_ptr(frame.txid, pgid, index, ptr, old_ptr)?;
+        frame.meta.dirty = true;
+        cell[INTERIOR_CELL_PTR_RANGE].copy_from_slice(&ptr.to_be_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn set_cell_overflow(
+        &mut self,
+        ctx: LogContext<'_>,
+        index: usize,
+        overflow_pgid: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let frame = self.frame_mut();
+        let cell = &mut frame.buffer[get_interior_cell_range(index)];
+        let old_overflow =
+            PageId::from_be_bytes(cell[INTERIOR_CELL_OVERFLOW_RANGE].try_into().unwrap());
+        if old_overflow == overflow_pgid {
+            return Ok(());
+        }
+        frame.meta.lsn = ctx.record_interior_set_cell_overflow(
+            frame.txid,
+            pgid,
+            index,
+            overflow_pgid,
+            old_overflow,
+        )?;
+        frame.meta.dirty = true;
+        cell[INTERIOR_CELL_OVERFLOW_RANGE].copy_from_slice(&overflow_pgid.to_be_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn insert_cell(
+        &mut self,
+        ctx: LogContext<'_>,
+        i: usize,
+        cell: InteriorCell,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let frame = self.frame();
+        log::debug!(
+            "insert_interior_cell {pgid:?} kind={:?} page_lsn={:?} i={i} cell_raw_len={:?}",
+            frame.meta.kind,
+            frame.meta.lsn,
+            cell.raw().len(),
+        );
+
+        let PageKind::Interior(ref kind) = frame.meta.kind else {
+            unreachable!();
+        };
+        let raw = cell.raw();
+        assert!(
+            raw.len() + INTERIOR_CELL_SIZE <= kind.remaining,
+            "insert cell only called in the context of moving a splitted page to a new page, so it should always fit",
+        );
+
+        let reserved_offset = self.insert_cell_meta(
+            i,
+            cell.ptr(),
+            cell.overflow(),
+            cell.key_size(),
+            cell.raw().len(),
+        );
+        let frame = self.frame_mut();
+        Bytes::new(cell.raw())
+            .put(&mut frame.buffer[reserved_offset..reserved_offset + raw.len()])?;
+
+        frame.meta.lsn = ctx.record_interior_insert(
+            frame.txid,
+            pgid,
+            i,
+            Bytes::new(&frame.buffer[reserved_offset..reserved_offset + raw.len()]),
+            cell.ptr(),
+            cell.key_size(),
+            cell.overflow(),
+        )?;
+        frame.meta.dirty = true;
+
+        log::debug!(
+            "insert_interior_cell_finish {pgid:?} kind={:?} page_lsn={:?} i={i}",
+            frame.meta.kind,
+            frame.meta.lsn,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn insert_content(
+        &mut self,
+        ctx: LogContext<'_>,
+        i: usize,
+        content: &mut impl Content,
+        key_size: usize,
+        ptr: PageId,
+        overflow: Option<PageId>,
+    ) -> anyhow::Result<bool> {
+        let pgid = self.id();
+        let frame = self.frame();
+        log::debug!(
+            "insert_interior_content {pgid:?} kind={:?} page_lsn={:?} i={i} raw_size={}",
+            frame.meta.kind,
+            frame.meta.lsn,
+            content.remaining(),
+        );
+
+        let page_size = frame.buffer.len();
+        let total_size = content.remaining();
+        let payload_size =
+            page_size - PAGE_HEADER_SIZE - INTERIOR_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+        let max_before_overflow = payload_size / 4 - INTERIOR_CELL_SIZE;
+        let min_content_not_overflow = max_before_overflow / 2;
+        let frame = self.frame_mut();
+        let PageKind::Interior(ref mut kind) = frame.meta.kind else {
+            unreachable!();
+        };
+        if kind.remaining < INTERIOR_CELL_SIZE {
+            return Ok(false);
+        }
+        let remaining = kind.remaining - INTERIOR_CELL_SIZE;
+        if remaining < min_content_not_overflow && remaining < total_size {
+            return Ok(false);
+        }
+
+        let raw_size = std::cmp::min(max_before_overflow, total_size);
+        let raw_size = std::cmp::min(raw_size, remaining);
+
+        let content_offset = self.insert_cell_meta(i, ptr, overflow, key_size, raw_size);
+        let frame = self.frame_mut();
+        content.put(&mut frame.buffer[content_offset..content_offset + raw_size])?;
+
+        frame.meta.lsn = ctx.record_interior_insert(
+            frame.txid,
+            pgid,
+            i,
+            Bytes::new(&frame.buffer[content_offset..content_offset + raw_size]),
+            ptr,
+            key_size,
+            overflow,
+        )?;
+        frame.meta.dirty = true;
+
+        log::debug!(
+            "insert_interior_content_finish {pgid:?} kind={:?} page_lsn={:?} i={i} raw_size={}",
+            frame.meta.kind,
+            frame.meta.lsn,
+            content.remaining(),
+        );
+
+        Ok(true)
+    }
+
+    fn insert_cell_meta(
+        &mut self,
+        index: usize,
+        ptr: PageId,
+        overflow: Option<PageId>,
+        key_size: usize,
+        raw_size: usize,
+    ) -> usize {
+        let frame = self.frame();
+        let PageKind::Interior(ref kind) = frame.meta.kind else {
+            unreachable!();
+        };
+        let added = INTERIOR_CELL_SIZE + raw_size;
+        let current_cell_size =
+            PAGE_HEADER_SIZE + INTERIOR_PAGE_HEADER_SIZE + INTERIOR_CELL_SIZE * kind.count;
+        if current_cell_size + added > kind.offset {
+            self.rearrange();
+        }
+
+        let frame = self.frame_mut();
+        let PageKind::Interior(ref mut kind) = frame.meta.kind else {
+            unreachable!();
+        };
+
+        let shifted = kind.count - index;
+        for i in 0..shifted {
+            let x = PAGE_HEADER_SIZE
+                + INTERIOR_PAGE_HEADER_SIZE
+                + INTERIOR_CELL_SIZE * (kind.count - i);
+            let (a, b) = frame.buffer.split_at_mut(x);
+            b[..INTERIOR_CELL_SIZE].copy_from_slice(&a[a.len() - INTERIOR_CELL_SIZE..]);
+        }
+
+        let cell = &mut frame.buffer[get_interior_cell_range(index)];
+
+        kind.offset -= raw_size;
+        kind.remaining -= added;
+        kind.count += 1;
+
+        cell[INTERIOR_CELL_PTR_RANGE].copy_from_slice(&ptr.to_be_bytes());
+        cell[INTERIOR_CELL_OVERFLOW_RANGE].copy_from_slice(&overflow.to_be_bytes());
+        cell[INTERIOR_CELL_KEY_SIZE_RANGE].copy_from_slice(&(key_size as u32).to_be_bytes());
+        cell[INTERIOR_CELL_OFFSET_RANGE].copy_from_slice(&(kind.offset as u16).to_be_bytes());
+        cell[INTERIOR_CELL_SIZE_RANGE].copy_from_slice(&(raw_size as u16).to_be_bytes());
+
+        kind.offset
+    }
+
+    fn rearrange(&mut self) {
+        use super::MAXIMUM_PAGE_SIZE;
+        use std::cell::RefCell;
+        std::thread_local! {
+            static TEMP_BUFFER: RefCell<[u8; MAXIMUM_PAGE_SIZE]> = RefCell::new([0u8; MAXIMUM_PAGE_SIZE]);
+        }
+
+        TEMP_BUFFER.with_borrow_mut(|copied| {
+            let count = self.count();
+            let frame = self.frame_mut();
+            let page_size = frame.buffer.len();
+            copied.copy_from_slice(&frame.buffer);
+
+            let mut new_offset = page_size - PAGE_FOOTER_SIZE;
+            for i in 0..count {
+                let copied_cell =
+                    get_interior_cell(&copied[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE], i);
+                let copied_content = copied_cell.raw();
+                new_offset -= copied_content.len();
+                frame.buffer[new_offset..new_offset + copied_content.len()]
+                    .copy_from_slice(copied_content);
+
+                let cell = &mut frame.buffer[get_interior_cell_range(i)];
+                cell[INTERIOR_CELL_OFFSET_RANGE]
+                    .copy_from_slice(&(new_offset as u16).to_be_bytes());
+            }
+
+            let PageKind::Interior(ref mut kind) = frame.meta.kind else {
+                unreachable!();
+            };
+            kind.offset = new_offset;
+        })
+    }
+
+    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, f: F) -> anyhow::Result<usize>
+    where
+        for<'c> F: Fn(InteriorCell<'c>) -> anyhow::Result<()>,
+    {
+        let pgid = self.id();
+        let frame = self.frame();
+        log::debug!(
+            "interior_split {pgid:?} kind={:?} page_lsn={:?}",
+            frame.meta.kind,
+            frame.meta.lsn,
+        );
+        let page_size = frame.buffer.len();
+
+        let payload_size =
+            page_size - PAGE_HEADER_SIZE - INTERIOR_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+        let half_payload = payload_size / 2;
+        let PageKind::Interior(ref kind) = frame.meta.kind else {
+            unreachable!();
+        };
+
+        let mut cummulative_size = 0;
+        let mut n_cells_to_keep = 0;
+
+        for i in 0..kind.count {
+            let cell = self.get(i);
+            let new_cummulative_size = cummulative_size + cell.raw.len() + INTERIOR_CELL_SIZE;
+            if new_cummulative_size >= half_payload {
+                n_cells_to_keep = i;
+                break;
+            }
+            cummulative_size = new_cummulative_size;
+        }
+        assert!(
+            n_cells_to_keep < kind.count,
+            "there is no point splitting the page if it doesn't move any entries. n_cells_to_keep={n_cells_to_keep} count={}", kind.count,
+        );
+
+        let frame = self.frame_mut();
+        let txid = frame.txid;
+        for i in (n_cells_to_keep..kind.count).rev() {
+            let cell = get_interior_cell(&frame.buffer[PAGE_HEADER_SIZE..], i);
+            frame.meta.lsn = ctx.record_interior_delete(
+                txid,
+                pgid,
+                i,
+                Bytes::new(cell.raw()),
+                cell.ptr(),
+                cell.overflow(),
+                cell.key_size(),
+            )?;
+        }
+        frame.meta.dirty = true;
+
+        let original_count = kind.count;
+        let PageKind::Interior(ref mut kind) = frame.meta.kind else {
+            unreachable!();
+        };
+        kind.count = n_cells_to_keep;
+        kind.remaining = payload_size - cummulative_size;
+
+        log::debug!(
+            "interior_split_finish {pgid:?} kind={:?} page_lsn={:?}",
+            frame.meta.kind,
+            frame.meta.lsn,
+        );
+
+        for i in n_cells_to_keep..original_count {
+            let cell = self.get(i);
+            f(cell)?;
+        }
+        Ok(n_cells_to_keep)
+    }
+
+    pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let frame = self.frame();
+        let kind = self.kind();
+        log::debug!(
+            "interior_delete {pgid:?} kind={kind:?} page_lsn={:?} i={index}",
+            frame.meta.lsn,
+        );
+
+        let cell = self.get(index);
+        let content_offset = cell.cell[INTERIOR_CELL_OFFSET_RANGE].read_u16() as usize;
+        let content_size = cell.cell[INTERIOR_CELL_SIZE_RANGE].read_u16() as usize;
+        let ptr = cell.ptr();
+        let overflow = cell.overflow();
+        let key_size = cell.key_size();
+
+        let frame = self.frame_mut();
+        frame.meta.lsn = ctx.record_interior_delete(
+            frame.txid,
+            pgid,
+            index,
+            Bytes::new(&frame.buffer[content_offset..content_offset + content_size]),
+            ptr,
+            overflow,
+            key_size,
+        )?;
+        frame.meta.dirty = true;
+
+        let PageKind::Interior(ref mut kind) = frame.meta.kind else {
+            unreachable!();
+        };
+        if kind.offset == content_offset {
+            kind.offset += content_size;
+        }
+        kind.remaining += INTERIOR_CELL_SIZE + content_size;
+        kind.count -= 1;
+
+        for i in index..kind.count {
+            let x = PAGE_HEADER_SIZE + INTERIOR_PAGE_HEADER_SIZE + INTERIOR_CELL_SIZE * i;
+            let (a, b) = frame.buffer.split_at_mut(x + INTERIOR_CELL_SIZE);
+            let a_len = a.len();
+            a[a_len - INTERIOR_CELL_SIZE..].copy_from_slice(&b[..INTERIOR_CELL_SIZE]);
+        }
+
+        log::debug!(
+            "interior_delete_finish {pgid:?} kind={kind:?} page_lsn={:?} i={index}",
+            frame.meta.lsn,
+        );
+        Ok(())
     }
 }
 
