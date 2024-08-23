@@ -280,6 +280,22 @@ impl PageKind {
         };
         kind
     }
+
+    #[inline]
+    fn overflow(&self) -> &OverflowKind {
+        let Self::Overflow(kind) = self else {
+            panic!("page is not an overflow");
+        };
+        kind
+    }
+
+    #[inline]
+    fn overflow_mut(&mut self) -> &mut OverflowKind {
+        let Self::Overflow(kind) = self else {
+            panic!("page is not an overflow");
+        };
+        kind
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -486,12 +502,12 @@ pub(crate) trait PageOps<'a>: Sized {
 }
 
 pub(crate) struct PageInternalWrite<'a> {
-    txid: TxId,
-    meta: &'a mut PageMeta,
-    buffer: &'a mut [u8],
+    pub(crate) txid: TxId,
+    pub(crate) meta: &'a mut PageMeta,
+    pub(crate) buffer: &'a mut [u8],
 }
 
-pub(crate) trait PageWrite<'a>: PageOps<'a> {
+pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
     fn internal_mut(&mut self) -> PageInternalWrite;
 
     fn init_interior(
@@ -614,7 +630,7 @@ pub(crate) trait PageWrite<'a>: PageOps<'a> {
 
 pub(crate) struct InteriorPageRead<T>(T);
 
-trait InteriorPage<'a>: PageOps<'a> {
+pub(crate) trait InteriorPage<'a>: PageOps<'a> {
     #[inline]
     fn last(&self) -> PageId {
         self.internal().meta.kind.interior().last
@@ -709,9 +725,9 @@ where
     }
 }
 
-impl<'a, T> PageWrite<'a> for InteriorPageWrite<T>
+impl<'a, T> PageWriteOps<'a> for InteriorPageWrite<T>
 where
-    T: PageWrite<'a>,
+    T: PageWriteOps<'a>,
 {
     #[inline]
     fn internal_mut(&mut self) -> PageInternalWrite {
@@ -723,7 +739,7 @@ impl<'a, T> InteriorPage<'a> for InteriorPageWrite<T> where T: PageOps<'a> {}
 
 impl<'a, T> InteriorPageWrite<T>
 where
-    T: PageWrite<'a>,
+    T: PageWriteOps<'a>,
 {
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
         let pgid = self.id();
@@ -1111,7 +1127,7 @@ where
 
 pub(crate) struct LeafPageRead<T>(T);
 
-trait LeafPage<'a>: PageOps<'a> {
+pub(crate) trait LeafPage<'a>: PageOps<'a> {
     #[inline]
     fn next(&self) -> Option<PageId> {
         self.internal().meta.kind.leaf().next
@@ -1189,9 +1205,9 @@ where
     }
 }
 
-impl<'a, T> PageWrite<'a> for LeafPageWrite<T>
+impl<'a, T> PageWriteOps<'a> for LeafPageWrite<T>
 where
-    T: PageWrite<'a>,
+    T: PageWriteOps<'a>,
 {
     #[inline]
     fn internal_mut(&mut self) -> PageInternalWrite {
@@ -1199,11 +1215,11 @@ where
     }
 }
 
-impl<'a, T> LeafPage<'a> for LeafPageWrite<T> where T: PageWrite<'a> {}
+impl<'a, T> LeafPage<'a> for LeafPageWrite<T> where T: PageWriteOps<'a> {}
 
 impl<'a, T> LeafPageWrite<T>
 where
-    T: PageWrite<'a>,
+    T: PageWriteOps<'a>,
 {
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
         let pgid = self.id();
@@ -1358,7 +1374,7 @@ where
             raw.len(),
         );
 
-        todo!();
+        Ok(())
     }
 
     fn reserve_cell(internal: &mut PageInternalWrite, raw_size: usize) -> usize {
@@ -1506,8 +1522,7 @@ where
         );
         let page_size = internal.buffer.len();
 
-        let payload_size =
-            page_size - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
+        let payload_size = page_size - PAGE_HEADER_SIZE - LEAF_PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE;
         let half_payload = payload_size / 2;
 
         let mut cummulative_size = 0;
@@ -1560,6 +1575,140 @@ where
             f(cell)?;
         }
         Ok(n_cells_to_keep)
+    }
+}
+
+pub(crate) struct OverflowPageRead<T>(T);
+
+pub(crate) trait OverflowPage<'a>: PageOps<'a> {
+    #[inline]
+    fn next(&self) -> Option<PageId> {
+        self.internal().meta.kind.overflow().next
+    }
+
+    #[inline]
+    fn content(&self) -> &[u8] {
+        let internal = self.internal();
+        let size = internal.meta.kind.overflow().size;
+        let offset = PAGE_HEADER_SIZE + OVERFLOW_PAGE_HEADER_SIZE;
+        &internal.buffer[offset..offset + size]
+    }
+}
+
+impl<'a, T> PageOps<'a> for OverflowPageRead<T>
+where
+    T: PageOps<'a>,
+{
+    #[inline]
+    fn internal(&self) -> PageInternal {
+        self.0.internal()
+    }
+}
+
+impl<'a, T> OverflowPage<'a> for OverflowPageRead<T> where T: PageOps<'a> {}
+
+pub(crate) struct OverflowPageWrite<T>(T);
+
+impl<'a, T> PageOps<'a> for OverflowPageWrite<T>
+where
+    T: PageOps<'a>,
+{
+    #[inline]
+    fn internal(&self) -> PageInternal {
+        self.0.internal()
+    }
+}
+
+impl<'a, T> PageWriteOps<'a> for OverflowPageWrite<T>
+where
+    T: PageWriteOps<'a>,
+{
+    #[inline]
+    fn internal_mut(&mut self) -> PageInternalWrite {
+        self.0.internal_mut()
+    }
+}
+
+impl<'a, T> OverflowPage<'a> for OverflowPageWrite<T> where T: PageWriteOps<'a> {}
+
+impl<'a, T> OverflowPageWrite<T>
+where
+    T: PageWriteOps<'a>,
+{
+    pub(crate) fn set_next(
+        &mut self,
+        ctx: LogContext,
+        new_next: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let internal = self.internal_mut();
+        let kind = internal.meta.kind.overflow_mut();
+        let old_next = kind.next;
+        if old_next == new_next {
+            return Ok(());
+        }
+        internal.meta.lsn =
+            ctx.record_overflow_set_next(internal.txid, pgid, new_next, old_next)?;
+        internal.meta.dirty = true;
+        kind.next = new_next;
+        Ok(())
+    }
+
+    pub(crate) fn set_content(
+        &mut self,
+        ctx: LogContext<'_>,
+        content: &mut impl Content,
+        next: Option<PageId>,
+    ) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let internal = self.internal_mut();
+        let max_size =
+            internal.buffer.len() - PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE - OVERFLOW_PAGE_HEADER_SIZE;
+        let kind = internal.meta.kind.overflow_mut();
+        if kind.size != 0 || kind.next.is_some() {
+            return Err(anyhow!("overflow page is already filled"));
+        }
+
+        let inserted_size = std::cmp::min(content.remaining(), max_size);
+
+        let offset = PAGE_HEADER_SIZE + OVERFLOW_PAGE_HEADER_SIZE;
+        let raw = &mut internal.buffer[offset..offset + inserted_size];
+        content.put(raw)?;
+        internal.meta.lsn =
+            ctx.record_overflow_set_content(internal.txid, pgid, Bytes::new(raw), next)?;
+        internal.meta.dirty = true;
+
+        kind.size = inserted_size;
+        kind.next = next;
+        Ok(())
+    }
+
+    pub(crate) fn unset_content(&mut self, ctx: LogContext<'_>) -> anyhow::Result<()> {
+        let pgid = self.id();
+        let internal = self.internal_mut();
+        let kind = internal.meta.kind.overflow_mut();
+        if kind.size == 0 {
+            return Ok(());
+        }
+
+        internal.meta.lsn =
+            ctx.record_overflow_set_content(internal.txid, pgid, Bytes::new(&[]), None)?;
+        internal.meta.dirty = true;
+
+        kind.size = 0;
+        Ok(())
+    }
+
+    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
+        let pgid = self.id();
+        let internal = self.internal_mut();
+        internal.meta.encode(internal.buffer)?;
+
+        let payload = Bytes::new(internal.buffer.payload());
+        internal.meta.lsn = ctx.record_overflow_reset(internal.txid, pgid, payload)?;
+        internal.meta.dirty = true;
+        internal.meta.kind = PageKind::None;
+        Ok(self.0)
     }
 }
 

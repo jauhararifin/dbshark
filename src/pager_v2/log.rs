@@ -320,4 +320,54 @@ impl<'a> LogContext<'a> {
             value_size,
         })
     }
+
+    pub(crate) fn record_overflow_set_next(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        next: Option<PageId>,
+        old_next: Option<PageId>,
+    ) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::OverflowSetNext {
+            txid,
+            pgid,
+            next,
+            old_next,
+        })
+    }
+
+    pub(crate) fn record_overflow_set_content(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        raw: Bytes<'a>,
+        next: Option<PageId>,
+    ) -> anyhow::Result<Lsn> {
+        self.record2(
+            || WalKind::OverflowSetContent {
+                txid,
+                pgid,
+                raw,
+                next,
+            },
+            || WalKind::OverflowSetContentForUndo { txid, pgid },
+        )
+    }
+
+    pub(crate) fn record_overflow_reset(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        payload: Bytes,
+    ) -> anyhow::Result<Lsn> {
+        self.record2(
+            || WalKind::OverflowReset {
+                txid,
+                pgid,
+                page_version: 0,
+                payload,
+            },
+            || WalKind::OverflowResetForUndo { txid, pgid },
+        )
+    }
 }

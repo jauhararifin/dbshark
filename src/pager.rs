@@ -3052,27 +3052,6 @@ impl<'a> OverflowPageWrite<'a> {
                 },
             },
         )?);
-        self.0.meta.lsn = Some(record_mutation(
-            ctx,
-            WalEntry {
-                clr: ctx.clr(),
-                kind: WalKind::OverflowReset {
-                    txid: self.0.txid,
-                    pgid,
-                    page_version: 0,
-                    payload: Bytes::new(
-                        &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
-                    ),
-                },
-            },
-            WalEntry {
-                clr: ctx.clr(),
-                kind: WalKind::OverflowResetForUndo {
-                    txid: self.0.txid,
-                    pgid,
-                },
-            },
-        )?);
         self.0.meta.is_dirty = true;
 
         self.0.meta.kind = PageKind::None;
