@@ -208,4 +208,22 @@ impl<'a> LogContext<'a> {
             || WalKind::InteriorDeleteForUndo { txid, pgid, index },
         )
     }
+
+    pub(crate) fn record_leaf_init(&self, txid: TxId, pgid: PageId) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::LeafInit { txid, pgid })
+    }
+
+    pub(crate) fn record_leaf_set(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        payload: Bytes,
+    ) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::LeafSet {
+            txid,
+            pgid,
+            page_version: 0,
+            payload,
+        })
+    }
 }

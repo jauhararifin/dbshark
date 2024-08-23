@@ -1,10 +1,9 @@
 use crate::id::{Lsn, PageId, TxId};
-use crate::log::{WalEntry, WalKind};
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
 use crate::pager_v2::log::LogContext;
-use crate::pager_v2::page::{get_interior_cell_range, PageKind, PageMeta, PageOps};
+use crate::pager_v2::page::{PageKind, PageMeta, PageOps};
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
 use anyhow::anyhow;

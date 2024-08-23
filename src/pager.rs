@@ -2248,20 +2248,6 @@ impl<'a> LeafPageRead<'a> {
         self.0.meta.id
     }
 
-    pub(crate) fn count(&self) -> usize {
-        let PageKind::Leaf { count, .. } = self.0.meta.kind else {
-            unreachable!();
-        };
-        count
-    }
-
-    pub(crate) fn get(&self, index: usize) -> LeafCell {
-        get_leaf_cell(
-            &self.0.buffer[PAGE_HEADER_SIZE..self.0.buffer.len() - PAGE_FOOTER_SIZE],
-            index,
-        )
-    }
-
     pub(crate) fn next(&self) -> Option<PageId> {
         let PageKind::Leaf { next, .. } = self.0.meta.kind else {
             unreachable!();

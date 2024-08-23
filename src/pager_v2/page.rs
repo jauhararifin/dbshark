@@ -424,23 +424,31 @@ pub(crate) trait PageOps<'a>: Sized {
         self.frame().meta.lsn
     }
 
-    fn into_interior(self) -> Option<InteriorOps<Self>> {
-        if let PageKind::Interior { .. } = &self.frame().meta.kind {
-            Some(InteriorOps(self))
+    fn into_interior(self) -> Option<InteriorPageRead<Self>> {
+        if let PageKind::Interior(..) = &self.frame().meta.kind {
+            Some(InteriorPageRead(self))
+        } else {
+            None
+        }
+    }
+
+    fn into_leaf(self) -> Option<LeafPageRead<Self>> {
+        if let PageKind::Leaf(..) = &self.frame().meta.kind {
+            Some(LeafPageRead(self))
         } else {
             None
         }
     }
 }
 
-pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
+pub(crate) trait PageWrite<'a>: PageOps<'a> {
     fn frame_mut(&mut self) -> &mut WriteFrame<'a>;
 
     fn init_interior(
         mut self,
         ctx: LogContext<'_>,
         last: PageId,
-    ) -> anyhow::Result<Option<InteriorWriteOps<Self>>> {
+    ) -> anyhow::Result<InteriorPageWrite<Self>> {
         let page_size = self.frame().buffer.len();
         if let PageKind::None = self.frame().meta.kind {
             let pgid = self.id();
@@ -458,12 +466,18 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
             });
         }
 
-        Ok(self.into_write_interior())
+        let Some(interior) = self.into_write_interior() else {
+            return Err(anyhow!(
+                "cannot init interior page because page is not an empty page nor interior page",
+            ));
+        };
+
+        Ok(interior)
     }
 
-    fn into_write_interior(self) -> Option<InteriorWriteOps<Self>> {
+    fn into_write_interior(self) -> Option<InteriorPageWrite<Self>> {
         if let PageKind::Interior { .. } = &self.frame().meta.kind {
-            Some(InteriorWriteOps(self))
+            Some(InteriorPageWrite(self))
         } else {
             None
         }
@@ -473,7 +487,7 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
         mut self,
         ctx: LogContext<'_>,
         payload: &'a [u8],
-    ) -> anyhow::Result<InteriorWriteOps<Self>> {
+    ) -> anyhow::Result<InteriorPageWrite<Self>> {
         assert!(
             matches!(self.frame().meta.kind, PageKind::None),
             "page is not empty"
@@ -492,11 +506,67 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
             .into_write_interior()
             .expect("the page should be an interior now"))
     }
+
+    fn init_leaf(mut self, ctx: LogContext<'_>) -> anyhow::Result<LeafPageWrite<Self>> {
+        let page_size = self.frame().buffer.len();
+        if let PageKind::None = self.frame().meta.kind {
+            let pgid = self.id();
+            let frame = self.frame_mut();
+            frame.meta.lsn = ctx.record_leaf_init(frame.txid, pgid)?;
+            frame.meta.dirty = true;
+            frame.meta.kind = PageKind::Leaf(LeafKind {
+                count: 0,
+                offset: page_size - PAGE_FOOTER_SIZE,
+                remaining: page_size - PAGE_HEADER_SIZE - PAGE_FOOTER_SIZE - LEAF_PAGE_HEADER_SIZE,
+                next: None,
+            });
+        }
+
+        let Some(leaf) = self.into_write_leaf() else {
+            return Err(anyhow!(
+                "cannot init leaf page because page is not an empty page nor leaf page",
+            ));
+        };
+
+        Ok(leaf)
+    }
+
+    fn set_leaf(
+        mut self,
+        ctx: LogContext<'_>,
+        payload: &'a [u8],
+    ) -> anyhow::Result<LeafPageWrite<Self>> {
+        assert!(
+            matches!(self.frame().meta.kind, PageKind::None),
+            "page is not empty"
+        );
+
+        let pgid = self.id();
+        let frame = self.frame_mut();
+        frame.meta.lsn = ctx.record_leaf_set(frame.txid, pgid, Bytes::new(payload))?;
+        frame.meta.dirty = true;
+
+        let page_size = frame.buffer.len();
+        frame.meta.kind = PageKind::Leaf(LeafKind::decode(payload)?);
+        frame.buffer[PAGE_HEADER_SIZE..page_size - PAGE_FOOTER_SIZE].copy_from_slice(payload);
+
+        Ok(self
+            .into_write_leaf()
+            .expect("the page should be a leaf now"))
+    }
+
+    fn into_write_leaf(self) -> Option<LeafPageWrite<Self>> {
+        if let PageKind::Leaf(..) = &self.frame().meta.kind {
+            Some(LeafPageWrite(self))
+        } else {
+            None
+        }
+    }
 }
 
-pub(crate) struct InteriorOps<T>(T);
+pub(crate) struct InteriorPageRead<T>(T);
 
-trait InteriorOpsExt<'a>: PageOps<'a> {
+trait InteriorPage<'a>: PageOps<'a> {
     fn kind(&self) -> &'a InteriorKind;
 
     fn last(&self) -> PageId {
@@ -518,33 +588,19 @@ trait InteriorOpsExt<'a>: PageOps<'a> {
         };
         remaining < min_content_not_overflow
     }
-}
 
-impl<'a, T> InteriorOps<T>
-where
-    T: PageOps<'a>,
-{
-    pub(crate) fn last(&self) -> PageId {
-        let PageKind::Interior(ref kind) = self.0.frame().meta.kind else {
-            unreachable!();
-        };
-        kind.last
+    fn count(&self) -> usize {
+        self.kind().count
+    }
+
+    fn get(&self, index: usize) -> InteriorCell<'a> {
+        let payload =
+            &self.frame().buffer[PAGE_HEADER_SIZE..self.frame().buffer.len() - PAGE_FOOTER_SIZE];
+        get_interior_cell(payload, index)
     }
 }
 
-pub(crate) trait BTreePage<'a> {
-    type Cell: BTreeCell<'a>;
-    fn count(&self) -> usize;
-    fn get(&'a self, index: usize) -> Self::Cell;
-}
-
-pub(crate) trait BTreeCell<'a> {
-    fn raw(&self) -> &'a [u8];
-    fn key_size(&self) -> usize;
-    fn overflow(&self) -> Option<PageId>;
-}
-
-impl<'a, T> PageOps<'a> for InteriorOps<T>
+impl<'a, T> PageOps<'a> for InteriorPageRead<T>
 where
     T: PageOps<'a>,
 {
@@ -553,7 +609,7 @@ where
     }
 }
 
-impl<'a, T> InteriorOpsExt<'a> for InteriorOps<T>
+impl<'a, T> InteriorPage<'a> for InteriorPageRead<T>
 where
     T: PageOps<'a>,
 {
@@ -565,29 +621,8 @@ where
     }
 }
 
-impl<'a: 'b, 'b, T> BTreePage<'b> for T
-where
-    T: InteriorOpsExt<'a>,
-{
-    type Cell = InteriorCell<'b>;
-
-    fn count(&self) -> usize {
-        let PageKind::Interior(ref kind) = self.frame().meta.kind else {
-            unreachable!();
-        };
-        kind.count
-    }
-
-    fn get(&'b self, index: usize) -> Self::Cell {
-        let payload =
-            &self.frame().buffer[PAGE_HEADER_SIZE..self.frame().buffer.len() - PAGE_FOOTER_SIZE];
-        get_interior_cell(payload, index)
-    }
-}
-
 fn get_interior_cell(buff: &[u8], index: usize) -> InteriorCell<'_> {
-    let cell_offset = INTERIOR_PAGE_HEADER_SIZE + INTERIOR_CELL_SIZE * index;
-    let cell = &buff[cell_offset..cell_offset + INTERIOR_CELL_SIZE];
+    let cell = &buff[get_interior_cell_range(index)];
     let offset = cell[INTERIOR_CELL_OFFSET_RANGE].read_u16() as usize;
     let size = cell[INTERIOR_CELL_SIZE_RANGE].read_u16() as usize;
     let offset = offset - PAGE_HEADER_SIZE;
@@ -600,29 +635,27 @@ pub(crate) struct InteriorCell<'a> {
     raw: &'a [u8],
 }
 
-impl<'a> BTreeCell<'a> for InteriorCell<'a> {
-    fn raw(&self) -> &'a [u8] {
+impl<'a> InteriorCell<'a> {
+    pub(crate) fn raw(&self) -> &'a [u8] {
         self.raw
     }
 
-    fn key_size(&self) -> usize {
+    pub(crate) fn ptr(&self) -> PageId {
+        PageId::from_be_bytes(self.cell[INTERIOR_CELL_PTR_RANGE].try_into().unwrap()).unwrap()
+    }
+
+    pub(crate) fn key_size(&self) -> usize {
         self.cell[INTERIOR_CELL_KEY_SIZE_RANGE].read_u32() as usize
     }
 
-    fn overflow(&self) -> Option<PageId> {
+    pub(crate) fn overflow(&self) -> Option<PageId> {
         PageId::from_be_bytes(self.cell[INTERIOR_CELL_OVERFLOW_RANGE].try_into().unwrap())
     }
 }
 
-impl<'a> InteriorCell<'a> {
-    pub(crate) fn ptr(&self) -> PageId {
-        PageId::from_be_bytes(self.cell[INTERIOR_CELL_PTR_RANGE].try_into().unwrap()).unwrap()
-    }
-}
+pub(crate) struct InteriorPageWrite<T>(T);
 
-pub(crate) struct InteriorWriteOps<T>(T);
-
-impl<'a, T> PageOps<'a> for InteriorWriteOps<T>
+impl<'a, T> PageOps<'a> for InteriorPageWrite<T>
 where
     T: PageOps<'a>,
 {
@@ -631,18 +664,18 @@ where
     }
 }
 
-impl<'a, T> PageWriteOps<'a> for InteriorWriteOps<T>
+impl<'a, T> PageWrite<'a> for InteriorPageWrite<T>
 where
-    T: PageWriteOps<'a>,
+    T: PageWrite<'a>,
 {
     fn frame_mut(&mut self) -> &mut WriteFrame<'a> {
         self.0.frame_mut()
     }
 }
 
-impl<'a, T> InteriorOpsExt<'a> for InteriorWriteOps<T>
+impl<'a, T> InteriorPage<'a> for InteriorPageWrite<T>
 where
-    T: PageWriteOps<'a>,
+    T: PageWrite<'a>,
 {
     fn kind(&self) -> &'a InteriorKind {
         let PageKind::Interior(ref kind) = self.frame().meta.kind else {
@@ -652,9 +685,9 @@ where
     }
 }
 
-impl<'a, T> InteriorWriteOps<T>
+impl<'a, T> InteriorPageWrite<T>
 where
-    T: PageWriteOps<'a>,
+    T: PageWrite<'a>,
 {
     pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
         let pgid = self.id();
@@ -1052,6 +1085,60 @@ where
         Ok(())
     }
 }
+
+pub(crate) struct LeafPageRead<T>(T);
+
+trait LeafPage<'a>: PageOps<'a> {
+    fn kind(&self) -> &'a LeafKind;
+
+    fn next(&self) -> Option<PageId> {
+        self.kind().next
+    }
+
+    fn count(&self) -> usize {
+        self.kind().count
+    }
+
+    fn get(&self, index: usize) -> LeafCell<'a> {
+        let payload =
+            &self.frame().buffer[PAGE_HEADER_SIZE..self.frame().buffer.len() - PAGE_FOOTER_SIZE];
+        get_leaf_cell(payload, index)
+    }
+}
+
+fn get_leaf_cell(buff: &[u8], index: usize) -> LeafCell<'_> {
+    let cell = &buff[get_leaf_cell_range(index)];
+    let offset = cell[LEAF_CELL_OFFSET_RANGE].read_u16() as usize;
+    let size = cell[LEAF_CELL_SIZE_RANGE].read_u16() as usize;
+    let offset = offset - PAGE_HEADER_SIZE;
+    let raw = &buff[offset..offset + size];
+    LeafCell { cell, raw }
+}
+
+pub(crate) struct LeafCell<'a> {
+    cell: &'a [u8],
+    raw: &'a [u8],
+}
+
+impl<'a> LeafCell<'a> {
+    pub(crate) fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    pub(crate) fn key_size(&self) -> usize {
+        self.cell[LEAF_CELL_KEY_SIZE_RANGE].read_u32() as usize
+    }
+
+    pub(crate) fn overflow(&self) -> Option<PageId> {
+        PageId::from_be_bytes(self.cell[LEAF_CELL_OVERFLOW_RANGE].try_into().unwrap())
+    }
+
+    pub(crate) fn val_size(&self) -> usize {
+        self.cell[LEAF_CELL_VAL_SIZE_RANGE].read_u32() as usize
+    }
+}
+
+pub(crate) struct LeafPageWrite<T>(T);
 
 #[cfg(test)]
 mod tests {
