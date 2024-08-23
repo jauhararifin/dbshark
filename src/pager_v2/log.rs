@@ -226,4 +226,98 @@ impl<'a> LogContext<'a> {
             payload,
         })
     }
+
+    pub(crate) fn record_leaf_reset(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        payload: Bytes,
+    ) -> anyhow::Result<Lsn> {
+        self.record2(
+            || WalKind::LeafReset {
+                txid,
+                pgid,
+                page_version: 0,
+                payload,
+            },
+            || WalKind::LeafResetForUndo { txid, pgid },
+        )
+    }
+
+    pub(crate) fn record_leaf_delete(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        index: usize,
+        old_raw: Bytes,
+        old_overflow: Option<PageId>,
+        old_key_size: usize,
+        old_val_size: usize,
+    ) -> anyhow::Result<Lsn> {
+        self.record2(
+            || WalKind::LeafDelete {
+                txid,
+                pgid,
+                index,
+                old_raw,
+                old_overflow,
+                old_key_size,
+                old_val_size,
+            },
+            || WalKind::LeafDeleteForUndo { txid, pgid, index },
+        )
+    }
+
+    pub(crate) fn record_leaf_set_next(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        next: Option<PageId>,
+        old_next: Option<PageId>,
+    ) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::LeafSetNext {
+            txid,
+            pgid,
+            next,
+            old_next,
+        })
+    }
+
+    pub(crate) fn record_leaf_set_cell_overflow(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        index: usize,
+        overflow: Option<PageId>,
+        old_overflow: Option<PageId>,
+    ) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::LeafSetOverflow {
+            txid,
+            pgid,
+            index,
+            overflow,
+            old_overflow,
+        })
+    }
+
+    pub(crate) fn record_leaf_insert(
+        &self,
+        txid: TxId,
+        pgid: PageId,
+        index: usize,
+        raw: Bytes<'a>,
+        overflow: Option<PageId>,
+        key_size: usize,
+        value_size: usize,
+    ) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::LeafInsert {
+            txid,
+            pgid,
+            index,
+            raw,
+            overflow,
+            key_size,
+            value_size,
+        })
+    }
 }

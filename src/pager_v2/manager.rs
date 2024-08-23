@@ -3,7 +3,7 @@ use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
 use crate::pager_v2::log::LogContext;
-use crate::pager_v2::page::{PageKind, PageMeta, PageOps};
+use crate::pager_v2::page::{PageInternal, PageKind, PageMeta, PageOps};
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
 use anyhow::anyhow;
@@ -286,14 +286,30 @@ impl<'a> Drop for PageRead<'a> {
 }
 
 impl<'a> PageOps<'a> for PageRead<'a> {
-    fn frame(&self) -> &ReadFrame<'a> {
-        &self.frame
+    #[inline]
+    fn internal(&self) -> PageInternal {
+        PageInternal {
+            txid: self.frame.txid,
+            meta: self.frame.meta,
+            buffer: self.frame.buffer,
+        }
     }
 }
 
 pub(crate) struct PageWrite<'a> {
     pub(super) pager: &'a Pager,
     pub(super) frame: WriteFrame<'a>,
+}
+
+impl<'a> PageOps<'a> for PageWrite<'a> {
+    #[inline]
+    fn internal(&self) -> PageInternal {
+        PageInternal {
+            txid: self.frame.txid,
+            meta: self.frame.meta,
+            buffer: self.frame.buffer,
+        }
+    }
 }
 
 impl<'a> Drop for PageWrite<'a> {
