@@ -473,6 +473,11 @@ pub(crate) trait PageOps<'a>: Sized {
     }
 
     #[inline]
+    fn lsn(&self) -> Lsn {
+        self.internal().meta.lsn
+    }
+
+    #[inline]
     fn is_interior(&self) -> bool {
         matches!(&self.internal().meta.kind, PageKind::Interior { .. })
     }
@@ -495,6 +500,15 @@ pub(crate) trait PageOps<'a>: Sized {
     fn into_leaf(self) -> Option<LeafPageRead<Self>> {
         if let PageKind::Leaf(..) = &self.internal().meta.kind {
             Some(LeafPageRead(self))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn into_overflow(self) -> Option<OverflowPageRead<Self>> {
+        if let PageKind::Overflow(..) = &self.internal().meta.kind {
+            Some(OverflowPageRead(self))
         } else {
             None
         }
@@ -622,6 +636,60 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
     fn into_write_leaf(self) -> Option<LeafPageWrite<Self>> {
         if let PageKind::Leaf(..) = &self.internal().meta.kind {
             Some(LeafPageWrite(self))
+        } else {
+            None
+        }
+    }
+
+    fn init_overflow(mut self, ctx: LogContext<'_>) -> anyhow::Result<OverflowPageWrite<Self>> {
+        if let PageKind::None = self.internal().meta.kind {
+            let pgid = self.id();
+            let internal = self.internal_mut();
+            internal.meta.lsn = ctx.record_overflow_init(internal.txid, pgid)?;
+            internal.meta.dirty = true;
+            internal.meta.kind = PageKind::Overflow(OverflowKind {
+                next: None,
+                size: 0,
+            });
+        }
+
+        let Some(overflow) = self.into_write_overflow() else {
+            return Err(anyhow!(
+                "cannot init overflow page because page is not an empty page nor overflow page",
+            ));
+        };
+
+        Ok(overflow)
+    }
+
+    fn set_overflow(
+        mut self,
+        ctx: LogContext<'_>,
+        payload: &'a [u8],
+    ) -> anyhow::Result<OverflowPageWrite<Self>> {
+        assert!(
+            matches!(self.internal().meta.kind, PageKind::None),
+            "page is not empty"
+        );
+        let LogContext::Redo(lsn) = ctx else {
+            panic!("set_overflow only can be used for redo-ing wal");
+        };
+
+        let internal = self.internal_mut();
+        internal.meta.lsn = lsn;
+        internal.meta.dirty = true;
+        internal.meta.kind = PageKind::Overflow(OverflowKind::decode(payload)?);
+        internal.buffer.payload_mut().copy_from_slice(payload);
+
+        Ok(self
+            .into_write_overflow()
+            .expect("the page should be an overflow now"))
+    }
+
+    #[inline]
+    fn into_write_overflow(self) -> Option<OverflowPageWrite<Self>> {
+        if let PageKind::Overflow(..) = &self.internal().meta.kind {
+            Some(OverflowPageWrite(self))
         } else {
             None
         }

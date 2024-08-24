@@ -25,12 +25,13 @@ mod bins;
 mod btree;
 mod content;
 mod db;
+mod file_lock;
 mod id;
 mod log;
 mod pager;
 mod pager_v2;
 mod recovery;
+mod recovery_v2;
 mod wal;
-mod file_lock;
 
 pub use db::{Db, Setting};

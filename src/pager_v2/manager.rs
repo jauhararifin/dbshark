@@ -3,7 +3,9 @@ use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
 use crate::pager_v2::log::LogContext;
-use crate::pager_v2::page::{PageInternal, PageKind, PageMeta, PageOps, PageWriteOps, PageInternalWrite};
+use crate::pager_v2::page::{
+    PageInternal, PageInternalWrite, PageKind, PageMeta, PageOps, PageWriteOps,
+};
 use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
 use anyhow::anyhow;
@@ -218,6 +220,33 @@ impl Pager {
         Ok(PageWrite { pager: self, frame })
     }
 
+    pub(crate) fn dealloc(
+        &self,
+        ctx: LogContext,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<PageWrite> {
+        let page = self.write(txid, pgid)?;
+        page.frame.meta.lsn = ctx.record_dealloc(txid, pgid)?;
+        page.frame.meta.dirty = true;
+        page.frame.meta.kind = PageKind::None;
+        Ok(page)
+    }
+
+    pub(crate) fn set_state(&self, ctx: LogContext, state: DbState) -> anyhow::Result<()> {
+        let mut current_state = self.state.write();
+        ctx.record_set_state(
+            state.root,
+            current_state.root,
+            state.freelist,
+            current_state.freelist,
+            state.page_count,
+            current_state.page_count,
+        )?;
+        *current_state = state;
+        Ok(())
+    }
+
     pub(crate) fn read_state(&self) -> RwLockReadGuard<DbState> {
         self.state.read()
     }
@@ -227,14 +256,12 @@ impl Pager {
     // dirty pages are flushed. This makes the checkpoint process longer, but simpler. We also
     // don't need checkpoint-end log record.
     pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
-        let mut first_unflushed = None;
+        let mut first_unflushed = wal.first_unflushed();
         for item in self.pool.walk() {
-            let should_flush = first_unflushed
-                .map(|first_unflushed| item.meta.lsn >= first_unflushed)
-                .unwrap_or(true);
+            let should_flush = item.meta.lsn >= first_unflushed;
             if should_flush {
                 let new_first_unflushed = wal.sync(item.meta.lsn)?;
-                first_unflushed = Some(new_first_unflushed);
+                first_unflushed = new_first_unflushed;
             }
 
             let mut file = self.file.write();

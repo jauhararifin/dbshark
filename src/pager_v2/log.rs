@@ -71,8 +71,31 @@ impl<'a> LogContext<'a> {
         Ok(lsn)
     }
 
+    pub(crate) fn record_set_state(
+        &self,
+        root: Option<PageId>,
+        old_root: Option<PageId>,
+        freelist: Option<PageId>,
+        old_freelist: Option<PageId>,
+        page_count: u64,
+        old_page_count: u64,
+    ) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::HeaderSet {
+            root,
+            old_root,
+            freelist,
+            old_freelist,
+            page_count,
+            old_page_count,
+        })
+    }
+
     pub(crate) fn record_alloc(&self, txid: TxId, pgid: PageId) -> anyhow::Result<Lsn> {
         self.record1(|| WalKind::AllocPage { txid, pgid })
+    }
+
+    pub(crate) fn record_dealloc(&self, txid: TxId, pgid: PageId) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::DeallocPage { txid, pgid })
     }
 
     pub(crate) fn record_interior_init(
@@ -352,6 +375,10 @@ impl<'a> LogContext<'a> {
             },
             || WalKind::OverflowSetContentForUndo { txid, pgid },
         )
+    }
+
+    pub(crate) fn record_overflow_init(&self, txid: TxId, pgid: PageId) -> anyhow::Result<Lsn> {
+        self.record1(|| WalKind::OverflowInit { txid, pgid })
     }
 
     pub(crate) fn record_overflow_reset(
