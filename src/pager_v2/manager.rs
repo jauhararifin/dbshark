@@ -316,7 +316,6 @@ impl<'a> PageOps<'a> for PageRead<'a> {
     #[inline]
     fn internal(&self) -> PageInternal {
         PageInternal {
-            txid: self.frame.txid,
             meta: self.frame.meta,
             buffer: self.frame.buffer,
         }
@@ -332,7 +331,6 @@ impl<'a> PageOps<'a> for PageWrite<'a> {
     #[inline]
     fn internal(&self) -> PageInternal {
         PageInternal {
-            txid: self.frame.txid,
             meta: self.frame.meta,
             buffer: self.frame.buffer,
         }

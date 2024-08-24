@@ -1,4 +1,3 @@
-use super::buffer::{ReadFrame, WriteFrame};
 use super::log::LogContext;
 use crate::bins::SliceExt;
 use crate::content::{Bytes, Content};
@@ -454,7 +453,6 @@ impl FreelistKind {
 }
 
 pub(crate) struct PageInternal<'a> {
-    pub(crate) txid: TxId,
     pub(crate) meta: &'a PageMeta,
     pub(crate) buffer: &'a [u8],
 }
@@ -759,24 +757,32 @@ pub(crate) struct InteriorCell<'a> {
     raw: &'a [u8],
 }
 
-impl<'a> InteriorCell<'a> {
-    #[inline]
-    pub(crate) fn raw(&self) -> &'a [u8] {
-        self.raw
-    }
+pub(crate) trait BTreeCell<'a> {
+    fn raw(&self) -> &'a [u8];
+    fn key_size(&self) -> usize;
+    fn overflow(&self) -> Option<PageId>;
+}
 
+impl<'a> InteriorCell<'a> {
     #[inline]
     pub(crate) fn ptr(&self) -> PageId {
         PageId::from_be_bytes(self.cell[INTERIOR_CELL_PTR_RANGE].try_into().unwrap()).unwrap()
     }
+}
+
+impl<'a> BTreeCell<'a> for InteriorCell<'a> {
+    #[inline]
+    fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
 
     #[inline]
-    pub(crate) fn key_size(&self) -> usize {
+    fn key_size(&self) -> usize {
         self.cell[INTERIOR_CELL_KEY_SIZE_RANGE].read_u32() as usize
     }
 
     #[inline]
-    pub(crate) fn overflow(&self) -> Option<PageId> {
+    fn overflow(&self) -> Option<PageId> {
         PageId::from_be_bytes(self.cell[INTERIOR_CELL_OVERFLOW_RANGE].try_into().unwrap())
     }
 }
@@ -1070,9 +1076,9 @@ where
         })
     }
 
-    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, f: F) -> anyhow::Result<usize>
+    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, mut f: F) -> anyhow::Result<usize>
     where
-        for<'c> F: Fn(InteriorCell<'c>) -> anyhow::Result<()>,
+        for<'c> F: FnMut(InteriorCell<'c>) -> anyhow::Result<()>,
     {
         let pgid = self.id();
         let internal = self.internal();
@@ -1241,23 +1247,25 @@ pub(crate) struct LeafCell<'a> {
 
 impl<'a> LeafCell<'a> {
     #[inline]
-    pub(crate) fn raw(&self) -> &'a [u8] {
+    pub(crate) fn val_size(&self) -> usize {
+        self.cell[LEAF_CELL_VAL_SIZE_RANGE].read_u32() as usize
+    }
+}
+
+impl<'a> BTreeCell<'a> for LeafCell<'a> {
+    #[inline]
+    fn raw(&self) -> &'a [u8] {
         self.raw
     }
 
     #[inline]
-    pub(crate) fn key_size(&self) -> usize {
+    fn key_size(&self) -> usize {
         self.cell[LEAF_CELL_KEY_SIZE_RANGE].read_u32() as usize
     }
 
     #[inline]
-    pub(crate) fn overflow(&self) -> Option<PageId> {
+    fn overflow(&self) -> Option<PageId> {
         PageId::from_be_bytes(self.cell[LEAF_CELL_OVERFLOW_RANGE].try_into().unwrap())
-    }
-
-    #[inline]
-    pub(crate) fn val_size(&self) -> usize {
-        self.cell[LEAF_CELL_VAL_SIZE_RANGE].read_u32() as usize
     }
 }
 
@@ -1577,9 +1585,9 @@ where
         })
     }
 
-    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, f: F) -> anyhow::Result<usize>
+    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, mut f: F) -> anyhow::Result<usize>
     where
-        for<'c> F: Fn(LeafCell<'c>) -> anyhow::Result<()>,
+        for<'c> F: FnMut(LeafCell<'c>) -> anyhow::Result<()>,
     {
         let pgid = self.id();
         let internal = self.internal();

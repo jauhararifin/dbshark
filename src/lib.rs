@@ -23,6 +23,7 @@
 
 mod bins;
 mod btree;
+mod btree_v2;
 mod content;
 mod db;
 mod file_lock;

@@ -1,7 +1,6 @@
 use crate::id::TxId;
 use crate::pager_v2::page::PageMeta;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::iter::Iterator;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

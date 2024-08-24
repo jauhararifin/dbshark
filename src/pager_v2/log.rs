@@ -3,6 +3,7 @@ use crate::id::{Lsn, PageId, TxId};
 use crate::log::{WalEntry, WalKind};
 use crate::wal::Wal;
 
+#[derive(Copy, Clone)]
 pub(crate) enum LogContext<'a> {
     Runtime(&'a Wal),
     Redo(Lsn),
