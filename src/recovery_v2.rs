@@ -197,14 +197,13 @@ impl<'a> Redoer<'a> {
                 page_count,
                 ..
             } => {
-                self.pager.set_state(
-                    LogContext::Redo(lsn),
-                    DbState {
+                self.pager.set_state(LogContext::Redo(lsn), |state| {
+                    *state = DbState {
                         root,
                         freelist,
                         page_count,
-                    },
-                )?;
+                    }
+                })?;
             }
 
             WalKind::AllocPage { txid, pgid } => {
@@ -487,6 +486,10 @@ fn undo(pager: &Pager, wal: &Wal, analyze_result: &AnalyzeResult) -> anyhow::Res
             ref mut last_undone,
         } => {
             undo_txn(pager, wal, *txid, last_undone)?;
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::End { txid: *txid },
+            })?;
         }
     }
 
@@ -545,7 +548,7 @@ pub(crate) fn undo_txn(
             } => {
                 pager.set_state(
                     ctx,
-                    DbState {
+                    |state| *state = DbState {
                         root: old_root,
                         freelist: old_freelist,
                         page_count: old_page_count,
@@ -793,11 +796,6 @@ pub(crate) fn undo_txn(
         }
 
         Ok(false)
-    })?;
-
-    wal.append_log(WalEntry {
-        clr: None,
-        kind: WalKind::End { txid },
     })?;
     log::debug!("undo_txn_finished");
 

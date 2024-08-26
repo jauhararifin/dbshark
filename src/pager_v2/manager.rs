@@ -76,6 +76,8 @@ impl Pager {
         txid: TxId,
         pgid: PageId,
     ) -> anyhow::Result<PageRead> {
+        log::trace!("read {txid:?} {pgid:?}");
+
         let page_count = self.state.read().page_count;
         assert!(
             pgid.get() < page_count,
@@ -86,6 +88,7 @@ impl Pager {
 
         let internal = self.internal.read();
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            self.evictor.lock().acquired(frame_id);
             let frame = self.pool.read(frame_id);
             return Ok(PageRead { pager: self, frame });
         }
@@ -111,6 +114,7 @@ impl Pager {
 
         let internal = self.internal.read();
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            self.evictor.lock().acquired(frame_id);
             let frame = self.pool.write(txid, frame_id);
             return Ok(PageWrite { pager: self, frame });
         }
@@ -124,6 +128,7 @@ impl Pager {
     where
         T: BufferPoolFrame<'a> + From<WriteFrame<'a>>,
     {
+        log::trace!("acquire {txid:?} {pgid:?}");
         let mut internal = self.internal.write();
         let page_count = self.state.read().page_count;
         assert!(
@@ -186,6 +191,7 @@ impl Pager {
     }
 
     pub(crate) fn alloc(&self, ctx: LogContext, txid: TxId) -> anyhow::Result<PageWrite> {
+        log::trace!("alloc {txid:?}");
         let pgid = {
             let mut state = self.state.write();
             state.page_count += 1;
@@ -231,8 +237,13 @@ impl Pager {
         Ok(page)
     }
 
-    pub(crate) fn set_state(&self, ctx: LogContext, state: DbState) -> anyhow::Result<()> {
-        let mut current_state = self.state.write();
+    pub(crate) fn set_state<F>(&self, ctx: LogContext, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut DbState),
+    {
+        let mut state = self.state.write();
+        let current_state = *state;
+        f(&mut state);
         ctx.record_set_state(
             state.root,
             current_state.root,
@@ -241,7 +252,6 @@ impl Pager {
             state.page_count,
             current_state.page_count,
         )?;
-        *current_state = state;
         Ok(())
     }
 
@@ -272,6 +282,7 @@ impl Pager {
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {
+        log::trace!("release frame_id={frame_id} is_dirty={is_dirty}");
         self.evictor.lock().released(frame_id, is_dirty);
     }
 
@@ -280,7 +291,7 @@ impl Pager {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub(crate) struct DbState {
     pub(crate) root: Option<PageId>,
     pub(crate) freelist: Option<PageId>,

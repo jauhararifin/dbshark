@@ -393,20 +393,16 @@ impl<'db> Tx<'db> {
     }
 
     fn init_root(&mut self) -> anyhow::Result<PageId> {
-        let db_state = *self.pager.read_state();
-        if let Some(pgid) = db_state.root {
+        let root = self.pager.read_state().root;
+        if let Some(pgid) = root {
             Ok(pgid)
         } else {
             let page = self.pager.alloc(LogContext::Runtime(&self.wal), self.id)?;
             let pgid = page.id();
-            let new_db_state = DbState {
-                root: Some(pgid),
-                freelist: db_state.freelist,
-                page_count: db_state.page_count,
-            };
-            drop(page);
             self.pager
-                .set_state(LogContext::Runtime(&self.wal), new_db_state)?;
+                .set_state(LogContext::Runtime(&self.wal), |state| {
+                    state.root = Some(pgid);
+                })?;
             Ok(pgid)
         }
     }
@@ -451,6 +447,10 @@ impl<'db> Tx<'db> {
         };
 
         undo_txn(&self.pager, &self.wal, self.id, last_undone)?;
+        self.wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::End { txid: self.id },
+        })?;
         *tx_state = TxState::None;
 
         Ok(())

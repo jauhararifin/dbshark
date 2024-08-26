@@ -113,15 +113,19 @@ impl LsnExt for Option<Lsn> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct PageId(NonZeroU64);
+pub(crate) struct PageId(u64);
 
 impl PageId {
     pub(crate) fn new(id: u64) -> Option<Self> {
-        NonZeroU64::new(id).map(Self)
+        if id == u64::MAX {
+            None
+        } else {
+            Some(Self(id))
+        }
     }
 
     pub(crate) fn get(&self) -> u64 {
-        self.0.get()
+        self.0
     }
 
     pub(crate) fn from_be_bytes(pgid: [u8; 8]) -> Option<Self> {
@@ -135,7 +139,7 @@ pub(crate) trait PageIdExt {
 
 impl PageIdExt for PageId {
     fn to_be_bytes(&self) -> [u8; 8] {
-        self.0.get().to_be_bytes()
+        self.0.to_be_bytes()
     }
 }
 impl PageIdExt for Option<PageId> {
@@ -143,7 +147,7 @@ impl PageIdExt for Option<PageId> {
         if let Some(pgid) = self {
             pgid.to_be_bytes()
         } else {
-            0u64.to_be_bytes()
+            u64::MAX.to_be_bytes()
         }
     }
 }

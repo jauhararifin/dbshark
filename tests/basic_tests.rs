@@ -169,6 +169,9 @@ fn test_db_rollback() {
         tx.rollback().unwrap();
     }
 
+    // need to drop the first db to unlock the files
+    drop(db);
+
     let db = Db::open(Path::new("test2"), Setting::default()).unwrap();
     drop(db);
 }

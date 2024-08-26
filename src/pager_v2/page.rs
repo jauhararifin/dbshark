@@ -1057,6 +1057,7 @@ where
         TEMP_BUFFER.with_borrow_mut(|copied| {
             let count = kind.count;
             let page_size = internal.buffer.len();
+            let copied = &mut copied[..page_size];
             copied.copy_from_slice(&internal.buffer);
 
             let mut new_offset = page_size - PAGE_FOOTER_SIZE;
@@ -1526,7 +1527,7 @@ where
         raw_size: usize,
     ) {
         let pgid = internal.meta.id();
-        let kind = internal.meta.kind.interior_mut();
+        let kind = internal.meta.kind.leaf_mut();
         let added = LEAF_CELL_SIZE + raw_size;
         assert!(
             index <= kind.count,
@@ -1567,6 +1568,7 @@ where
         TEMP_BUFFER.with_borrow_mut(|copied| {
             let count = kind.count;
             let page_size = internal.buffer.len();
+            let copied = &mut copied[..page_size];
             copied.copy_from_slice(internal.buffer);
 
             let mut new_offset = page_size - PAGE_FOOTER_SIZE;
