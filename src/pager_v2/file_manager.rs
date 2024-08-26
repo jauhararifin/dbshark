@@ -1,20 +1,17 @@
 use crate::file_lock::FileLock;
 use crate::id::{Lsn, PageId};
+use crate::pager_v2::log::WalSync;
 use crate::pager_v2::page::PageMeta;
-use crate::wal::Wal;
 use anyhow::anyhow;
 use indexmap::IndexSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 pub(crate) struct FileManager {
     main: File,
     double_buff: File,
     page_size: usize,
-
-    wal: Arc<Wal>,
 
     n: usize,
     pages: Box<[u8]>,
@@ -23,12 +20,7 @@ pub(crate) struct FileManager {
 }
 
 impl FileManager {
-    pub(crate) fn new(
-        path: &Path,
-        wal: Arc<Wal>,
-        page_size: usize,
-        n: usize,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
         let main_path = path.join("main");
         let double_buff_path = path.join("dbuff");
 
@@ -58,8 +50,6 @@ impl FileManager {
             main,
             double_buff,
             page_size,
-
-            wal,
 
             n,
             pages: vec![0u8; page_size * n].into_boxed_slice(),
@@ -108,7 +98,12 @@ impl FileManager {
         Ok(())
     }
 
-    pub(crate) fn spill(&mut self, meta: &PageMeta, buff: &mut [u8]) -> anyhow::Result<()> {
+    pub(crate) fn spill(
+        &mut self,
+        wal: &impl WalSync,
+        meta: &PageMeta,
+        buff: &mut [u8],
+    ) -> anyhow::Result<()> {
         assert_eq!(self.page_size, buff.len());
         meta.encode(buff)?;
 
@@ -117,7 +112,7 @@ impl FileManager {
         } else {
             let is_full = self.pgids.len() >= self.n;
             if is_full {
-                self.sync()?;
+                self.sync(wal)?;
             }
             let i = self.pgids.len();
             self.pgids.insert(meta.id);
@@ -129,14 +124,14 @@ impl FileManager {
         Ok(())
     }
 
-    pub(crate) fn sync(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn sync(&mut self, wal: &impl WalSync) -> anyhow::Result<()> {
         self.double_buff.set_len(0)?;
         self.double_buff.seek(SeekFrom::Start(0))?;
         self.double_buff.write_all(&self.pages)?;
         self.double_buff.sync_all()?;
 
         if let Some(max_lsn) = (0..self.pgids.len()).map(|i| self.lsns[i]).max() {
-            self.wal.sync(max_lsn)?;
+            wal.sync(max_lsn)?;
         }
 
         for (i, pgid) in self.pgids.iter().enumerate() {

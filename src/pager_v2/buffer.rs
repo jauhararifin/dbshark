@@ -37,11 +37,11 @@ impl BufferPool {
         }
     }
 
-    pub(crate) fn read(&self, txid: TxId, index: usize) -> ReadFrame {
+    pub(crate) fn read(&self, index: usize) -> ReadFrame {
         assert!(index < self.allocated.load(Ordering::SeqCst));
         assert!(index < self.n);
 
-        let guard = self.locks[index].read();
+        let _guard = self.locks[index].read();
         // SAFETY: since i < n, and self.metas' len is n, this operation is safe because
         // it will never point to address beyond buffer.
         let meta = unsafe { self.metas.add(index) };
@@ -63,8 +63,7 @@ impl BufferPool {
 
         ReadFrame {
             index,
-            guard,
-            txid,
+            _guard,
             meta,
             buffer,
         }
@@ -177,8 +176,7 @@ impl Drop for BufferPool {
 
 pub(crate) struct ReadFrame<'a> {
     pub(crate) index: usize,
-    guard: RwLockReadGuard<'a, ()>,
-    pub(super) txid: TxId,
+    _guard: RwLockReadGuard<'a, ()>,
     pub(super) meta: &'a PageMeta,
     pub(super) buffer: &'a [u8],
 }
@@ -187,8 +185,7 @@ impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
     fn from(value: WriteFrame<'a>) -> Self {
         Self {
             index: value.index,
-            guard: RwLockWriteGuard::downgrade(value.guard),
-            txid: value.txid,
+            _guard: RwLockWriteGuard::downgrade(value.guard),
             meta: value.meta,
             buffer: value.buffer,
         }
@@ -312,7 +309,7 @@ mod tests {
                 let is_read = randomizer.gen_bool(0.5);
                 scope.spawn(move || {
                     if is_read {
-                        let buff = pool.read(txid, index);
+                        let buff = pool.read(index);
                         let x = buff.buffer[0];
                         assert!(buff.buffer.iter().all(|y| *y == x));
                     } else {
@@ -344,7 +341,7 @@ mod tests {
                             pool.write(txid, index);
                         }
                         1 => {
-                            pool.read(txid, index);
+                            pool.read(index);
                         }
                         2 => {
                             pool.alloc(

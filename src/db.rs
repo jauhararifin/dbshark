@@ -1,10 +1,10 @@
 use crate::bins::SliceExt;
-use crate::btree::{BTreeRead, BTreeWrite, Cursor};
+use crate::btree_v2::{BTree, Cursor};
 use crate::file_lock::FileLock;
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
-use crate::pager::{DbState, LogContext, Pager};
-use crate::recovery::{recover, undo_txn};
+use crate::pager_v2::{DbState, LogContext, PageOps, Pager};
+use crate::recovery_v2::{recover, undo_txn};
 use crate::wal::Wal;
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -63,40 +63,22 @@ impl Db {
             return Err(anyhow!("path is not a directory"));
         }
 
-        log::debug!("opening db on {path:?}");
-        let db_path = path.join("main");
-        let double_buff_path = path.join("dbuff");
-
-        // TODO(important): The files here are not locked. In order to prevent corruption, only
-        // one database instance can exist at a time. We should lock the file for this.
-        let mut db_file = OpenOptions::new()
+        let db_header_path = path.join("info");
+        let mut db_header_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(db_path)?
+            .open(db_header_path)?
             .lock()?;
-        if !db_file.metadata()?.is_file() {
-            return Err(anyhow!("db file is not a regular file"));
-        }
-        let header = Self::load_db_header(&mut db_file)?;
-
-        let double_buff_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(double_buff_path)?
-            .lock()?;
-        if !double_buff_file.metadata()?.is_file() {
-            return Err(anyhow!("double buffer file is not a regular file"));
-        }
+        let header = Self::load_db_header(&mut db_header_file)?;
+        drop(db_header_file);
 
         if header.version != 0 {
             return Err(anyhow!("unsupported database version"));
         }
         let page_size = header.page_size as usize;
-        let pager = Arc::new(Pager::new(db_file, double_buff_file, page_size, 1000)?);
+        let pager = Arc::new(Pager::new(path, page_size, 1000)?);
 
         let result = recover(path, &pager)?;
         let wal = Arc::new(result.wal);
@@ -165,7 +147,21 @@ impl Db {
     }
 
     fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<TxState>) -> anyhow::Result<()> {
-        pager.checkpoint(wal, tx_state.read())?;
+        let db_state = pager.read_state();
+        let tx_state = tx_state.read();
+        let checkpoint_lsn = wal.append_log(WalEntry {
+            clr: None,
+            kind: WalKind::Checkpoint {
+                active_tx: *tx_state,
+                root: db_state.root,
+                freelist: db_state.freelist,
+                page_count: db_state.page_count,
+            },
+        })?;
+        drop(tx_state);
+        drop(db_state);
+        pager.checkpoint(wal)?;
+        wal.complete_checkpoint(checkpoint_lsn)?;
         Ok(())
     }
 
@@ -366,7 +362,7 @@ impl<'db> Tx<'db> {
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
-        let mut btree = crate::btree::new(self.id, &self.pager, &self.wal, root_pgid);
+        let mut btree = crate::btree_v2::new(self.id, &self.pager, &self.wal, root_pgid);
         let result = btree.get(name.as_bytes())?;
 
         let bucket_pgid = if let Some(result) = result {
@@ -392,25 +388,25 @@ impl<'db> Tx<'db> {
         };
 
         Ok(Bucket {
-            btree: crate::btree::new(self.id, &self.pager, &self.wal, bucket_pgid),
+            btree: crate::btree_v2::new(self.id, &self.pager, &self.wal, bucket_pgid),
         })
     }
 
     fn init_root(&mut self) -> anyhow::Result<PageId> {
-        if let Some(pgid) = self.pager.root() {
+        let db_state = *self.pager.read_state();
+        if let Some(pgid) = db_state.root {
             Ok(pgid)
         } else {
             let page = self.pager.alloc(LogContext::Runtime(&self.wal), self.id)?;
             let pgid = page.id();
-            self.pager.set_db_state(
-                LogContext::Runtime(&self.wal),
-                DbState {
-                    root: Some(pgid),
-                    freelist: self.pager.freelist(),
-                    page_count: self.pager.page_count(),
-                },
-            )?;
+            let new_db_state = DbState {
+                root: Some(pgid),
+                freelist: db_state.freelist,
+                page_count: db_state.page_count,
+            };
             drop(page);
+            self.pager
+                .set_state(LogContext::Runtime(&self.wal), new_db_state)?;
             Ok(pgid)
         }
     }
@@ -462,7 +458,7 @@ impl<'db> Tx<'db> {
 }
 
 pub struct Bucket<'a> {
-    btree: BTreeWrite<'a>,
+    btree: BTree<'a>,
 }
 
 impl<'a> Bucket<'a> {
@@ -527,6 +523,7 @@ pub struct KeyValue {
 pub struct ReadTx<'db> {
     txid: TxId,
     pager: Arc<Pager>,
+    wal: Arc<Wal>,
 
     _tx_guard: RwLockReadGuard<'db, ()>,
 }
@@ -536,17 +533,18 @@ impl<'db> ReadTx<'db> {
         let tx = Self {
             txid,
             pager: db.pager.clone(),
+            wal: db.wal.clone(),
             _tx_guard: tx_guard,
         };
         Ok(tx)
     }
 
     pub fn bucket(&self, name: &str) -> anyhow::Result<Option<ReadBucket>> {
-        let Some(root_pgid) = self.pager.root() else {
+        let Some(root_pgid) = self.pager.read_state().root else {
             return Ok(None);
         };
 
-        let btree = crate::btree::read_only(self.txid, &self.pager, root_pgid);
+        let btree = crate::btree_v2::new(self.txid, &self.pager, &self.wal, root_pgid);
         let result = btree.get(name.as_bytes())?;
 
         let Some(result) = result else {
@@ -563,13 +561,13 @@ impl<'db> ReadTx<'db> {
         };
 
         Ok(Some(ReadBucket {
-            btree: crate::btree::read_only(self.txid, &self.pager, pgid),
+            btree: crate::btree_v2::new(self.txid, &self.pager, &self.wal, pgid),
         }))
     }
 }
 
 pub struct ReadBucket<'a> {
-    btree: BTreeRead<'a>,
+    btree: BTree<'a>,
 }
 
 impl<'a> ReadBucket<'a> {

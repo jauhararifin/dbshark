@@ -2,7 +2,7 @@ use crate::id::{Lsn, PageId, TxId};
 use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
 use crate::pager_v2::evictor::Evictor;
 use crate::pager_v2::file_manager::FileManager;
-use crate::pager_v2::log::LogContext;
+use crate::pager_v2::log::{LogContext, WalSync};
 use crate::pager_v2::page::{
     PageInternal, PageInternalWrite, PageKind, PageMeta, PageOps, PageWriteOps,
 };
@@ -12,12 +12,8 @@ use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 pub(crate) struct Pager {
-    page_size: usize,
-    n: usize,
-
     state: RwLock<DbState>,
     pool: BufferPool,
     internal: RwLock<PagerInternal>,
@@ -30,12 +26,7 @@ struct PagerInternal {
 }
 
 impl Pager {
-    pub(crate) fn new(
-        path: &Path,
-        wal: Arc<Wal>,
-        page_size: usize,
-        n: usize,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
         Self::check_page_size(page_size)?;
         if n < 10 {
             return Err(anyhow!(
@@ -44,16 +35,13 @@ impl Pager {
         }
 
         Ok(Self {
-            page_size,
-            n,
-
             state: RwLock::new(DbState::default()),
             pool: BufferPool::new(page_size, n),
             internal: RwLock::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
             }),
             evictor: Mutex::new(Evictor::new(n)),
-            file: RwLock::new(FileManager::new(path, wal, page_size, 10)?),
+            file: RwLock::new(FileManager::new(path, page_size, 10)?),
         })
     }
 
@@ -82,7 +70,12 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn read(&self, txid: TxId, pgid: PageId) -> anyhow::Result<PageRead> {
+    pub(crate) fn read(
+        &self,
+        wal: &impl WalSync,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<PageRead> {
         let page_count = self.state.read().page_count;
         assert!(
             pgid.get() < page_count,
@@ -93,16 +86,21 @@ impl Pager {
 
         let internal = self.internal.read();
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
-            let frame = self.pool.read(txid, frame_id);
+            let frame = self.pool.read(frame_id);
             return Ok(PageRead { pager: self, frame });
         }
         drop(internal);
 
-        let frame = self.acquire::<ReadFrame>(txid, pgid)?;
+        let frame = self.acquire::<ReadFrame>(wal, txid, pgid)?;
         Ok(PageRead { pager: self, frame })
     }
 
-    pub(crate) fn write(&self, txid: TxId, pgid: PageId) -> anyhow::Result<PageWrite> {
+    pub(crate) fn write(
+        &self,
+        wal: &impl WalSync,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<PageWrite> {
         let page_count = self.state.read().page_count;
         assert!(
             pgid.get() < page_count,
@@ -118,11 +116,11 @@ impl Pager {
         }
         drop(internal);
 
-        let frame = self.acquire::<WriteFrame>(txid, pgid)?;
+        let frame = self.acquire::<WriteFrame>(wal, txid, pgid)?;
         Ok(PageWrite { pager: self, frame })
     }
 
-    fn acquire<'a, T>(&'a self, txid: TxId, pgid: PageId) -> anyhow::Result<T>
+    fn acquire<'a, T>(&'a self, wal: &impl WalSync, txid: TxId, pgid: PageId) -> anyhow::Result<T>
     where
         T: BufferPoolFrame<'a> + From<WriteFrame<'a>>,
     {
@@ -149,7 +147,7 @@ impl Pager {
             let old_pgid = frame.meta.id;
             let mut file = self.file.write();
             if dirty {
-                file.spill(frame.meta, frame.buffer)?;
+                file.spill(wal, frame.meta, frame.buffer)?;
             }
             *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer)?;
             internal.page_to_frame.remove(&old_pgid);
@@ -208,7 +206,7 @@ impl Pager {
             let old_pgid = frame.meta.id;
             if dirty {
                 let mut file = self.file.write();
-                file.spill(frame.meta, frame.buffer)?;
+                file.spill(&ctx, frame.meta, frame.buffer)?;
             }
             *frame.meta = PageMeta::init(pgid, lsn);
             internal.page_to_frame.remove(&old_pgid);
@@ -226,7 +224,7 @@ impl Pager {
         txid: TxId,
         pgid: PageId,
     ) -> anyhow::Result<PageWrite> {
-        let page = self.write(txid, pgid)?;
+        let page = self.write(&ctx, txid, pgid)?;
         page.frame.meta.lsn = ctx.record_dealloc(txid, pgid)?;
         page.frame.meta.dirty = true;
         page.frame.meta.kind = PageKind::None;
@@ -265,20 +263,24 @@ impl Pager {
             }
 
             let mut file = self.file.write();
-            file.spill(item.meta, item.buffer)?;
+            file.spill(wal, item.meta, item.buffer)?;
         }
 
         let mut file = self.file.write();
-        file.sync()?;
+        file.sync(wal)?;
         Ok(())
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {
         self.evictor.lock().released(frame_id, is_dirty);
     }
+
+    pub(crate) fn shutdown(self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub(crate) struct DbState {
     pub(crate) root: Option<PageId>,
     pub(crate) freelist: Option<PageId>,
@@ -290,8 +292,8 @@ pub(crate) trait BufferPoolFrame<'a> {
 }
 
 impl<'a> BufferPoolFrame<'a> for ReadFrame<'a> {
-    fn get(pool: &'a BufferPool, txid: TxId, index: usize) -> Self {
-        pool.read(txid, index)
+    fn get(pool: &'a BufferPool, _txid: TxId, index: usize) -> Self {
+        pool.read(index)
     }
 }
 

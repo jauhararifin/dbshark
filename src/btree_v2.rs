@@ -9,10 +9,10 @@ use anyhow::anyhow;
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 
-pub(crate) struct BTree<'a, T> {
+pub(crate) struct BTree<'a> {
     txid: TxId,
     pager: &'a Pager,
-    ctx: T,
+    ctx: LogContext<'a>,
     root: PageId,
 }
 
@@ -29,15 +29,7 @@ struct LookupHop<T> {
     found: bool,
 }
 
-pub(crate) type BTreeWrite<'a> = BTree<'a, LogContext<'a>>;
-pub(crate) type BTreeRead<'a> = BTree<'a, ()>;
-
-pub(crate) fn new<'a>(
-    txid: TxId,
-    pager: &'a Pager,
-    wal: &'a Wal,
-    root: PageId,
-) -> BTree<'a, LogContext<'a>> {
+pub(crate) fn new<'a>(txid: TxId, pager: &'a Pager, wal: &'a Wal, root: PageId) -> BTree<'a> {
     BTree {
         txid,
         pager,
@@ -46,16 +38,7 @@ pub(crate) fn new<'a>(
     }
 }
 
-pub(crate) fn read_only(txid: TxId, pager: &Pager, root: PageId) -> BTree<()> {
-    BTree {
-        txid,
-        pager,
-        ctx: (),
-        root,
-    }
-}
-
-impl<'a> BTree<'a, LogContext<'a>> {
+impl<'a> BTree<'a> {
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         if key.len() + value.len() > MAX_ENTRY_SIZE {
             return Err(anyhow!("key-value pair is too large"));
@@ -119,7 +102,7 @@ impl<'a> BTree<'a, LogContext<'a>> {
     fn lookup_for_insert(&self, key: &[u8]) -> anyhow::Result<LookupForUpdateResult<'a>> {
         let mut hops = Vec::default();
 
-        let mut current = self.pager.write(self.txid, self.root)?;
+        let mut current = self.pager.write(&self.ctx, self.txid, self.root)?;
         let page = loop {
             if !current.is_interior() {
                 break current;
@@ -132,7 +115,7 @@ impl<'a> BTree<'a, LogContext<'a>> {
             } else {
                 node.get(i).ptr()
             };
-            let next = self.pager.write(self.txid, next_pgid)?;
+            let next = self.pager.write(&self.ctx, self.txid, next_pgid)?;
 
             if !node.might_split() {
                 hops.clear();
@@ -167,7 +150,8 @@ impl<'a> BTree<'a, LogContext<'a>> {
         let cell = page.get(index);
         let mut overflow_pgid = cell.overflow();
         while let Some(pgid) = overflow_pgid {
-            let Some(overflow) = self.pager.read(self.txid, pgid)?.into_overflow() else {
+            let Some(overflow) = self.pager.read(&self.ctx, self.txid, pgid)?.into_overflow()
+            else {
                 return Err(anyhow!("expected an overflow page"));
             };
             overflow_pgid = overflow.next();
@@ -283,7 +267,9 @@ impl<'a> BTree<'a, LogContext<'a>> {
         };
 
         let pivot_cell = new_right_leaf.get(0);
-        Ok(BTreeContent::from_cell(self.pager, self.txid, pivot_cell))
+        Ok(BTreeContent::from_cell(
+            self.ctx, self.pager, self.txid, pivot_cell,
+        ))
     }
 
     // initial state, A is the root and a leaf node, and the only node.
@@ -434,6 +420,7 @@ impl<'a> BTree<'a, LogContext<'a>> {
         };
 
         Ok(BTreeContent::from_pivot(
+            self.ctx,
             self.pager,
             self.txid,
             next_pivot.raw.into_boxed_slice(),
@@ -495,11 +482,9 @@ impl<'a> BTree<'a, LogContext<'a>> {
         // TODO: put the page into freelist
         Ok(())
     }
-}
 
-impl<'a, T> BTree<'a, T> {
     pub(crate) fn get(&self, key: &[u8]) -> anyhow::Result<Option<GetResult>> {
-        let mut current = self.pager.read(self.txid, self.root)?;
+        let mut current = self.pager.read(&self.ctx, self.txid, self.root)?;
         let page = loop {
             if !current.is_interior() {
                 break current;
@@ -512,7 +497,7 @@ impl<'a, T> BTree<'a, T> {
             } else {
                 node.get(i).ptr()
             };
-            let next = self.pager.read(self.txid, next_pgid)?;
+            let next = self.pager.read(&self.ctx, self.txid, next_pgid)?;
 
             current = next;
         };
@@ -528,6 +513,7 @@ impl<'a, T> BTree<'a, T> {
             return Ok(None);
         }
         Ok(Some(GetResult {
+            ctx: self.ctx,
             pager: self.pager,
             txid: self.txid,
             page: leaf,
@@ -547,7 +533,7 @@ impl<'a, T> BTree<'a, T> {
         while i < node.count() {
             let cell = node.get(i);
             let mut a = Bytes::new(key);
-            let b = BTreeContent::from_cell(self.pager, self.txid, cell);
+            let b = BTreeContent::from_cell(self.ctx, self.pager, self.txid, cell);
             let ord = a.compare(b)?;
             found = ord.is_eq();
             if ord.is_lt() {
@@ -571,7 +557,7 @@ impl<'a, T> BTree<'a, T> {
         while i < node.count() {
             let cell = node.get(i);
             let mut a = Bytes::new(key);
-            let b = BTreeContent::from_cell(self.pager, self.txid, cell);
+            let b = BTreeContent::from_cell(self.ctx, self.pager, self.txid, cell);
             let ord = a.compare(b)?;
             found = ord.is_eq();
             if ord.is_le() {
@@ -590,19 +576,19 @@ impl<'a, T> BTree<'a, T> {
             Bound::Unbounded => (self.find_position(&[])?, false),
         };
         let Some((page, i)) = start else {
-            return Ok(Cursor::Empty { txid: self.txid });
+            return Ok(Cursor::Empty);
         };
 
         let end = match range.end_bound() {
             Bound::Included(key) => {
                 let Some((page, i)) = self.find_position(key)? else {
-                    return Ok(Cursor::Empty { txid: self.txid });
+                    return Ok(Cursor::Empty);
                 };
                 Bound::Included((page.id(), i))
             }
             Bound::Excluded(key) => {
                 let Some((page, i)) = self.find_position(key)? else {
-                    return Ok(Cursor::Empty { txid: self.txid });
+                    return Ok(Cursor::Empty);
                 };
                 Bound::Excluded((page.id(), i))
             }
@@ -611,6 +597,7 @@ impl<'a, T> BTree<'a, T> {
 
         Ok(Cursor::Leaf {
             pager: self.pager,
+            ctx: self.ctx,
             txid: self.txid,
             skip_current: skip_first,
             current_page: Some(page),
@@ -623,7 +610,7 @@ impl<'a, T> BTree<'a, T> {
         &self,
         key: &[u8],
     ) -> anyhow::Result<Option<(LeafPageRead<PageRead<'a>>, usize)>> {
-        let mut current = self.pager.read(self.txid, self.root)?;
+        let mut current = self.pager.read(&self.ctx, self.txid, self.root)?;
         let page = loop {
             if !current.is_interior() {
                 break current;
@@ -636,7 +623,7 @@ impl<'a, T> BTree<'a, T> {
             } else {
                 node.get(i).ptr()
             };
-            let next = self.pager.read(self.txid, next_pgid)?;
+            let next = self.pager.read(&self.ctx, self.txid, next_pgid)?;
 
             current = next;
         };
@@ -651,6 +638,7 @@ impl<'a, T> BTree<'a, T> {
 }
 
 pub(crate) struct GetResult<'a> {
+    ctx: LogContext<'a>,
     pager: &'a Pager,
     txid: TxId,
     page: LeafPageRead<PageRead<'a>>,
@@ -662,7 +650,7 @@ impl GetResult<'_> {
         let cell = self.page.get(self.index);
         let total_size = cell.key_size() + cell.val_size();
         let mut raw = vec![0u8; total_size];
-        let mut content = BTreeContent::from_leaf_content(self.pager, self.txid, &cell);
+        let mut content = BTreeContent::from_leaf_content(self.ctx, self.pager, self.txid, &cell);
         content.put(&mut raw)?;
 
         Ok(KVItem {
@@ -688,11 +676,10 @@ impl KVItem {
 }
 
 pub(crate) enum Cursor<'a> {
-    Empty {
-        txid: TxId,
-    },
+    Empty,
     Leaf {
         txid: TxId,
+        ctx: LogContext<'a>,
         pager: &'a Pager,
         skip_current: bool,
 
@@ -714,6 +701,7 @@ impl<'a> Cursor<'a> {
 
         let Self::Leaf {
             txid,
+            ref ctx,
             pager,
             skip_current,
             current_page,
@@ -746,7 +734,7 @@ impl<'a> Cursor<'a> {
             let cell = leaf_page.get(*current_index);
             let total_size = cell.key_size() + cell.val_size();
             let mut raw = vec![0u8; total_size];
-            let mut content = BTreeContent::from_leaf_content(pager, *txid, &cell);
+            let mut content = BTreeContent::from_leaf_content(*ctx, pager, *txid, &cell);
             content.put(&mut raw)?;
 
             *current_index += 1;
@@ -760,7 +748,7 @@ impl<'a> Cursor<'a> {
 
         if *current_index >= leaf_page.count() {
             if let Some(next_pgid) = leaf_page.next() {
-                let Some(page) = pager.read(*txid, next_pgid)?.into_leaf() else {
+                let Some(page) = pager.read(ctx, *txid, next_pgid)?.into_leaf() else {
                     return Err(anyhow!("expected a leaf page"));
                 };
                 *current_page = Some(page);
@@ -812,6 +800,7 @@ impl Content for KeyValContent<'_> {
 }
 
 struct BTreeContent<'a> {
+    ctx: LogContext<'a>,
     pager: &'a Pager,
     remaining: usize,
     txid: TxId,
@@ -838,6 +827,7 @@ enum BTreeContentKind<'a> {
 
 impl<'a> BTreeContent<'a> {
     fn from_pivot(
+        ctx: LogContext<'a>,
         pager: &'a Pager,
         txid: TxId,
         raw: Box<[u8]>,
@@ -845,6 +835,7 @@ impl<'a> BTreeContent<'a> {
         size: usize,
     ) -> Self {
         BTreeContent {
+            ctx,
             pager,
             remaining: size,
             txid,
@@ -856,10 +847,16 @@ impl<'a> BTreeContent<'a> {
         }
     }
 
-    fn from_cell(pager: &'a Pager, txid: TxId, cell: impl BTreeCell<'a>) -> Self {
+    fn from_cell(
+        ctx: LogContext<'a>,
+        pager: &'a Pager,
+        txid: TxId,
+        cell: impl BTreeCell<'a>,
+    ) -> Self {
         let raw_size = std::cmp::min(cell.raw().len(), cell.key_size());
         let raw = &cell.raw()[..raw_size];
         BTreeContent {
+            ctx,
             pager,
             remaining: cell.key_size(),
             txid,
@@ -870,8 +867,14 @@ impl<'a> BTreeContent<'a> {
         }
     }
 
-    fn from_leaf_content(pager: &'a Pager, txid: TxId, cell: &'a LeafCell) -> Self {
+    fn from_leaf_content(
+        ctx: LogContext<'a>,
+        pager: &'a Pager,
+        txid: TxId,
+        cell: &'a LeafCell,
+    ) -> Self {
         BTreeContent {
+            ctx,
             pager,
             remaining: cell.key_size() + cell.val_size(),
             txid,
@@ -916,7 +919,10 @@ impl<'a> Content for BTreeContent<'a> {
                         break;
                     };
 
-                    let Some(page) = self.pager.read(self.txid, *overflow_pgid)?.into_overflow()
+                    let Some(page) = self
+                        .pager
+                        .read(&self.ctx, self.txid, *overflow_pgid)?
+                        .into_overflow()
                     else {
                         return Err(anyhow!("expected overflow page"));
                     };
@@ -945,7 +951,10 @@ impl<'a> Content for BTreeContent<'a> {
                         break;
                     };
 
-                    let Some(page) = self.pager.read(self.txid, *overflow_pgid)?.into_overflow()
+                    let Some(page) = self
+                        .pager
+                        .read(&self.ctx, self.txid, *overflow_pgid)?
+                        .into_overflow()
                     else {
                         return Err(anyhow!("expected overflow page"));
                     };
@@ -976,7 +985,9 @@ impl<'a> Content for BTreeContent<'a> {
                     }
 
                     if let Some(pgid) = overflow.next() {
-                        let Some(page) = self.pager.read(self.txid, pgid)?.into_overflow() else {
+                        let Some(page) =
+                            self.pager.read(&self.ctx, self.txid, pgid)?.into_overflow()
+                        else {
                             return Err(anyhow!("expected overflow page"));
                         };
                         *overflow = page;

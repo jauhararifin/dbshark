@@ -254,7 +254,9 @@ impl<'a> Redoer<'a> {
         txid: TxId,
         pgid: PageId,
     ) -> anyhow::Result<()> {
-        let page = self.pager.write(txid, pgid)?;
+        let ctx = LogContext::Redo(lsn);
+
+        let page = self.pager.write(&ctx, txid, pgid)?;
         if page.lsn() >= lsn {
             log::debug!(
                 "redo skipped because page_lsn={:?} >= {lsn:?}",
@@ -262,8 +264,6 @@ impl<'a> Redoer<'a> {
             );
             return Ok(());
         }
-
-        let ctx = LogContext::Redo(lsn);
 
         match entry.kind {
             WalKind::Begin { .. }
@@ -572,7 +572,7 @@ pub(crate) fn undo_txn(
                 if page_version != 0 {
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 page.set_interior(ctx, payload.slice())?;
             }
             WalKind::InteriorResetForUndo { .. } => {
@@ -584,21 +584,21 @@ pub(crate) fn undo_txn(
                 if page_version != 0 {
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.reset(ctx)?;
             }
             WalKind::InteriorInit { pgid, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.reset(ctx)?;
             }
             WalKind::InteriorInsert { pgid, index, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
@@ -613,7 +613,7 @@ pub(crate) fn undo_txn(
                 old_overflow,
                 old_key_size,
             } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
@@ -636,7 +636,7 @@ pub(crate) fn undo_txn(
                 old_overflow,
                 ..
             } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
@@ -648,14 +648,14 @@ pub(crate) fn undo_txn(
                 old_ptr,
                 ..
             } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.set_cell_ptr(ctx, index, old_ptr)?;
             }
             WalKind::InteriorSetLast { pgid, old_last, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
@@ -671,7 +671,7 @@ pub(crate) fn undo_txn(
                 if page_version != 0 {
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 page.set_leaf(ctx, payload.slice())?;
             }
             WalKind::LeafResetForUndo { .. } => {
@@ -683,21 +683,21 @@ pub(crate) fn undo_txn(
                 if page_version != 0 {
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.reset(ctx)?;
             }
             WalKind::LeafInit { txid, pgid } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.reset(ctx)?;
             }
             WalKind::LeafInsert { pgid, index, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
@@ -712,7 +712,7 @@ pub(crate) fn undo_txn(
                 old_key_size,
                 old_val_size,
             } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
@@ -735,14 +735,14 @@ pub(crate) fn undo_txn(
                 old_overflow,
                 ..
             } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.set_cell_overflow(ctx, index, old_overflow)?;
             }
             WalKind::LeafSetNext { pgid, old_next, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
@@ -758,21 +758,21 @@ pub(crate) fn undo_txn(
                 if page_version != 0 {
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 page.set_overflow(ctx, payload.slice())?;
             }
             WalKind::OverflowResetForUndo { .. } => {
                 unreachable!("OverflowUndoReset only used for CLR which shouldn't be undone");
             }
             WalKind::OverflowInit { txid, pgid } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(page) = page.into_write_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
                 page.reset(ctx)?;
             }
             WalKind::OverflowSetContent { pgid, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
@@ -782,7 +782,7 @@ pub(crate) fn undo_txn(
                 unreachable!("OverflowUndoSetContent only used for CLR which shouldn't be undone");
             }
             WalKind::OverflowSetNext { pgid, old_next, .. } => {
-                let page = pager.write(txid, pgid)?;
+                let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };

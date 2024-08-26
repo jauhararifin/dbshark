@@ -3,6 +3,30 @@ use crate::id::{Lsn, PageId, TxId};
 use crate::log::{WalEntry, WalKind};
 use crate::wal::Wal;
 
+pub(crate) trait WalSync {
+    fn sync(&self, lsn: Lsn) -> anyhow::Result<()>;
+}
+
+impl WalSync for Wal {
+    fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
+        Wal::sync(self, lsn)?;
+        Ok(())
+    }
+}
+
+impl WalSync for LogContext<'_> {
+    fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
+        let wal = match self {
+            Self::Runtime(wal) => wal,
+            Self::Redo(..) => return Ok(()),
+            Self::Undo(wal, ..) => wal,
+        };
+
+        wal.sync(lsn)?;
+        Ok(())
+    }
+}
+
 #[derive(Copy, Clone)]
 pub(crate) enum LogContext<'a> {
     Runtime(&'a Wal),
@@ -11,30 +35,6 @@ pub(crate) enum LogContext<'a> {
 }
 
 impl<'a> LogContext<'a> {
-    pub(crate) fn runtime(wal: &'a Wal) -> Self {
-        Self::Runtime(wal)
-    }
-
-    pub(crate) fn redo(lsn: Lsn) -> Self {
-        Self::Redo(lsn)
-    }
-
-    pub(crate) fn undo(wal: &'a Wal, clr: Lsn) -> Self {
-        Self::Undo(wal, clr)
-    }
-
-    fn is_undo(&self) -> bool {
-        matches!(self, Self::Undo(..))
-    }
-
-    fn clr(&self) -> Option<Lsn> {
-        if let Self::Undo(_, lsn) = self {
-            Some(*lsn)
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn record1<'e, F>(&self, entry: F) -> anyhow::Result<Lsn>
     where
         F: FnOnce() -> WalKind<'e>,

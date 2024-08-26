@@ -1365,7 +1365,6 @@ mod tests {
         })?;
 
         wal.iter_back(rollback_lsn, |lsn, entry| {
-            println!("item> {lsn:?} {entry:?}");
             let Some((expected_lsn, expected_entry)) = entries.pop() else {
                 return Ok(true);
             };
