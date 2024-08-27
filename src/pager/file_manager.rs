@@ -1,7 +1,7 @@
 use crate::file_lock::FileLock;
 use crate::id::{Lsn, PageId};
-use crate::pager_v2::log::WalSync;
-use crate::pager_v2::page::PageMeta;
+use crate::pager::log::WalSync;
+use crate::pager::page::PageMeta;
 use anyhow::anyhow;
 use indexmap::IndexSet;
 use std::fs::{File, OpenOptions};

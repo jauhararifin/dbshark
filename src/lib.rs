@@ -23,16 +23,13 @@
 
 mod bins;
 mod btree;
-mod btree_v2;
 mod content;
 mod db;
 mod file_lock;
 mod id;
 mod log;
 mod pager;
-mod pager_v2;
 mod recovery;
-mod recovery_v2;
 mod wal;
 
 pub use db::{Db, Setting};

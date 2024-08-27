@@ -1,5 +1,5 @@
 use crate::id::TxId;
-use crate::pager_v2::page::PageMeta;
+use crate::pager::page::PageMeta;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -200,6 +200,12 @@ pub(crate) struct WriteFrame<'a> {
     pub(super) buffer: &'a mut [u8],
 }
 
+impl std::fmt::Debug for WriteFrame<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.meta.fmt(f)
+    }
+}
+
 impl BufferPool {
     pub(crate) fn walk(&self) -> impl Iterator<Item = BufferPoolItem> {
         let allocated = self.allocated.load(Ordering::SeqCst);
@@ -242,7 +248,7 @@ impl<'a> Iterator for BufferPoolWalk<'a> {
 mod tests {
     use super::*;
     use crate::id::{Lsn, PageId};
-    use crate::pager_v2::page::PageKind;
+    use crate::pager::page::PageKind;
     use rand::Rng;
     use std::sync::atomic::AtomicI32;
 

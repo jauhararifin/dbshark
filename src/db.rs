@@ -1,10 +1,10 @@
 use crate::bins::SliceExt;
-use crate::btree_v2::{BTree, Cursor};
+use crate::btree::{BTree, Cursor};
 use crate::file_lock::FileLock;
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
-use crate::pager_v2::{DbState, LogContext, PageOps, Pager};
-use crate::recovery_v2::{recover, undo_txn};
+use crate::pager::{LogContext, PageOps, Pager};
+use crate::recovery::{recover, undo_txn};
 use crate::wal::Wal;
 use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -237,6 +237,8 @@ impl Db {
                 Ok(())
             }
             TxState::Committing(txid) => {
+                log::debug!("continue committing previous transaction {txid:?}");
+
                 let commit_lsn = self.wal.append_log(WalEntry {
                     clr: None,
                     kind: WalKind::Commit { txid },
@@ -362,7 +364,7 @@ impl<'db> Tx<'db> {
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
         let root_pgid = self.init_root()?;
 
-        let mut btree = crate::btree_v2::new(self.id, &self.pager, &self.wal, root_pgid);
+        let mut btree = crate::btree::new(self.id, &self.pager, &self.wal, root_pgid);
         let result = btree.get(name.as_bytes())?;
 
         let bucket_pgid = if let Some(result) = result {
@@ -388,7 +390,7 @@ impl<'db> Tx<'db> {
         };
 
         Ok(Bucket {
-            btree: crate::btree_v2::new(self.id, &self.pager, &self.wal, bucket_pgid),
+            btree: crate::btree::new(self.id, &self.pager, &self.wal, bucket_pgid),
         })
     }
 
@@ -544,7 +546,7 @@ impl<'db> ReadTx<'db> {
             return Ok(None);
         };
 
-        let btree = crate::btree_v2::new(self.txid, &self.pager, &self.wal, root_pgid);
+        let btree = crate::btree::new(self.txid, &self.pager, &self.wal, root_pgid);
         let result = btree.get(name.as_bytes())?;
 
         let Some(result) = result else {
@@ -561,7 +563,7 @@ impl<'db> ReadTx<'db> {
         };
 
         Ok(Some(ReadBucket {
-            btree: crate::btree_v2::new(self.txid, &self.pager, &self.wal, pgid),
+            btree: crate::btree::new(self.txid, &self.pager, &self.wal, pgid),
         }))
     }
 }

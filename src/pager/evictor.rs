@@ -42,13 +42,7 @@ impl Evictor {
         }
     }
 
-    pub(crate) fn reset(&mut self, frame_id: usize) {
-        log::trace!("reset frame_id={frame_id}");
-        self.released(frame_id, false);
-        self.acquired(frame_id);
-    }
-
-    pub(crate) fn evict(&mut self) -> anyhow::Result<(usize, bool)> {
+    pub(crate) fn evict_and_acquire(&mut self) -> anyhow::Result<(usize, bool)> {
         log::trace!(
             "evict free_and_clean={} free_frames={}",
             self.free_and_clean.len(),
@@ -56,8 +50,13 @@ impl Evictor {
         );
 
         if let Some(frame_id) = self.free_and_clean.iter().next().copied() {
+            self.ref_count[frame_id] = 1;
+            self.free_and_clean.remove(&frame_id);
+            self.free_frames.remove(&frame_id);
             Ok((frame_id, false))
         } else if let Some(frame_id) = self.free_frames.iter().next().copied() {
+            self.ref_count[frame_id] = 1;
+            self.free_frames.remove(&frame_id);
             Ok((frame_id, true))
         } else {
             return Err(anyhow!("all pages are pinned"));
@@ -78,12 +77,12 @@ mod tests {
         evictor.released(2, false);
         evictor.acquired(3);
         evictor.acquired(4);
-        let (frame_id, evict) = evictor.evict().unwrap();
+        let (frame_id, evict) = evictor.evict_and_acquire().unwrap();
         assert_eq!(2, frame_id);
         assert!(!evict);
         evictor.released(3, true);
         evictor.acquired(2);
-        let (frame_id, evict) = evictor.evict().unwrap();
+        let (frame_id, evict) = evictor.evict_and_acquire().unwrap();
         assert_eq!(3, frame_id);
         assert!(evict);
     }
@@ -92,14 +91,14 @@ mod tests {
     fn test_eviction_full() {
         let mut evictor = Evictor::new(5);
         evictor.acquired(0);
-        assert!(evictor.evict().is_err());
+        assert!(evictor.evict_and_acquire().is_err());
         evictor.acquired(1);
-        assert!(evictor.evict().is_err());
+        assert!(evictor.evict_and_acquire().is_err());
         evictor.acquired(2);
-        assert!(evictor.evict().is_err());
+        assert!(evictor.evict_and_acquire().is_err());
         evictor.acquired(3);
-        assert!(evictor.evict().is_err());
+        assert!(evictor.evict_and_acquire().is_err());
         evictor.acquired(4);
-        assert!(evictor.evict().is_err());
+        assert!(evictor.evict_and_acquire().is_err());
     }
 }

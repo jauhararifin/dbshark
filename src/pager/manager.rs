@@ -1,12 +1,12 @@
 use crate::id::{Lsn, PageId, TxId};
-use crate::pager_v2::buffer::{BufferPool, ReadFrame, WriteFrame};
-use crate::pager_v2::evictor::Evictor;
-use crate::pager_v2::file_manager::FileManager;
-use crate::pager_v2::log::{LogContext, WalSync};
-use crate::pager_v2::page::{
+use crate::pager::buffer::{BufferPool, ReadFrame, WriteFrame};
+use crate::pager::evictor::Evictor;
+use crate::pager::file_manager::FileManager;
+use crate::pager::log::{LogContext, WalSync};
+use crate::pager::page::{
     PageInternal, PageInternalWrite, PageKind, PageMeta, PageOps, PageWriteOps,
 };
-use crate::pager_v2::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
+use crate::pager::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
 use crate::wal::Wal;
 use anyhow::anyhow;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -147,7 +147,7 @@ impl Pager {
             internal.page_to_frame.insert(pgid, frame.index);
             return Ok(frame.into());
         } else {
-            let (frame_id, dirty) = evictor.evict()?;
+            let (frame_id, dirty) = evictor.evict_and_acquire()?;
             let frame = self.pool.write(txid, frame_id);
             let old_pgid = frame.meta.id;
             let mut file = self.file.write();
@@ -157,7 +157,6 @@ impl Pager {
             *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer)?;
             internal.page_to_frame.remove(&old_pgid);
             internal.page_to_frame.insert(pgid, frame_id);
-            evictor.reset(frame_id);
             Ok(frame.into())
         }
     }
@@ -207,7 +206,7 @@ impl Pager {
             internal.page_to_frame.insert(pgid, frame.index);
             frame
         } else {
-            let (frame_id, dirty) = evictor.evict()?;
+            let (frame_id, dirty) = evictor.evict_and_acquire()?;
             let frame = self.pool.write(txid, frame_id);
             let old_pgid = frame.meta.id;
             if dirty {
@@ -217,7 +216,6 @@ impl Pager {
             *frame.meta = PageMeta::init(pgid, lsn);
             internal.page_to_frame.remove(&old_pgid);
             internal.page_to_frame.insert(pgid, frame_id);
-            evictor.reset(frame_id);
             frame
         };
 
@@ -321,7 +319,7 @@ pub(crate) struct PageRead<'a> {
 
 impl<'a> Drop for PageRead<'a> {
     fn drop(&mut self) {
-        self.pager.release(self.frame.index, false);
+        self.pager.release(self.frame.index, self.frame.meta.dirty);
     }
 }
 
@@ -338,6 +336,12 @@ impl<'a> PageOps<'a> for PageRead<'a> {
 pub(crate) struct PageWrite<'a> {
     pub(super) pager: &'a Pager,
     pub(super) frame: WriteFrame<'a>,
+}
+
+impl<'a> std::fmt::Debug for PageWrite<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.frame.fmt(f)
+    }
 }
 
 impl<'a> PageOps<'a> for PageWrite<'a> {
@@ -363,6 +367,52 @@ impl<'a> PageWriteOps<'a> for PageWrite<'a> {
 
 impl<'a> Drop for PageWrite<'a> {
     fn drop(&mut self) {
-        self.pager.release(self.frame.index, false);
+        self.pager.release(self.frame.index, self.frame.meta.dirty);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::Bytes;
+
+    struct NoopWalSync;
+
+    impl WalSync for NoopWalSync {
+        fn sync(&self, _lsn: Lsn) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let pager = Pager::new(dir.path(), 512, 10).unwrap();
+        let txid = TxId::new(1).unwrap();
+
+        for i in 0..20 {
+            let ctx = LogContext::Redo(Lsn::new(1));
+            let page = pager.alloc(ctx, txid).unwrap();
+            assert_eq!(i, page.id().get());
+            let mut leaf = page.init_leaf(ctx).unwrap();
+            for j in 0..5 {
+                leaf.insert_content(ctx, j, &mut Bytes::new(b"abc"), 3, 0, None)
+                    .unwrap();
+            }
+            leaf.set_next(ctx, PageId::new(5)).unwrap();
+        }
+
+        for i in (0..20).rev() {
+            let page = pager
+                .write(&NoopWalSync, txid, PageId::new(i).unwrap())
+                .unwrap();
+            let ctx = LogContext::Redo(Lsn::new(1));
+            let mut leaf = page.into_write_leaf().unwrap();
+            leaf.set_next(ctx, None).unwrap();
+            for j in (0..5).rev() {
+                leaf.delete(ctx, j).unwrap();
+            }
+            leaf.reset(ctx).unwrap();
+        }
     }
 }

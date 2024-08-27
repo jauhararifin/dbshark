@@ -1820,7 +1820,7 @@ impl<'a> PagePayloadMut<'a> for &'a mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pager_v2::MAXIMUM_PAGE_SIZE;
+    use crate::pager::MAXIMUM_PAGE_SIZE;
 
     #[test]
     fn test_encode_decode() -> anyhow::Result<()> {
