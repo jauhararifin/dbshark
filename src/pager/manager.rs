@@ -139,7 +139,7 @@ impl Pager {
         let mut evictor = self.evictor.lock();
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
             evictor.acquired(frame_id);
-            return Ok(T::get(&self.pool, txid, frame_id));
+            Ok(T::get(&self.pool, txid, frame_id))
         } else if let Some(frame) = self.pool.alloc(txid, PageMeta::empty(pgid)) {
             let mut file = self.file.write();
             *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer)?;

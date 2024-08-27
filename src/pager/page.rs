@@ -1049,7 +1049,7 @@ where
         use super::MAXIMUM_PAGE_SIZE;
         use std::cell::RefCell;
         std::thread_local! {
-            static TEMP_BUFFER: RefCell<[u8; MAXIMUM_PAGE_SIZE]> = RefCell::new([0u8; MAXIMUM_PAGE_SIZE]);
+            static TEMP_BUFFER: RefCell<[u8; MAXIMUM_PAGE_SIZE]> = const { RefCell::new([0u8; MAXIMUM_PAGE_SIZE]) };
         }
 
         let kind = internal.meta.kind.interior_mut();
@@ -1058,7 +1058,7 @@ where
             let count = kind.count;
             let page_size = internal.buffer.len();
             let copied = &mut copied[..page_size];
-            copied.copy_from_slice(&internal.buffer);
+            copied.copy_from_slice(internal.buffer);
 
             let mut new_offset = page_size - PAGE_FOOTER_SIZE;
             for i in 0..count {
@@ -1561,7 +1561,7 @@ where
         use super::MAXIMUM_PAGE_SIZE;
         use std::cell::RefCell;
         std::thread_local! {
-            static TEMP_BUFFER: RefCell<[u8; MAXIMUM_PAGE_SIZE]> = RefCell::new([0u8; MAXIMUM_PAGE_SIZE]);
+            static TEMP_BUFFER: RefCell<[u8; MAXIMUM_PAGE_SIZE]> = const { RefCell::new([0u8; MAXIMUM_PAGE_SIZE]) };
         }
 
         let kind = internal.meta.kind.leaf_mut();
