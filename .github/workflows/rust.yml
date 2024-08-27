@@ -25,7 +25,7 @@ jobs:
       run: cargo test --lib --verbose
     - name: Run unit tests with miri
       env:
-        MIRIFLAGS=-Zmiri-disable-isolation
+        MIRIFLAGS: "-Zmiri-disable-isolation"
       run: cargo miri test --lib --verbose
     - name: Run basic integration tests
       run: cargo test --test basic_tests --verbose
