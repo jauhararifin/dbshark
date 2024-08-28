@@ -271,7 +271,8 @@ impl Wal {
         }
         f.f.sync_all()?;
 
-        buffer.start_offset = buffer.end_offset;
+        buffer.start_offset = 0;
+        buffer.end_offset = 0;
         internal.first_unflushed = internal.next;
 
         Ok(())
