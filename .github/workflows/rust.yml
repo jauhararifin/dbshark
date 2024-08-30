@@ -23,11 +23,9 @@ jobs:
       run: cargo build --verbose
     - name: Run unit tests
       run: cargo test --lib --verbose
-    # Miri is disabled for now since we use raw syscall for file
-    # locking and it's not supported by Miri.
-    # - name: Run unit tests with miri
-    #   env:
-    #     MIRIFLAGS: "-Zmiri-disable-isolation"
-    #   run: cargo miri test --lib --verbose
+    - name: Run unit tests with miri
+      env:
+        MIRIFLAGS: "-Zmiri-disable-isolation"
+      run: cargo miri test --lib pager::buffer --verbose
     - name: Run basic integration tests
       run: cargo test --test basic_tests --verbose

@@ -1143,6 +1143,67 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_buffer_full() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let entry = WalEntry {
+            clr: None,
+            kind: WalKind::Begin {
+                txid: TxId::new(1).unwrap(),
+            },
+        };
+        assert!(BUFFER_SIZE % entry.size() == 0);
+        let n = BUFFER_SIZE as u64 / entry.size() as u64;
+
+        {
+            let wal = recover(dir.path(), |_, _| Ok(()))?;
+
+            for i in 0u64..3 * n {
+                wal.append_log(WalEntry {
+                    clr: None,
+                    kind: WalKind::Begin {
+                        txid: TxId::new(i + 1).unwrap(),
+                    },
+                })?;
+            }
+            wal.append_log(WalEntry {
+                clr: None,
+                kind: WalKind::LeafDeleteForUndo {
+                    txid: TxId::new(99999999999999999).unwrap(),
+                    pgid: PageId::new(99999999999999999).unwrap(),
+                    index: 10,
+                },
+            })?;
+            wal.trigger_flush()?;
+        }
+
+        let mut i = 0;
+        recover(dir.path(), |_, entry| {
+            if i < 3 * n {
+                assert_eq!(
+                    WalKind::Begin {
+                        txid: TxId::new(i + 1).unwrap()
+                    },
+                    entry.kind
+                );
+            } else {
+                assert_eq!(
+                    WalKind::LeafDeleteForUndo {
+                        txid: TxId::new(99999999999999999).unwrap(),
+                        pgid: PageId::new(99999999999999999).unwrap(),
+                        index: 10,
+                    },
+                    entry.kind
+                );
+            }
+            i += 1;
+            Ok(())
+        })?;
+        assert_eq!(3 * n + 1, i);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_million_logs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
