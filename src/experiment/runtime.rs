@@ -1,0 +1,124 @@
+use std::fs;
+use std::io;
+use std::ops::{Deref, DerefMut};
+use std::path::Path;
+
+pub(crate) type RwMutexReadGuard<'a, R: Runtime, T> = <R::RwMutex<T> as RwMutex<T>>::ReadGuard<'a>;
+pub(crate) type RwMutexWriteGuard<'a, R: Runtime, T> =
+    <R::RwMutex<T> as RwMutex<T>>::WriteGuard<'a>;
+
+pub(crate) type Guard<'a, R: Runtime, T> = <R::Mutex<T> as Mutex<T>>::Guard<'a>;
+
+pub(crate) trait Runtime: 'static {
+    type Sender<T>: Sender<T>;
+    type Receiver<T>: Receiver<T>;
+
+    type Timer: Timer + 'static;
+    type TimerHandle: TimerHandle + 'static;
+
+    type Mutex<T>: Mutex<T>;
+
+    type RwMutex<T>: RwMutex<T>;
+
+    type JoinHandle: JoinHandle;
+
+    type File: File;
+
+    type AtomicUsize: Atomic<usize>;
+    type AtomicU8: Atomic<u8>;
+    type AtomicU16: Atomic<u16>;
+    type AtomicU32: Atomic<u32>;
+    type AtomicU64: Atomic<u64>;
+    type AtomicIsize: Atomic<isize>;
+    type AtomicI8: Atomic<i8>;
+    type AtomicI16: Atomic<i16>;
+    type AtomicI32: Atomic<i32>;
+    type AtomicI64: Atomic<i64>;
+
+    fn channel<T>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>);
+
+    fn spawn<F>(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
+
+    fn park();
+
+    fn sleep(time: std::time::Duration);
+
+    fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle);
+
+    fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()>;
+}
+
+pub(crate) trait Sender<T> {
+    fn send(&self, value: T);
+    fn close(&self);
+}
+
+pub(crate) trait Receiver<T> {
+    fn recv(&mut self) -> Option<T>;
+}
+
+pub(crate) trait Timer {
+    fn wait(&mut self) -> bool;
+}
+
+pub(crate) trait TimerHandle: Clone {
+    fn trigger(&self);
+    fn close(&self);
+}
+
+pub(crate) trait Mutex<T> {
+    type Guard<'a>: DerefMut<Target = T>
+    where
+        Self: 'a;
+
+    fn new(data: T) -> Self;
+    fn lock<'a>(&'a self) -> Self::Guard<'a>;
+    fn try_lock<'a>(&'a self) -> Option<Self::Guard<'a>>;
+}
+
+pub(crate) trait RwMutex<T> {
+    type ReadGuard<'a>: Deref<Target = T> + From<Self::WriteGuard<'a>>
+    where
+        Self: 'a;
+    type WriteGuard<'a>: DerefMut<Target = T>
+    where
+        Self: 'a;
+
+    fn new(data: T) -> Self;
+
+    fn read<'a>(&'a self) -> Self::ReadGuard<'a>;
+
+    fn write<'a>(&'a self) -> Self::WriteGuard<'a>;
+
+    fn try_write<'a>(&'a self) -> Option<Self::WriteGuard<'a>>;
+}
+
+pub(crate) trait JoinHandle {
+    fn join(self);
+}
+
+pub(crate) trait File: Sized {
+    fn open(path: impl AsRef<Path>) -> io::Result<Self>;
+
+    fn metadata(&self) -> io::Result<fs::Metadata>;
+
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<()>;
+
+    fn read(&mut self, buff: &mut [u8]) -> io::Result<usize>;
+
+    fn read_exact(&mut self, buff: &mut [u8]) -> io::Result<()>;
+
+    fn write_all(&mut self, buff: &[u8]) -> io::Result<()>;
+
+    fn sync(&mut self) -> io::Result<()>;
+
+    fn truncate(&mut self, size: u64) -> io::Result<()>;
+}
+
+pub(crate) trait Atomic<T> {
+    fn new(value: T) -> Self;
+    fn load(&self) -> T;
+    fn store(&self, value: T);
+    fn compare_and_exchange(&self, old: T, new: T) -> bool;
+    fn fetch_add(&self, delta: T) -> T;
+}

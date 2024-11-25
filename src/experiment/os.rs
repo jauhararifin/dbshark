@@ -1,0 +1,372 @@
+use super::runtime;
+use std::io::{Read, Seek, Write};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
+pub(crate) struct OsRuntime;
+
+impl runtime::Runtime for OsRuntime {
+    type Sender<T> = OsSender<T>;
+    type Receiver<T> = OsReceiver<T>;
+
+    type Timer = OsTimer;
+    type TimerHandle = OsTimerHandle;
+
+    type Mutex<T> = OsMutex<T>;
+    type RwMutex<T> = OsRwMutex<T>;
+
+    type JoinHandle = OsJoinHandle;
+
+    type File = OsFile;
+
+    type AtomicUsize = AtomicUsize;
+    type AtomicU8 = AtomicU8;
+    type AtomicU16 = AtomicU16;
+    type AtomicU32 = AtomicU32;
+    type AtomicU64 = AtomicU64;
+    type AtomicIsize = AtomicIsize;
+    type AtomicI8 = AtomicI8;
+    type AtomicI16 = AtomicI16;
+    type AtomicI32 = AtomicI32;
+    type AtomicI64 = AtomicI64;
+
+    fn channel<T>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(buffer);
+        (OsSender(sender), OsReceiver(receiver))
+    }
+
+    fn spawn<F>(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
+        let handle = std::thread::spawn(f);
+        OsJoinHandle(handle)
+    }
+
+    fn park() {
+        // no-op
+    }
+
+    fn sleep(time: std::time::Duration) {
+        std::thread::sleep(time)
+    }
+
+    fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
+        let cond = Arc::new(parking_lot::Condvar::new());
+        let m = Arc::new(parking_lot::Mutex::new(TimerState {
+            trigger: 0,
+            closed: false,
+        }));
+
+        (
+            OsTimer {
+                duration,
+                cond: cond.clone(),
+                m: m.clone(),
+            },
+            OsTimerHandle { cond, m },
+        )
+    }
+
+    fn create_dir_all<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
+        std::fs::create_dir_all(path.as_ref())
+    }
+}
+
+pub(crate) struct OsSender<T>(std::sync::mpsc::SyncSender<T>);
+
+impl<T> runtime::Sender<T> for OsSender<T> {
+    fn send(&self, value: T) {
+        todo!()
+    }
+
+    fn close(&self) {
+        todo!()
+    }
+}
+
+pub(crate) struct OsReceiver<T>(std::sync::mpsc::Receiver<T>);
+
+impl<T> runtime::Receiver<T> for OsReceiver<T> {
+    fn recv(&mut self) -> Option<T> {
+        todo!()
+    }
+}
+
+pub(crate) struct OsTimer {
+    duration: std::time::Duration,
+    cond: Arc<parking_lot::Condvar>,
+    m: Arc<parking_lot::Mutex<TimerState>>,
+}
+
+struct TimerState {
+    trigger: usize,
+    closed: bool,
+}
+
+impl runtime::Timer for OsTimer {
+    fn wait(&mut self) -> bool {
+        let mut state = self.m.lock();
+        if state.closed {
+            return false;
+        }
+        if state.trigger > 0 {
+            state.trigger -= 1;
+            return true;
+        }
+
+        self.cond.wait_for(&mut state, self.duration);
+
+        if state.closed {
+            return false;
+        }
+        if state.trigger > 0 {
+            state.trigger -= 1;
+            return true;
+        }
+        return true;
+    }
+}
+
+pub(crate) struct OsTimerHandle {
+    cond: Arc<parking_lot::Condvar>,
+    m: Arc<parking_lot::Mutex<TimerState>>,
+}
+
+impl Clone for OsTimerHandle {
+    fn clone(&self) -> Self {
+        Self {
+            cond: self.cond.clone(),
+            m: self.m.clone(),
+        }
+    }
+}
+
+impl runtime::TimerHandle for OsTimerHandle {
+    fn trigger(&self) {
+        let mut state = self.m.lock();
+        state.trigger += 1;
+        drop(state);
+        self.cond.notify_one();
+    }
+
+    fn close(&self) {
+        let mut state = self.m.lock();
+        state.closed = true;
+        drop(state);
+        self.cond.notify_one();
+    }
+}
+
+pub(crate) struct OsMutex<T>(parking_lot::Mutex<T>);
+
+impl<T> runtime::Mutex<T> for OsMutex<T> {
+    type Guard<'a> = OsMutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn new(data: T) -> Self {
+        Self(parking_lot::Mutex::new(data))
+    }
+
+    fn lock<'a>(&'a self) -> Self::Guard<'a> {
+        OsMutexGuard(self.0.lock())
+    }
+
+    fn try_lock<'a>(&'a self) -> Option<Self::Guard<'a>> {
+        self.0.try_lock().map(OsMutexGuard)
+    }
+}
+
+pub(crate) struct OsMutexGuard<'a, T>(parking_lot::MutexGuard<'a, T>);
+
+impl<'a, T> Deref for OsMutexGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<'a, T> DerefMut for OsMutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}
+
+pub(crate) struct OsRwMutex<T>(parking_lot::RwLock<T>);
+
+impl<T> runtime::RwMutex<T> for OsRwMutex<T> {
+    type ReadGuard<'a> = OsRwMutexReadGuard<'a,T>
+    where
+        T: 'a;
+    type WriteGuard<'a> = OsRwMutexWriteGuard<'a,T>
+    where
+        T: 'a;
+
+    fn new(data: T) -> Self {
+        Self(parking_lot::RwLock::new(data))
+    }
+
+    fn read<'a>(&'a self) -> Self::ReadGuard<'a> {
+        OsRwMutexReadGuard(self.0.read())
+    }
+
+    fn write<'a>(&'a self) -> Self::WriteGuard<'a> {
+        OsRwMutexWriteGuard(self.0.write())
+    }
+
+    fn try_write<'a>(&'a self) -> Option<Self::WriteGuard<'a>> {
+        self.0.try_write().map(OsRwMutexWriteGuard)
+    }
+}
+
+pub(crate) struct OsRwMutexReadGuard<'a, T>(parking_lot::RwLockReadGuard<'a, T>);
+
+impl<'a, T> Deref for OsRwMutexReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<'a, T> From<OsRwMutexWriteGuard<'a, T>> for OsRwMutexReadGuard<'a, T> {
+    fn from(value: OsRwMutexWriteGuard<'a, T>) -> Self {
+        Self(parking_lot::RwLockWriteGuard::downgrade(value.0))
+    }
+}
+
+pub(crate) struct OsRwMutexWriteGuard<'a, T>(parking_lot::RwLockWriteGuard<'a, T>);
+
+impl<'a, T> Deref for OsRwMutexWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<'a, T> DerefMut for OsRwMutexWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}
+
+pub(crate) struct OsJoinHandle(std::thread::JoinHandle<()>);
+
+impl runtime::JoinHandle for OsJoinHandle {
+    fn join(self) {
+        self.0.join().expect("thread should not panic")
+    }
+}
+
+pub(crate) struct OsFile(std::fs::File);
+
+impl runtime::File for OsFile {
+    #[inline]
+    fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.as_ref())?;
+        lock(&f)?;
+        Ok(Self(f))
+    }
+
+    #[inline]
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.0.metadata()
+    }
+
+    #[inline]
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<()> {
+        self.0.seek(position)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buff)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buff: &mut [u8]) -> std::io::Result<()> {
+        self.0.read_exact(buff)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buff: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(buff)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.0.sync_all()
+    }
+
+    #[inline]
+    fn truncate(&mut self, size: u64) -> std::io::Result<()> {
+        self.0.set_len(size)
+    }
+}
+
+#[cfg(unix)]
+fn lock(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    use syscalls::{syscall2, Sysno};
+    let fd = f.as_raw_fd();
+    const LOCK_EX: usize = 0x2;
+    let result = unsafe { syscall2(Sysno::flock, fd as usize, LOCK_EX) };
+    if let Err(err) = result {
+        Err(std::io::Error::from_raw_os_error(err.into_raw()))
+    } else {
+        Ok(())
+    }
+}
+
+macro_rules! impl_atomic {
+    ($name:ident, $ty:ident) => {
+        pub(crate) struct $name(atomic::$name);
+
+        impl runtime::Atomic<$ty> for $name {
+            #[inline]
+            fn new(value: $ty) -> Self {
+                Self(atomic::$name::new(value))
+            }
+
+            #[inline]
+            fn load(&self) -> $ty {
+                self.0.load(atomic::Ordering::SeqCst)
+            }
+
+            #[inline]
+            fn store(&self, value: $ty) {
+                self.0.store(value, atomic::Ordering::SeqCst);
+            }
+
+            #[inline]
+            fn compare_and_exchange(&self, old: $ty, new: $ty) -> bool {
+                self.0
+                    .compare_exchange(old, new, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst)
+                    .is_ok()
+            }
+
+            fn fetch_add(&self, delta: $ty) -> $ty {
+                self.0.fetch_add(delta, atomic::Ordering::SeqCst)
+            }
+        }
+    };
+}
+
+use std::sync::atomic;
+impl_atomic!(AtomicUsize, usize);
+impl_atomic!(AtomicU8, u8);
+impl_atomic!(AtomicU16, u16);
+impl_atomic!(AtomicU32, u32);
+impl_atomic!(AtomicU64, u64);
+impl_atomic!(AtomicIsize, isize);
+impl_atomic!(AtomicI8, i8);
+impl_atomic!(AtomicI16, i16);
+impl_atomic!(AtomicI32, i32);
+impl_atomic!(AtomicI64, i64);
