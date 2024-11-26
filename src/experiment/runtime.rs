@@ -10,9 +10,6 @@ pub(crate) type RwMutexWriteGuard<'a, R, T> =
 pub(crate) type Guard<'a, R, T> = <<R as Runtime>::Mutex<T> as Mutex<T>>::Guard<'a>;
 
 pub(crate) trait Runtime: 'static {
-    type Sender<T>: Sender<T>;
-    type Receiver<T>: Receiver<T>;
-
     type Timer: Timer;
     type TimerHandle: TimerHandle;
 
@@ -35,26 +32,13 @@ pub(crate) trait Runtime: 'static {
     type AtomicI32: Atomic<i32>;
     type AtomicI64: Atomic<i64>;
 
-    fn channel<T>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>);
-
     fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
 
     fn park();
 
-    fn sleep(time: std::time::Duration);
-
     fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle);
 
     fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()>;
-}
-
-pub(crate) trait Sender<T> {
-    fn send(&self, value: T);
-    fn close(&self);
-}
-
-pub(crate) trait Receiver<T> {
-    fn recv(&mut self) -> Option<T>;
 }
 
 pub(crate) trait Timer: Send {

@@ -6,9 +6,6 @@ use std::sync::Arc;
 pub(crate) struct OsRuntime;
 
 impl runtime::Runtime for OsRuntime {
-    type Sender<T> = OsSender<T>;
-    type Receiver<T> = OsReceiver<T>;
-
     type Timer = OsTimer;
     type TimerHandle = OsTimerHandle;
 
@@ -30,11 +27,6 @@ impl runtime::Runtime for OsRuntime {
     type AtomicI32 = AtomicI32;
     type AtomicI64 = AtomicI64;
 
-    fn channel<T>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>) {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(buffer);
-        (OsSender(sender), OsReceiver(receiver))
-    }
-
     fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
         let handle = std::thread::spawn(f);
         OsJoinHandle(handle)
@@ -42,10 +34,6 @@ impl runtime::Runtime for OsRuntime {
 
     fn park() {
         // no-op
-    }
-
-    fn sleep(time: std::time::Duration) {
-        std::thread::sleep(time)
     }
 
     fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
@@ -67,26 +55,6 @@ impl runtime::Runtime for OsRuntime {
 
     fn create_dir_all<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
         std::fs::create_dir_all(path.as_ref())
-    }
-}
-
-pub(crate) struct OsSender<T>(std::sync::mpsc::SyncSender<T>);
-
-impl<T> runtime::Sender<T> for OsSender<T> {
-    fn send(&self, value: T) {
-        todo!()
-    }
-
-    fn close(&self) {
-        todo!()
-    }
-}
-
-pub(crate) struct OsReceiver<T>(std::sync::mpsc::Receiver<T>);
-
-impl<T> runtime::Receiver<T> for OsReceiver<T> {
-    fn recv(&mut self) -> Option<T> {
-        todo!()
     }
 }
 

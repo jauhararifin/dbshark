@@ -1,8 +1,10 @@
 mod bins;
 mod content;
-mod os;
-mod runtime;
-mod pager;
 mod id;
 mod log;
+mod os;
+mod pager;
+mod runtime;
+mod simulation;
 mod wal;
+
