@@ -3,22 +3,22 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
-pub(crate) type RwMutexReadGuard<'a, R: Runtime, T> = <R::RwMutex<T> as RwMutex<T>>::ReadGuard<'a>;
-pub(crate) type RwMutexWriteGuard<'a, R: Runtime, T> =
-    <R::RwMutex<T> as RwMutex<T>>::WriteGuard<'a>;
-
-pub(crate) type Guard<'a, R: Runtime, T> = <R::Mutex<T> as Mutex<T>>::Guard<'a>;
+pub(crate) type RwMutexReadGuard<'a, R, T> =
+    <<R as Runtime>::RwMutex<T> as RwMutex<T>>::ReadGuard<'a>;
+pub(crate) type RwMutexWriteGuard<'a, R, T> =
+    <<R as Runtime>::RwMutex<T> as RwMutex<T>>::WriteGuard<'a>;
+pub(crate) type Guard<'a, R, T> = <<R as Runtime>::Mutex<T> as Mutex<T>>::Guard<'a>;
 
 pub(crate) trait Runtime: 'static {
     type Sender<T>: Sender<T>;
     type Receiver<T>: Receiver<T>;
 
-    type Timer: Timer + 'static;
-    type TimerHandle: TimerHandle + 'static;
+    type Timer: Timer;
+    type TimerHandle: TimerHandle;
 
-    type Mutex<T>: Mutex<T>;
+    type Mutex<T: Send + Sync>: Mutex<T>;
 
-    type RwMutex<T>: RwMutex<T>;
+    type RwMutex<T: Send + Sync>: RwMutex<T>;
 
     type JoinHandle: JoinHandle;
 
@@ -37,7 +37,7 @@ pub(crate) trait Runtime: 'static {
 
     fn channel<T>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>);
 
-    fn spawn<F>(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
+    fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
 
     fn park();
 
@@ -57,7 +57,7 @@ pub(crate) trait Receiver<T> {
     fn recv(&mut self) -> Option<T>;
 }
 
-pub(crate) trait Timer {
+pub(crate) trait Timer: Send {
     fn wait(&mut self) -> bool;
 }
 
@@ -66,17 +66,17 @@ pub(crate) trait TimerHandle: Clone {
     fn close(&self);
 }
 
-pub(crate) trait Mutex<T> {
+pub(crate) trait Mutex<T: Send + Sync>: Send + Sync {
     type Guard<'a>: DerefMut<Target = T>
     where
         Self: 'a;
 
     fn new(data: T) -> Self;
-    fn lock<'a>(&'a self) -> Self::Guard<'a>;
-    fn try_lock<'a>(&'a self) -> Option<Self::Guard<'a>>;
+    fn lock(& self) -> Self::Guard<'_>;
+    fn try_lock(& self) -> Option<Self::Guard<'_>>;
 }
 
-pub(crate) trait RwMutex<T> {
+pub(crate) trait RwMutex<T: Send + Sync>: Send + Sync {
     type ReadGuard<'a>: Deref<Target = T> + From<Self::WriteGuard<'a>>
     where
         Self: 'a;
@@ -86,18 +86,18 @@ pub(crate) trait RwMutex<T> {
 
     fn new(data: T) -> Self;
 
-    fn read<'a>(&'a self) -> Self::ReadGuard<'a>;
+    fn read(&self) -> Self::ReadGuard<'_>;
 
-    fn write<'a>(&'a self) -> Self::WriteGuard<'a>;
+    fn write(&self) -> Self::WriteGuard<'_>;
 
-    fn try_write<'a>(&'a self) -> Option<Self::WriteGuard<'a>>;
+    fn try_write(&self) -> Option<Self::WriteGuard<'_>>;
 }
 
 pub(crate) trait JoinHandle {
     fn join(self);
 }
 
-pub(crate) trait File: Sized {
+pub(crate) trait File: Sized + Send + Sync {
     fn open(path: impl AsRef<Path>) -> io::Result<Self>;
 
     fn metadata(&self) -> io::Result<fs::Metadata>;

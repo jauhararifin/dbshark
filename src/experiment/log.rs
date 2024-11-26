@@ -1,6 +1,6 @@
-use crate::bins::SliceExt;
-use crate::content::Bytes;
-use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId, TxIdExt};
+use super::bins::SliceExt;
+use super::content::Bytes;
+use super::id::{Lsn, LsnExt, PageId, PageIdExt, TxId, TxIdExt};
 use anyhow::anyhow;
 
 pub(crate) const WAL_HEADER_SIZE: usize = 32;

@@ -5,3 +5,4 @@ mod runtime;
 mod pager;
 mod id;
 mod log;
+mod wal;

@@ -12,8 +12,8 @@ impl runtime::Runtime for OsRuntime {
     type Timer = OsTimer;
     type TimerHandle = OsTimerHandle;
 
-    type Mutex<T> = OsMutex<T>;
-    type RwMutex<T> = OsRwMutex<T>;
+    type Mutex<T: Send + Sync> = OsMutex<T>;
+    type RwMutex<T: Send + Sync> = OsRwMutex<T>;
 
     type JoinHandle = OsJoinHandle;
 
@@ -35,7 +35,7 @@ impl runtime::Runtime for OsRuntime {
         (OsSender(sender), OsReceiver(receiver))
     }
 
-    fn spawn<F>(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
+    fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
         let handle = std::thread::spawn(f);
         OsJoinHandle(handle)
     }
@@ -121,7 +121,7 @@ impl runtime::Timer for OsTimer {
             state.trigger -= 1;
             return true;
         }
-        return true;
+        true
     }
 }
 
@@ -155,9 +155,9 @@ impl runtime::TimerHandle for OsTimerHandle {
     }
 }
 
-pub(crate) struct OsMutex<T>(parking_lot::Mutex<T>);
+pub(crate) struct OsMutex<T: Send + Sync>(parking_lot::Mutex<T>);
 
-impl<T> runtime::Mutex<T> for OsMutex<T> {
+impl<T: Send + Sync> runtime::Mutex<T> for OsMutex<T> {
     type Guard<'a> = OsMutexGuard<'a, T>
     where
         Self: 'a;
@@ -166,11 +166,11 @@ impl<T> runtime::Mutex<T> for OsMutex<T> {
         Self(parking_lot::Mutex::new(data))
     }
 
-    fn lock<'a>(&'a self) -> Self::Guard<'a> {
+    fn lock(&self) -> Self::Guard<'_> {
         OsMutexGuard(self.0.lock())
     }
 
-    fn try_lock<'a>(&'a self) -> Option<Self::Guard<'a>> {
+    fn try_lock(&self) -> Option<Self::Guard<'_>> {
         self.0.try_lock().map(OsMutexGuard)
     }
 }
@@ -191,9 +191,9 @@ impl<'a, T> DerefMut for OsMutexGuard<'a, T> {
     }
 }
 
-pub(crate) struct OsRwMutex<T>(parking_lot::RwLock<T>);
+pub(crate) struct OsRwMutex<T: Send + Sync>(parking_lot::RwLock<T>);
 
-impl<T> runtime::RwMutex<T> for OsRwMutex<T> {
+impl<T: Send + Sync> runtime::RwMutex<T> for OsRwMutex<T> {
     type ReadGuard<'a> = OsRwMutexReadGuard<'a,T>
     where
         T: 'a;
@@ -205,15 +205,15 @@ impl<T> runtime::RwMutex<T> for OsRwMutex<T> {
         Self(parking_lot::RwLock::new(data))
     }
 
-    fn read<'a>(&'a self) -> Self::ReadGuard<'a> {
+    fn read(&self) -> Self::ReadGuard<'_> {
         OsRwMutexReadGuard(self.0.read())
     }
 
-    fn write<'a>(&'a self) -> Self::WriteGuard<'a> {
+    fn write(&self) -> Self::WriteGuard<'_> {
         OsRwMutexWriteGuard(self.0.write())
     }
 
-    fn try_write<'a>(&'a self) -> Option<Self::WriteGuard<'a>> {
+    fn try_write(&self) -> Option<Self::WriteGuard<'_>> {
         self.0.try_write().map(OsRwMutexWriteGuard)
     }
 }
