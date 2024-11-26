@@ -7,4 +7,5 @@ mod pager;
 mod runtime;
 mod simulation;
 mod wal;
+mod recovery;
 

@@ -11,10 +11,13 @@ use anyhow::anyhow;
 use buffer::{BufferPool, ReadFrame, WriteFrame};
 use evictor::Evictor;
 use file_manager::FileManager;
-use log::{LogContext, WalSync};
-use page::{PageInternal, PageInternalWrite, PageKind, PageMeta, PageOps, PageWriteOps};
+use log::WalSync;
+use page::{PageInternal, PageInternalWrite, PageKind, PageMeta};
 use std::collections::HashMap;
 use std::path::Path;
+
+pub(crate) use log::LogContext;
+pub(crate) use page::{PageOps, PageWriteOps};
 
 extern crate log as logging;
 
