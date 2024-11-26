@@ -1,6 +1,7 @@
 mod bins;
 mod btree;
 mod content;
+mod db;
 mod id;
 mod log;
 mod os;

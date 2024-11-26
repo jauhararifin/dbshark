@@ -45,7 +45,7 @@ pub(crate) trait Timer: Send {
     fn wait(&mut self) -> bool;
 }
 
-pub(crate) trait TimerHandle: Clone {
+pub(crate) trait TimerHandle: Send + Sync + Clone {
     fn trigger(&self);
     fn close(&self);
 }
