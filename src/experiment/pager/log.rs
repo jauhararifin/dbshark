@@ -28,12 +28,23 @@ impl<R: Runtime> WalSync for LogContext<'_, R> {
     }
 }
 
-#[derive(Clone)]
 pub(crate) enum LogContext<'a, R: Runtime> {
     Runtime(&'a Wal<R>),
     Redo(Lsn),
     Undo(&'a Wal<R>, Lsn),
 }
+
+impl<'a, R: Runtime> Clone for LogContext<'a, R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Runtime(wal) => Self::Runtime(wal),
+            Self::Redo(lsn) => Self::Redo(*lsn),
+            Self::Undo(wal, lsn) => Self::Undo(wal, *lsn),
+        }
+    }
+}
+
+impl<'a, R: Runtime> Copy for LogContext<'a, R> {}
 
 impl<'a, R: Runtime> LogContext<'a, R> {
     pub(crate) fn record1<'e, F>(&self, entry: F) -> anyhow::Result<Lsn>

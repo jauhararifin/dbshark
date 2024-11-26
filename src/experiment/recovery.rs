@@ -213,7 +213,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
             }
 
             WalKind::AllocPage { txid, pgid } => {
-                let page = self.pager.alloc(&LogContext::Redo(lsn), txid)?;
+                let page = self.pager.alloc(LogContext::Redo(lsn), txid)?;
                 assert_eq!(page.id(), pgid);
             }
             WalKind::DeallocPage { txid, pgid } => {
@@ -361,13 +361,13 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                         "redo failed on leaf reset because page {pgid:?} is not a leaf"
                     ));
                 };
-                page.reset(&ctx)?;
+                page.reset(ctx)?;
             }
             WalKind::LeafSet { payload, .. } => {
                 page.set_leaf(ctx, payload.slice())?;
             }
             WalKind::LeafInit { .. } => {
-                page.init_leaf(&ctx)?;
+                page.init_leaf(ctx)?;
             }
             WalKind::LeafInsert {
                 index,
@@ -383,7 +383,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 let ok =
-                    page.insert_content(&ctx, index, &mut raw, key_size, value_size, overflow)?;
+                    page.insert_content(ctx, index, &mut raw, key_size, value_size, overflow)?;
                 if !ok {
                     return Err(anyhow!(
                     "redo failed on leaf insert because the content can't be inserted into page {pgid:?}"
@@ -396,7 +396,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                         "redo failed on leaf delete because page {pgid:?} is not a leaf"
                     ));
                 };
-                page.delete(&ctx, index)?;
+                page.delete(ctx, index)?;
             }
             WalKind::LeafSetOverflow {
                 index, overflow, ..
@@ -414,7 +414,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                         "redo failed on leaf set overflow because page {pgid:?} is not a leaf",
                     ));
                 };
-                page.set_next(&ctx, next)?;
+                page.set_next(ctx, next)?;
             }
 
             WalKind::OverflowReset { .. } | WalKind::OverflowResetForUndo { .. } => {
@@ -700,21 +700,21 @@ pub(crate) fn undo_txn<R: Runtime>(
                 let Some(page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.reset(&ctx)?;
+                page.reset(ctx)?;
             }
             WalKind::LeafInit { txid, pgid } => {
                 let page = pager.write(wal, txid, pgid)?;
                 let Some(page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
-                page.reset(&ctx)?;
+                page.reset(ctx)?;
             }
             WalKind::LeafInsert { pgid, index, .. } => {
                 let page = pager.write(wal, txid, pgid)?;
                 let Some(mut page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
-                page.delete(&ctx, index)?;
+                page.delete(ctx, index)?;
             }
             WalKind::LeafDelete {
                 txid,
@@ -730,7 +730,7 @@ pub(crate) fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 let ok = page.insert_content(
-                    &ctx,
+                    ctx,
                     index,
                     &mut Bytes::new(old_raw.slice()),
                     old_key_size,
@@ -759,7 +759,7 @@ pub(crate) fn undo_txn<R: Runtime>(
                 let Some(mut page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
-                page.set_next(&ctx, old_next)?;
+                page.set_next(ctx, old_next)?;
             }
 
             WalKind::OverflowReset {

@@ -587,7 +587,7 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
 
     fn init_leaf<R: Runtime>(
         mut self,
-        ctx: &LogContext<'_, R>,
+        ctx: LogContext<'_, R>,
     ) -> anyhow::Result<LeafPageWrite<Self>> {
         let page_size = self.internal().buffer.len();
         if let PageKind::None = self.internal().meta.kind {
@@ -1317,7 +1317,7 @@ impl<'a, T> LeafPageWrite<T>
 where
     T: PageWriteOps<'a>,
 {
-    pub(crate) fn reset<R: Runtime>(mut self, ctx: &LogContext<'_, R>) -> anyhow::Result<T> {
+    pub(crate) fn reset<R: Runtime>(mut self, ctx: LogContext<'_, R>) -> anyhow::Result<T> {
         let pgid = self.id();
         let internal = self.internal_mut();
         internal.meta.encode(internal.buffer)?;
@@ -1331,7 +1331,7 @@ where
 
     pub(crate) fn delete<R: Runtime>(
         &mut self,
-        ctx: &LogContext<'_, R>,
+        ctx: LogContext<'_, R>,
         index: usize,
     ) -> anyhow::Result<()> {
         let pgid = self.id();
@@ -1384,7 +1384,7 @@ where
 
     pub(crate) fn set_next<R: Runtime>(
         &mut self,
-        ctx: &LogContext<'_, R>,
+        ctx: LogContext<'_, R>,
         new_next: Option<PageId>,
     ) -> anyhow::Result<()> {
         let pgid = self.id();
@@ -1497,7 +1497,7 @@ where
 
     pub(crate) fn insert_content<R: Runtime>(
         &mut self,
-        ctx: &LogContext<'_, R>,
+        ctx: LogContext<'_, R>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,

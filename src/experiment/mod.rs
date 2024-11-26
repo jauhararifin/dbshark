@@ -1,11 +1,11 @@
 mod bins;
+mod btree;
 mod content;
 mod id;
 mod log;
 mod os;
 mod pager;
+mod recovery;
 mod runtime;
 mod simulation;
 mod wal;
-mod recovery;
-

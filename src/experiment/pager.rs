@@ -16,8 +16,11 @@ use page::{PageInternal, PageInternalWrite, PageKind, PageMeta};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub(crate) use log::LogContext;
-pub(crate) use page::{PageOps, PageWriteOps};
+pub(crate) use crate::experiment::pager::log::LogContext;
+pub(crate) use page::{
+    BTreeCell, InteriorPage, InteriorPageWrite, LeafCell, LeafPage, LeafPageRead, LeafPageWrite,
+    OverflowPage, OverflowPageRead, PageOps, PageWriteOps,
+};
 
 extern crate log as logging;
 
@@ -202,7 +205,7 @@ impl<R: Runtime> Pager<R> {
 
     pub(crate) fn alloc(
         &self,
-        ctx: &LogContext<'_, R>,
+        ctx: LogContext<'_, R>,
         txid: TxId,
     ) -> anyhow::Result<PageWrite<R>> {
         logging::trace!("alloc {txid:?}");
@@ -226,7 +229,7 @@ impl<R: Runtime> Pager<R> {
             let old_pgid = frame.meta.id;
             if dirty {
                 let mut file = self.file.write();
-                file.spill(ctx, frame.meta, frame.buffer)?;
+                file.spill(&ctx, frame.meta, frame.buffer)?;
             }
             *frame.meta = PageMeta::init(pgid, lsn);
             internal.page_to_frame.remove(&old_pgid);
@@ -408,14 +411,14 @@ mod tests {
 
         for i in 0..20 {
             let ctx = LogContext::<OsRuntime>::Redo(Lsn::new(1));
-            let page = pager.alloc(&ctx, txid).unwrap();
+            let page = pager.alloc(ctx, txid).unwrap();
             assert_eq!(i, page.id().get());
-            let mut leaf = page.init_leaf(&ctx).unwrap();
+            let mut leaf = page.init_leaf(ctx).unwrap();
             for j in 0..5 {
-                leaf.insert_content::<OsRuntime>(&ctx, j, &mut Bytes::new(b"abc"), 3, 0, None)
+                leaf.insert_content::<OsRuntime>(ctx, j, &mut Bytes::new(b"abc"), 3, 0, None)
                     .unwrap();
             }
-            leaf.set_next(&ctx, PageId::new(5)).unwrap();
+            leaf.set_next(ctx, PageId::new(5)).unwrap();
         }
 
         for i in (0..20).rev() {
@@ -424,11 +427,11 @@ mod tests {
                 .unwrap();
             let ctx = LogContext::<OsRuntime>::Redo(Lsn::new(1));
             let mut leaf = page.into_write_leaf().unwrap();
-            leaf.set_next(&ctx, None).unwrap();
+            leaf.set_next(ctx, None).unwrap();
             for j in (0..5).rev() {
-                leaf.delete(&ctx, j).unwrap();
+                leaf.delete(ctx, j).unwrap();
             }
-            leaf.reset(&ctx).unwrap();
+            leaf.reset(ctx).unwrap();
         }
     }
 }
