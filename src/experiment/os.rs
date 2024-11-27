@@ -41,6 +41,7 @@ impl runtime::Runtime for OsRuntime {
         let m = Arc::new(parking_lot::Mutex::new(TimerState {
             trigger: 0,
             closed: false,
+            last_run: std::time::Instant::now(),
         }));
 
         (
@@ -67,6 +68,7 @@ pub(crate) struct OsTimer {
 struct TimerState {
     trigger: usize,
     closed: bool,
+    last_run: std::time::Instant,
 }
 
 impl runtime::Timer for OsTimer {
@@ -77,18 +79,29 @@ impl runtime::Timer for OsTimer {
         }
         if state.trigger > 0 {
             state.trigger -= 1;
+            state.last_run = std::time::Instant::now();
             return true;
         }
 
-        self.cond.wait_for(&mut state, self.duration);
+        let elapsed = state.last_run.elapsed();
+        if elapsed > self.duration {
+            state.last_run = std::time::Instant::now();
+            return true;
+        }
+
+        let result = self.cond.wait_for(&mut state, self.duration - elapsed);
 
         if state.closed {
             return false;
         }
         if state.trigger > 0 {
             state.trigger -= 1;
+            state.last_run = std::time::Instant::now();
             return true;
         }
+
+        assert!(result.timed_out());
+        state.last_run = std::time::Instant::now();
         true
     }
 }
