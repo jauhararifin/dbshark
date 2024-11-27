@@ -25,7 +25,7 @@ mod bins;
 mod btree;
 mod content;
 mod db;
-mod experiment;
+pub mod experiment;
 mod file_lock;
 mod id;
 mod log;

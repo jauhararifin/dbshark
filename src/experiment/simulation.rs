@@ -9,8 +9,52 @@ use std::sync::Arc;
 
 thread_local! {
     static RUNTIME: RefCell<Option<SimulatedRuntime>> = RefCell::default();
-    static THREAD_ID: Cell<usize> = Cell::new(1);
+    static THREAD_ID: Cell<ThreadId> = Cell::default();
     static THREAD_WAITER: RefCell<Option<std::sync::mpsc::Receiver<()>>> = RefCell::default();
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ThreadId(usize);
+
+impl ThreadId {
+    fn next(&mut self) -> ThreadId {
+        self.0 += 1;
+        *self
+    }
+}
+
+impl log::kv::ToValue for ThreadId {
+    fn to_value(&self) -> log::kv::Value {
+        log::kv::Value::from_display(self)
+    }
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "thread#{}", self.0)
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MutexId(usize);
+
+impl MutexId {
+    fn next(&mut self) -> MutexId {
+        self.0 += 1;
+        *self
+    }
+}
+
+impl log::kv::ToValue for MutexId {
+    fn to_value(&self) -> log::kv::Value {
+        log::kv::Value::from_display(self)
+    }
+}
+
+impl std::fmt::Display for MutexId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mutex#{}", self.0)
+    }
 }
 
 pub(crate) struct SimulatedRuntime {
@@ -18,15 +62,17 @@ pub(crate) struct SimulatedRuntime {
 }
 
 struct Internal {
-    thread_id: usize,
-    ready: Vec<usize>,
-    active_threads: HashSet<usize>,
-    panicked_threads: Vec<usize>,
-    waker: HashMap<usize, std::sync::mpsc::SyncSender<()>>,
+    thread_id: ThreadId,
+    ready: Vec<ThreadId>,
+    active_threads: HashSet<ThreadId>,
+    panicked_threads: Vec<ThreadId>,
+    waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<()>>,
     // joining maps from joined thread to the list joining threads.
     // k -> v0, v1, v2... means v0, v1, and v2 waiting for
     // k to finish
-    joining: HashMap<usize, IndexSet<usize>>,
+    joining: HashMap<ThreadId, IndexSet<ThreadId>>,
+    mutex_id: MutexId,
+    mutex_wait: HashMap<MutexId, IndexSet<ThreadId>>,
     rng: StdRng,
 }
 
@@ -57,8 +103,7 @@ impl Runtime for SimulatedRuntime {
 
         let thread_id = RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-            r.thread_id += 1;
-            r.thread_id
+            r.thread_id.next()
         });
         log::trace!(thread_id; "spawning_thread");
 
@@ -101,28 +146,21 @@ impl Runtime for SimulatedRuntime {
             r.ready.push(thread_id);
         });
 
-        resume_any();
-
-        THREAD_WAITER.with_borrow(|w| {
-            w.as_ref()
-                .expect("waiter should exists")
-                .recv()
-                .expect("waiting a thread should never fail")
-        });
+        switch();
         log::trace!(thread_id=THREAD_ID.get(); "thread_resumed");
     }
 
-    fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
+    fn timer(_duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
         todo!();
     }
 
-    fn create_dir_all<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
-        todo!();
+    fn create_dir_all<P: AsRef<std::path::Path>>(_path: P) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
 struct SpawnCleanup {
-    thread_id: usize,
+    thread_id: ThreadId,
 }
 
 impl Drop for SpawnCleanup {
@@ -156,17 +194,20 @@ impl SimulatedRuntime {
     pub(crate) fn run(seed: u64, f: impl FnOnce() + Send + 'static) {
         let r = Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
-                thread_id: 1,
+                thread_id: ThreadId(1),
                 ready: vec![],
                 active_threads: HashSet::default(),
                 panicked_threads: Vec::default(),
                 waker: HashMap::default(),
                 joining: HashMap::default(),
+                mutex_id: MutexId::default(),
+                mutex_wait: HashMap::default(),
                 rng: rand::rngs::StdRng::seed_from_u64(seed),
             })),
         };
 
-        let thread_id = 1;
+        let thread_id = ThreadId(1);
+        THREAD_ID.set(thread_id);
         log::trace!(thread_id; "spawn_root");
 
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
@@ -186,7 +227,7 @@ impl SimulatedRuntime {
 }
 
 struct RunCleanup {
-    thread_id: usize,
+    thread_id: ThreadId,
 }
 
 impl Drop for RunCleanup {
@@ -227,7 +268,7 @@ impl Drop for RunCleanup {
     }
 }
 
-fn resume_any() -> Option<usize> {
+fn resume_any() -> Option<ThreadId> {
     let (id, waker) = RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
         if r.ready.is_empty() {
@@ -265,14 +306,6 @@ impl Drop for SimulatedRuntime {
     }
 }
 
-pub(crate) struct RuntimeGuard;
-
-impl Drop for RuntimeGuard {
-    fn drop(&mut self) {
-        RUNTIME.set(None);
-    }
-}
-
 pub(crate) struct SimulatedTimer {}
 
 impl runtime::Timer for SimulatedTimer {
@@ -299,7 +332,11 @@ impl runtime::TimerHandle for SimulatedTimerHandle {
     }
 }
 
-pub(crate) struct SimulatedMutex<T: Send + Sync>(std::marker::PhantomData<T>);
+pub(crate) struct SimulatedMutex<T: Send + Sync> {
+    id: MutexId,
+    locker: parking_lot::Mutex<Option<ThreadId>>,
+    value: parking_lot::Mutex<T>,
+}
 
 impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
     type Guard<'a> = SimulatedMutexGuard<'a, T>
@@ -307,11 +344,46 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
         Self: 'a;
 
     fn new(data: T) -> Self {
-        todo!();
+        let mutex_id = RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            r.mutex_id.next()
+        });
+
+        Self {
+            id: mutex_id,
+            locker: parking_lot::Mutex::new(None),
+            value: parking_lot::Mutex::new(data),
+        }
     }
 
     fn lock(&self) -> Self::Guard<'_> {
-        todo!();
+        SimulatedRuntime::park();
+
+        {
+            let current = THREAD_ID.get();
+            let mut locker = self.locker.lock();
+            if let Some(_) = *locker {
+                drop(locker);
+                enqueue_mutex(self.id);
+                switch();
+            } else {
+                *locker = Some(current);
+            }
+        }
+
+        SimulatedRuntime::park();
+
+        SimulatedMutexGuard {
+            id: self.id,
+            locker: self
+                .locker
+                .try_lock()
+                .expect("at this phase, locking should success without blocking"),
+            guard: self
+                .value
+                .try_lock()
+                .expect("at this phase, locking should success without blocking"),
+        }
     }
 
     fn try_lock(&self) -> Option<Self::Guard<'_>> {
@@ -319,19 +391,37 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
     }
 }
 
-pub(crate) struct SimulatedMutexGuard<'a, T>(std::marker::PhantomData<&'a T>);
+pub(crate) struct SimulatedMutexGuard<'a, T: Send + Sync> {
+    id: MutexId,
+    locker: parking_lot::MutexGuard<'a, Option<ThreadId>>,
+    guard: parking_lot::MutexGuard<'a, T>,
+}
 
-impl<'a, T> Deref for SimulatedMutexGuard<'a, T> {
+impl<'a, T: Send + Sync> Deref for SimulatedMutexGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        todo!();
+        self.guard.deref()
     }
 }
 
-impl<'a, T> DerefMut for SimulatedMutexGuard<'a, T> {
+impl<'a, T: Send + Sync> DerefMut for SimulatedMutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        todo!();
+        self.guard.deref_mut()
+    }
+}
+
+impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
+    fn drop(&mut self) {
+        *self.locker = None;
+        RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            if let Some(s) = r.mutex_wait.remove(&self.id) {
+                for t in s {
+                    r.ready.push(t);
+                }
+            }
+        });
     }
 }
 
@@ -345,7 +435,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
     where
         T: 'a;
 
-    fn new(data: T) -> Self {
+    fn new(_data: T) -> Self {
         todo!();
     }
 
@@ -373,7 +463,7 @@ impl<'a, T> Deref for SimulatedRwMutexReadGuard<'a, T> {
 }
 
 impl<'a, T> From<SimulatedRwMutexWriteGuard<'a, T>> for SimulatedRwMutexReadGuard<'a, T> {
-    fn from(value: SimulatedRwMutexWriteGuard<'a, T>) -> Self {
+    fn from(_value: SimulatedRwMutexWriteGuard<'a, T>) -> Self {
         todo!()
     }
 }
@@ -394,7 +484,7 @@ impl<'a, T> DerefMut for SimulatedRwMutexWriteGuard<'a, T> {
     }
 }
 
-pub(crate) struct SimulatedJoinHandle(usize);
+pub(crate) struct SimulatedJoinHandle(ThreadId);
 
 impl runtime::JoinHandle for SimulatedJoinHandle {
     fn join(self) {
@@ -403,37 +493,65 @@ impl runtime::JoinHandle for SimulatedJoinHandle {
 
         let thread_id = self.0;
         let already_exit = RUNTIME.with_borrow(|r| {
-            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let r = r.as_ref().expect("runtime should be valid").internal.lock();
             if !r.active_threads.contains(&self.0) {
-                return true;
+                true
+            } else {
+                false
             }
 
-            let this_thread = THREAD_ID.get();
-            r.joining.entry(thread_id).or_default().insert(this_thread);
-            false
+            //let this_thread = THREAD_ID.get();
+            //r.joining.entry(thread_id).or_default().insert(this_thread);
+            //false
         });
 
         if already_exit {
             log::trace!(source=THREAD_ID.get(), target=self.0; "join_target_already_exit");
-            return;
+        } else {
+            enqueue_join(thread_id);
+            switch();
         }
-
-        resume_any().expect("all thread are sleeping, a sign of deadlock");
-
-        THREAD_WAITER.with_borrow(|w| {
-            w.as_ref()
-                .expect("waiter should exists")
-                .recv()
-                .expect("waiting a thread should never fail")
-        });
     }
+}
+
+fn switch() {
+    resume_any().expect("all thread are sleeping, a sign of deadlock");
+    sleep();
+}
+
+fn sleep() {
+    THREAD_WAITER.with_borrow(|w| {
+        w.as_ref()
+            .expect("waiter should exists")
+            .recv()
+            .expect("waiting a thread should never fail")
+    });
+}
+
+fn enqueue_join(thread_id: ThreadId) {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        let this_thread = THREAD_ID.get();
+        r.joining.entry(thread_id).or_default().insert(this_thread);
+    });
+}
+
+fn enqueue_mutex(mutex_id: MutexId) {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        let this_thread = THREAD_ID.get();
+        r.mutex_wait
+            .entry(mutex_id)
+            .or_default()
+            .insert(this_thread);
+    });
 }
 
 pub(crate) struct SimulatedFile;
 
 impl runtime::File for SimulatedFile {
     #[inline]
-    fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+    fn open(_path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         todo!();
     }
 
@@ -443,22 +561,22 @@ impl runtime::File for SimulatedFile {
     }
 
     #[inline]
-    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<()> {
+    fn seek(&mut self, _position: std::io::SeekFrom) -> std::io::Result<()> {
         todo!();
     }
 
     #[inline]
-    fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, _buff: &mut [u8]) -> std::io::Result<usize> {
         todo!();
     }
 
     #[inline]
-    fn read_exact(&mut self, buff: &mut [u8]) -> std::io::Result<()> {
+    fn read_exact(&mut self, _buff: &mut [u8]) -> std::io::Result<()> {
         todo!();
     }
 
     #[inline]
-    fn write_all(&mut self, buff: &[u8]) -> std::io::Result<()> {
+    fn write_all(&mut self, _buff: &[u8]) -> std::io::Result<()> {
         todo!();
     }
 
@@ -468,7 +586,7 @@ impl runtime::File for SimulatedFile {
     }
 
     #[inline]
-    fn truncate(&mut self, size: u64) -> std::io::Result<()> {
+    fn truncate(&mut self, _size: u64) -> std::io::Result<()> {
         todo!();
     }
 }
@@ -579,6 +697,32 @@ mod tests {
             handle2.join();
 
             assert_eq!(100000, a.load());
+        });
+    }
+
+    #[test]
+    fn test_3() {
+        setup();
+        SimulatedRuntime::run(0, || {
+            let a = Arc::new(SimulatedMutex::new(0));
+            let x = a.clone();
+            let handle1 = SimulatedRuntime::spawn(move || {
+                for _ in 0..10000 {
+                    let mut y = x.lock();
+                    *y += 20;
+                }
+            });
+            let x = a.clone();
+            let handle2 = SimulatedRuntime::spawn(move || {
+                for _ in 0..10000 {
+                    let mut y = x.lock();
+                    *y -= 10;
+                }
+            });
+            handle1.join();
+            handle2.join();
+
+            assert_eq!(100000, *a.lock());
         });
     }
 }

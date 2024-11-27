@@ -10,3 +10,5 @@ mod recovery;
 mod runtime;
 mod simulation;
 mod wal;
+
+pub use db::{Db, Setting};
