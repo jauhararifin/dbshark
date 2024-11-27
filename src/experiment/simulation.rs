@@ -191,6 +191,7 @@ impl Drop for SpawnCleanup {
 }
 
 impl SimulatedRuntime {
+    #[allow(unused)]
     pub(crate) fn run(seed: u64, f: impl FnOnce() + Send + 'static) {
         let r = Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
@@ -323,10 +324,6 @@ impl Clone for SimulatedTimerHandle {
 
 impl runtime::TimerHandle for SimulatedTimerHandle {
     fn trigger(&self) {
-        todo!();
-    }
-
-    fn close(&self) {
         todo!();
     }
 }
@@ -600,13 +597,6 @@ macro_rules! impl_atomic {
                 let val = *self.0.lock();
                 SimulatedRuntime::park();
                 val
-            }
-
-            #[inline]
-            fn store(&self, value: $ty) {
-                SimulatedRuntime::park();
-                *self.0.lock() = value;
-                SimulatedRuntime::park();
             }
 
             #[inline]

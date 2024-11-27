@@ -127,13 +127,6 @@ impl runtime::TimerHandle for OsTimerHandle {
         drop(state);
         self.cond.notify_one();
     }
-
-    fn close(&self) {
-        let mut state = self.m.lock();
-        state.closed = true;
-        drop(state);
-        self.cond.notify_one();
-    }
 }
 
 pub(crate) struct OsMutex<T: Send + Sync>(parking_lot::Mutex<T>);
@@ -319,11 +312,6 @@ macro_rules! impl_atomic {
             #[inline]
             fn load(&self) -> $ty {
                 self.0.load(atomic::Ordering::SeqCst)
-            }
-
-            #[inline]
-            fn store(&self, value: $ty) {
-                self.0.store(value, atomic::Ordering::SeqCst);
             }
 
             #[inline]

@@ -44,7 +44,6 @@ pub trait Timer: Send {
 
 pub trait TimerHandle: Send + Sync + Clone {
     fn trigger(&self);
-    fn close(&self);
 }
 
 pub trait Mutex<T: Send + Sync>: Send + Sync {
@@ -99,7 +98,6 @@ pub trait File: Sized + Send + Sync {
 pub trait Atomic<T> {
     fn new(value: T) -> Self;
     fn load(&self) -> T;
-    fn store(&self, value: T);
     fn compare_and_exchange(&self, old: T, new: T) -> bool;
     fn fetch_add(&self, delta: T) -> T;
 }
