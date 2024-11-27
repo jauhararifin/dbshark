@@ -147,7 +147,7 @@ impl Runtime for SimulatedRuntime {
         });
 
         switch();
-        log::trace!(thread_id=THREAD_ID.get(); "thread_resumed");
+        log::trace!(thread_id; "thread_resumed");
     }
 
     fn timer(_duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
@@ -275,7 +275,6 @@ fn resume_any() -> Option<ThreadId> {
             return None;
         }
         let resuming_thread_index = r.rng.next_u64() as usize % r.ready.len();
-
         let resuming_thread_id = r.ready.remove(resuming_thread_index);
         log::trace!(thread_id=resuming_thread_id; "thread_resuming");
         let waker = r
@@ -359,30 +358,27 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
     fn lock(&self) -> Self::Guard<'_> {
         SimulatedRuntime::park();
 
-        {
+        loop {
             let current = THREAD_ID.get();
             let mut locker = self.locker.lock();
-            if let Some(_) = *locker {
+            if let Some(blocker) = *locker {
                 drop(locker);
+                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,blocker; "mutex_acquiring_blocked");
                 enqueue_mutex(self.id);
                 switch();
             } else {
                 *locker = Some(current);
+                break;
             }
         }
 
         SimulatedRuntime::park();
 
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_acquired");
         SimulatedMutexGuard {
             id: self.id,
-            locker: self
-                .locker
-                .try_lock()
-                .expect("at this phase, locking should success without blocking"),
-            guard: self
-                .value
-                .try_lock()
-                .expect("at this phase, locking should success without blocking"),
+            locker: &self.locker,
+            guard: self.value.lock(),
         }
     }
 
@@ -393,7 +389,7 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
 
 pub(crate) struct SimulatedMutexGuard<'a, T: Send + Sync> {
     id: MutexId,
-    locker: parking_lot::MutexGuard<'a, Option<ThreadId>>,
+    locker: &'a parking_lot::Mutex<Option<ThreadId>>,
     guard: parking_lot::MutexGuard<'a, T>,
 }
 
@@ -413,7 +409,12 @@ impl<'a, T: Send + Sync> DerefMut for SimulatedMutexGuard<'a, T> {
 
 impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
     fn drop(&mut self) {
-        *self.locker = None;
+        SimulatedRuntime::park();
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released");
+        {
+            *self.locker.lock() = None;
+        }
         RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             if let Some(s) = r.mutex_wait.remove(&self.id) {
@@ -488,21 +489,14 @@ pub(crate) struct SimulatedJoinHandle(ThreadId);
 
 impl runtime::JoinHandle for SimulatedJoinHandle {
     fn join(self) {
-        log::trace!(source=THREAD_ID.get(), target=self.0;"join");
         SimulatedRuntime::park();
+
+        log::trace!(source=THREAD_ID.get(), target=self.0;"join");
 
         let thread_id = self.0;
         let already_exit = RUNTIME.with_borrow(|r| {
             let r = r.as_ref().expect("runtime should be valid").internal.lock();
-            if !r.active_threads.contains(&self.0) {
-                true
-            } else {
-                false
-            }
-
-            //let this_thread = THREAD_ID.get();
-            //r.joining.entry(thread_id).or_default().insert(this_thread);
-            //false
+            !r.active_threads.contains(&self.0)
         });
 
         if already_exit {
@@ -708,21 +702,47 @@ mod tests {
             let x = a.clone();
             let handle1 = SimulatedRuntime::spawn(move || {
                 for _ in 0..10000 {
+                    SimulatedRuntime::park();
                     let mut y = x.lock();
-                    *y += 20;
+                    SimulatedRuntime::park();
+                    let new_y = *y + 20;
+                    SimulatedRuntime::park();
+                    *y = new_y;
+                    SimulatedRuntime::park();
                 }
             });
+
             let x = a.clone();
             let handle2 = SimulatedRuntime::spawn(move || {
                 for _ in 0..10000 {
+                    SimulatedRuntime::park();
                     let mut y = x.lock();
-                    *y -= 10;
+                    SimulatedRuntime::park();
+                    let new_y = *y - 10;
+                    SimulatedRuntime::park();
+                    *y = new_y;
+                    SimulatedRuntime::park();
                 }
             });
+
+            let x = a.clone();
+            let handle3 = SimulatedRuntime::spawn(move || {
+                for _ in 0..10000 {
+                    SimulatedRuntime::park();
+                    let mut y = x.lock();
+                    SimulatedRuntime::park();
+                    let new_y = *y + 1;
+                    SimulatedRuntime::park();
+                    *y = new_y;
+                    SimulatedRuntime::park();
+                }
+            });
+
             handle1.join();
             handle2.join();
+            handle3.join();
 
-            assert_eq!(100000, *a.lock());
+            assert_eq!(110_000, *a.lock());
         });
     }
 }
