@@ -57,6 +57,28 @@ impl std::fmt::Display for MutexId {
     }
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct RwMutexId(usize);
+
+impl RwMutexId {
+    fn next(&mut self) -> RwMutexId {
+        self.0 += 1;
+        *self
+    }
+}
+
+impl log::kv::ToValue for RwMutexId {
+    fn to_value(&self) -> log::kv::Value {
+        log::kv::Value::from_display(self)
+    }
+}
+
+impl std::fmt::Display for RwMutexId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rwmutex#{}", self.0)
+    }
+}
+
 pub(crate) struct SimulatedRuntime {
     internal: Arc<parking_lot::Mutex<Internal>>,
 }
@@ -67,12 +89,17 @@ struct Internal {
     active_threads: HashSet<ThreadId>,
     panicked_threads: Vec<ThreadId>,
     waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<()>>,
+
     // joining maps from joined thread to the list joining threads.
     // k -> v0, v1, v2... means v0, v1, and v2 waiting for
     // k to finish
     joining: HashMap<ThreadId, IndexSet<ThreadId>>,
     mutex_id: MutexId,
     mutex_wait: HashMap<MutexId, IndexSet<ThreadId>>,
+    rwmutex_id: RwMutexId,
+    rwmutex_read_wait: HashMap<RwMutexId, IndexSet<ThreadId>>,
+    rwmutex_write_wait: HashMap<RwMutexId, IndexSet<ThreadId>>,
+
     rng: StdRng,
 }
 
@@ -173,7 +200,7 @@ impl Drop for SpawnCleanup {
             });
         }
 
-        SimulatedRuntime::park();
+        park();
 
         log::trace!(thread_id=self.thread_id; "thread_finished");
         RUNTIME.with_borrow(|r| {
@@ -203,6 +230,9 @@ impl SimulatedRuntime {
                 joining: HashMap::default(),
                 mutex_id: MutexId::default(),
                 mutex_wait: HashMap::default(),
+                rwmutex_id: RwMutexId::default(),
+                rwmutex_read_wait: HashMap::default(),
+                rwmutex_write_wait: HashMap::default(),
                 rng: rand::rngs::StdRng::seed_from_u64(seed),
             })),
         };
@@ -353,7 +383,7 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
     }
 
     fn lock(&self) -> Self::Guard<'_> {
-        SimulatedRuntime::park();
+        park();
 
         loop {
             let current = THREAD_ID.get();
@@ -369,7 +399,7 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
             }
         }
 
-        SimulatedRuntime::park();
+        park();
 
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_acquired");
         SimulatedMutexGuard {
@@ -406,7 +436,7 @@ impl<'a, T: Send + Sync> DerefMut for SimulatedMutexGuard<'a, T> {
 
 impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
     fn drop(&mut self) {
-        SimulatedRuntime::park();
+        park();
 
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released");
         {
@@ -423,7 +453,24 @@ impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
     }
 }
 
-pub(crate) struct SimulatedRwMutex<T: Send + Sync>(std::marker::PhantomData<T>);
+pub(crate) struct SimulatedRwMutex<T: Send + Sync> {
+    id: RwMutexId,
+    locker: parking_lot::Mutex<RwMutexState>,
+    value: parking_lot::RwLock<T>,
+}
+
+enum RwMutexState {
+    // It's in read state. reading this rwmutex shouldn't be blocked
+    Read(usize),
+    // It's in read state, but a writer is trying to write it.
+    // To avoid starvation, any further read is blocked until this
+    // writer get a chance to write
+    ReadBlocked(usize),
+    // It's in write state, no other thread should be able to lock
+    Write(ThreadId),
+    // It's unlocked
+    Unlocked,
+}
 
 impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
     type ReadGuard<'a> = SimulatedRwMutexReadGuard<'a,T>
@@ -433,30 +480,159 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
     where
         T: 'a;
 
-    fn new(_data: T) -> Self {
-        todo!();
+    fn new(data: T) -> Self {
+        let rwmutex_id = RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            r.rwmutex_id.next()
+        });
+
+        Self {
+            id: rwmutex_id,
+            locker: parking_lot::Mutex::new(RwMutexState::Unlocked),
+            value: parking_lot::RwLock::new(data),
+        }
     }
 
     fn read(&self) -> Self::ReadGuard<'_> {
-        todo!();
+        park();
+
+        loop {
+            let current = THREAD_ID.get();
+            let mut locker = self.locker.lock();
+            match *locker {
+                RwMutexState::Read(n) => {
+                    *locker = RwMutexState::Read(n + 1);
+                    break;
+                }
+                RwMutexState::ReadBlocked(_) => {
+                    drop(locker);
+                    log::trace!(thread_id=current,rwmutex_id=self.id; "rwmutex_read_acquiring_blocked_1");
+                    enqueue_rwmutex_for_read(self.id);
+                    switch();
+                }
+                RwMutexState::Write(writer) => {
+                    drop(locker);
+                    log::trace!(thread_id=current,rwmutex_id=self.id,writer; "rwmutex_read_acquiring_blocked_2");
+                    enqueue_rwmutex_for_read(self.id);
+                    switch();
+                }
+                RwMutexState::Unlocked => {
+                    *locker = RwMutexState::Read(1);
+                    break;
+                }
+            }
+        }
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_read_acquired");
+
+        park();
+        SimulatedRwMutexReadGuard {
+            id: self.id,
+            locker: &self.locker,
+            guard: self.value.read(),
+        }
     }
 
     fn write(&self) -> Self::WriteGuard<'_> {
-        todo!();
+        park();
+
+        loop {
+            let current = THREAD_ID.get();
+            let mut locker = self.locker.lock();
+            match *locker {
+                RwMutexState::Read(n) => {
+                    log::trace!(thread_id=current,rwmutex_id=self.id; "rwmutex_write_acquiring_blocked_1");
+                    *locker = RwMutexState::ReadBlocked(n);
+                    drop(locker);
+                    enqueue_rwmutex_for_write(self.id);
+                    switch();
+                }
+                RwMutexState::ReadBlocked(_) | RwMutexState::Write(_) => {
+                    log::trace!(thread_id=current,rwmutex_id=self.id; "rwmutex_write_acquiring_blocked_2");
+                    drop(locker);
+                    enqueue_rwmutex_for_write(self.id);
+                    switch();
+                }
+                RwMutexState::Unlocked => {
+                    *locker = RwMutexState::Write(current);
+                    break;
+                }
+            }
+        }
+
+        park();
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_write_acquired");
+        SimulatedRwMutexWriteGuard {
+            id: self.id,
+            locker: &self.locker,
+            guard: self.value.write(),
+        }
     }
 
     fn try_write(&self) -> Option<Self::WriteGuard<'_>> {
-        todo!();
+        park();
+
+        let current = THREAD_ID.get();
+        let mut locker = self.locker.lock();
+        match *locker {
+            RwMutexState::Read(_) | RwMutexState::ReadBlocked(_) | RwMutexState::Write(_) => {
+                return None;
+            }
+            RwMutexState::Unlocked => {
+                *locker = RwMutexState::Write(current);
+            }
+        }
+
+        park();
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_try_write_acquired");
+        Some(SimulatedRwMutexWriteGuard {
+            id: self.id,
+            locker: &self.locker,
+            guard: self.value.write(),
+        })
     }
 }
 
-pub(crate) struct SimulatedRwMutexReadGuard<'a, T>(std::marker::PhantomData<&'a T>);
+pub(crate) struct SimulatedRwMutexReadGuard<'a, T> {
+    id: RwMutexId,
+    locker: &'a parking_lot::Mutex<RwMutexState>,
+    guard: parking_lot::RwLockReadGuard<'a, T>,
+}
+
+impl<'a, T> Drop for SimulatedRwMutexReadGuard<'a, T> {
+    fn drop(&mut self) {
+        park();
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_read_released");
+        let mut state = self.locker.lock();
+        let is_last_reader = {
+            match *state {
+                RwMutexState::Read(n) => {
+                    *state = RwMutexState::Read(n - 1);
+                    n == 1
+                }
+                RwMutexState::ReadBlocked(n) => {
+                    *state = RwMutexState::ReadBlocked(n - 1);
+                    n == 1
+                }
+                _ => unreachable!("cannot release non acquired rw mutex"),
+            }
+        };
+
+        if is_last_reader {
+            *state = RwMutexState::Unlocked;
+            release_all_rwmutex_waiter(self.id);
+        }
+    }
+}
 
 impl<'a, T> Deref for SimulatedRwMutexReadGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        todo!();
+        self.guard.deref()
     }
 }
 
@@ -466,19 +642,49 @@ impl<'a, T> From<SimulatedRwMutexWriteGuard<'a, T>> for SimulatedRwMutexReadGuar
     }
 }
 
-pub(crate) struct SimulatedRwMutexWriteGuard<'a, T>(std::marker::PhantomData<&'a T>);
+pub(crate) struct SimulatedRwMutexWriteGuard<'a, T> {
+    id: RwMutexId,
+    locker: &'a parking_lot::Mutex<RwMutexState>,
+    guard: parking_lot::RwLockWriteGuard<'a, T>,
+}
+
+impl<'a, T> Drop for SimulatedRwMutexWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        park();
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_write_released");
+        *self.locker.lock() = RwMutexState::Unlocked;
+        release_all_rwmutex_waiter(self.id);
+    }
+}
+
+fn release_all_rwmutex_waiter(rwmutex_id: RwMutexId) {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        if let Some(s) = r.rwmutex_write_wait.remove(&rwmutex_id) {
+            for t in s {
+                r.ready.push(t);
+            }
+        }
+        if let Some(s) = r.rwmutex_read_wait.remove(&rwmutex_id) {
+            for t in s {
+                r.ready.push(t);
+            }
+        }
+    });
+}
 
 impl<'a, T> Deref for SimulatedRwMutexWriteGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        todo!();
+        self.guard.deref()
     }
 }
 
 impl<'a, T> DerefMut for SimulatedRwMutexWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        todo!();
+        self.guard.deref_mut()
     }
 }
 
@@ -486,7 +692,7 @@ pub(crate) struct SimulatedJoinHandle(ThreadId);
 
 impl runtime::JoinHandle for SimulatedJoinHandle {
     fn join(self) {
-        SimulatedRuntime::park();
+        park();
 
         log::trace!(source=THREAD_ID.get(), target=self.0;"join");
 
@@ -519,6 +725,10 @@ fn sleep() {
     });
 }
 
+fn park() {
+    SimulatedRuntime::park();
+}
+
 fn enqueue_join(thread_id: ThreadId) {
     RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
@@ -533,6 +743,28 @@ fn enqueue_mutex(mutex_id: MutexId) {
         let this_thread = THREAD_ID.get();
         r.mutex_wait
             .entry(mutex_id)
+            .or_default()
+            .insert(this_thread);
+    });
+}
+
+fn enqueue_rwmutex_for_read(rwmutex_id: RwMutexId) {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        let this_thread = THREAD_ID.get();
+        r.rwmutex_read_wait
+            .entry(rwmutex_id)
+            .or_default()
+            .insert(this_thread);
+    });
+}
+
+fn enqueue_rwmutex_for_write(rwmutex_id: RwMutexId) {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        let this_thread = THREAD_ID.get();
+        r.rwmutex_write_wait
+            .entry(rwmutex_id)
             .or_default()
             .insert(this_thread);
     });
@@ -593,15 +825,15 @@ macro_rules! impl_atomic {
 
             #[inline]
             fn load(&self) -> $ty {
-                SimulatedRuntime::park();
+                park();
                 let val = *self.0.lock();
-                SimulatedRuntime::park();
+                park();
                 val
             }
 
             #[inline]
             fn compare_and_exchange(&self, old: $ty, new: $ty) -> bool {
-                SimulatedRuntime::park();
+                park();
                 let mut val = self.0.lock();
                 let result = if *val == old {
                     *val = new;
@@ -610,17 +842,17 @@ macro_rules! impl_atomic {
                     false
                 };
                 drop(val);
-                SimulatedRuntime::park();
+                park();
                 result
             }
 
             fn fetch_add(&self, delta: $ty) -> $ty {
-                SimulatedRuntime::park();
+                park();
                 let mut val = self.0.lock();
                 let old = *val;
                 *val += delta;
                 drop(val);
-                SimulatedRuntime::park();
+                park();
                 old
             }
         }
@@ -652,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_1() {
+    fn test_simple_join() {
         setup();
         SimulatedRuntime::run(0, || {
             let handle = SimulatedRuntime::spawn(|| {});
@@ -661,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_2() {
+    fn test_simple_atomic() {
         setup();
         SimulatedRuntime::run(0, || {
             let a = Arc::new(AtomicI32::new(0));
@@ -685,46 +917,46 @@ mod tests {
     }
 
     #[test]
-    fn test_3() {
+    fn test_simple_mutex() {
         setup();
         SimulatedRuntime::run(0, || {
             let a = Arc::new(SimulatedMutex::new(0));
             let x = a.clone();
             let handle1 = SimulatedRuntime::spawn(move || {
                 for _ in 0..10000 {
-                    SimulatedRuntime::park();
+                    park();
                     let mut y = x.lock();
-                    SimulatedRuntime::park();
+                    park();
                     let new_y = *y + 20;
-                    SimulatedRuntime::park();
+                    park();
                     *y = new_y;
-                    SimulatedRuntime::park();
+                    park();
                 }
             });
 
             let x = a.clone();
             let handle2 = SimulatedRuntime::spawn(move || {
                 for _ in 0..10000 {
-                    SimulatedRuntime::park();
+                    park();
                     let mut y = x.lock();
-                    SimulatedRuntime::park();
+                    park();
                     let new_y = *y - 10;
-                    SimulatedRuntime::park();
+                    park();
                     *y = new_y;
-                    SimulatedRuntime::park();
+                    park();
                 }
             });
 
             let x = a.clone();
             let handle3 = SimulatedRuntime::spawn(move || {
                 for _ in 0..10000 {
-                    SimulatedRuntime::park();
+                    park();
                     let mut y = x.lock();
-                    SimulatedRuntime::park();
+                    park();
                     let new_y = *y + 1;
-                    SimulatedRuntime::park();
+                    park();
                     *y = new_y;
-                    SimulatedRuntime::park();
+                    park();
                 }
             });
 
@@ -733,6 +965,54 @@ mod tests {
             handle3.join();
 
             assert_eq!(110_000, *a.lock());
+        });
+    }
+
+    #[test]
+    fn test_simple_rwmutex() {
+        setup();
+        SimulatedRuntime::run(0, || {
+            let a = Arc::new(SimulatedRwMutex::new((0, 0)));
+
+            let mut joins = vec![];
+            for _ in 0..100 {
+                let x = a.clone();
+                let handle = SimulatedRuntime::spawn(move || {
+                    for _ in 0..100 {
+                        park();
+                        let g = x.read();
+                        park();
+                        let (p, q) = *g;
+                        park();
+                        assert!(p == q);
+                        park();
+                    }
+                });
+                joins.push(handle);
+            }
+
+            use rand::SeedableRng;
+
+            for seed in 0..15 {
+                let x = a.clone();
+                let mut rng = StdRng::seed_from_u64(seed as u64);
+                let handle = SimulatedRuntime::spawn(move || {
+                    for _ in 0..100 {
+                        park();
+                        let mut g = x.write();
+                        park();
+                        let y = rng.next_u32() as i32;
+                        park();
+                        *g = (y, y);
+                        park();
+                    }
+                });
+                joins.push(handle);
+            }
+
+            for h in joins {
+                h.join();
+            }
         });
     }
 }
