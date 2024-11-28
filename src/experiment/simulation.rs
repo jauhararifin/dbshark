@@ -85,14 +85,13 @@ pub(crate) struct SimulatedRuntime {
 
 struct Internal {
     thread_id: ThreadId,
-    ready: Vec<ThreadId>,
+
     active_threads: HashSet<ThreadId>,
     panicked_threads: Vec<ThreadId>,
+
     waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<()>>,
 
-    // joining maps from joined thread to the list joining threads.
-    // k -> v0, v1, v2... means v0, v1, and v2 waiting for
-    // k to finish
+    ready: Vec<ThreadId>,
     joining: HashMap<ThreadId, IndexSet<ThreadId>>,
     mutex_id: MutexId,
     mutex_wait: HashMap<MutexId, IndexSet<ThreadId>>,
@@ -126,40 +125,35 @@ impl Runtime for SimulatedRuntime {
     type AtomicI64 = AtomicI64;
 
     fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
-        Self::park();
+        park();
 
-        let thread_id = RUNTIME.with_borrow(|r| {
-            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-            r.thread_id.next()
-        });
+        let thread_id = next_thread_id();
         log::trace!(thread_id; "spawning_thread");
 
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
-        RUNTIME.with_borrow(|r| {
-            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+
+        let runtime = clone_runtime();
+        {
+            let mut r = runtime.internal.lock();
             r.waker.insert(thread_id, trigger);
             r.active_threads.insert(thread_id);
             r.ready.push(thread_id);
-        });
-
-        let cloned_runtime =
-            RUNTIME.with_borrow(|r| r.as_ref().expect("runtime should be valid").clone());
+        }
 
         std::thread::spawn(move || {
-            waiter.recv().expect("waiting a thread should never fail");
-            RUNTIME.set(Some(cloned_runtime));
+            RUNTIME.set(Some(runtime));
             THREAD_ID.set(thread_id);
             THREAD_WAITER.set(Some(waiter));
 
-            log::trace!(thread_id; "thread_started");
+            sleep();
 
-            Self::park();
+            log::trace!(thread_id; "thread_started");
             let cleanup = SpawnCleanup { thread_id };
             f();
             drop(cleanup);
         });
 
-        Self::park();
+        park();
 
         SimulatedJoinHandle(thread_id)
     }
@@ -330,12 +324,6 @@ impl Clone for SimulatedRuntime {
     }
 }
 
-impl Drop for SimulatedRuntime {
-    fn drop(&mut self) {
-        // TODO: we should check that everything is ok. no pending thread etc
-    }
-}
-
 pub(crate) struct SimulatedTimer {}
 
 impl runtime::Timer for SimulatedTimer {
@@ -410,7 +398,27 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
     }
 
     fn try_lock(&self) -> Option<Self::Guard<'_>> {
-        todo!();
+        park();
+
+        {
+            let current = THREAD_ID.get();
+            let mut locker = self.locker.lock();
+            if let Some(blocker) = *locker {
+                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,blocker; "mutex_try_acquiring_failed");
+                return None;
+            } else {
+                *locker = Some(current);
+            }
+        }
+
+        park();
+
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_acquired");
+        Some(SimulatedMutexGuard {
+            id: self.id,
+            locker: &self.locker,
+            guard: self.value.lock(),
+        })
     }
 }
 
@@ -566,7 +574,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
         SimulatedRwMutexWriteGuard {
             id: self.id,
             locker: &self.locker,
-            guard: self.value.write(),
+            guard: Some(self.value.write()),
         }
     }
 
@@ -590,7 +598,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
         Some(SimulatedRwMutexWriteGuard {
             id: self.id,
             locker: &self.locker,
-            guard: self.value.write(),
+            guard: Some(self.value.write()),
         })
     }
 }
@@ -637,22 +645,43 @@ impl<'a, T> Deref for SimulatedRwMutexReadGuard<'a, T> {
 }
 
 impl<'a, T> From<SimulatedRwMutexWriteGuard<'a, T>> for SimulatedRwMutexReadGuard<'a, T> {
-    fn from(_value: SimulatedRwMutexWriteGuard<'a, T>) -> Self {
-        todo!()
+    fn from(mut value: SimulatedRwMutexWriteGuard<'a, T>) -> Self {
+        park();
+
+        {
+            let thread_id = THREAD_ID.get();
+            log::trace!(thread_id,rwmutex_id=value.id; "rwmutex_write_downgrade");
+            let mut state = value.locker.lock();
+            assert!(matches!(*state, RwMutexState::Write(..)));
+            *state = RwMutexState::Read(1);
+        }
+
+        release_all_rwmutex_waiter(value.id);
+
+        let guard = parking_lot::RwLockWriteGuard::downgrade(value.guard.take().unwrap());
+        SimulatedRwMutexReadGuard {
+            id: value.id,
+            locker: value.locker,
+            guard,
+        }
     }
 }
 
 pub(crate) struct SimulatedRwMutexWriteGuard<'a, T> {
     id: RwMutexId,
     locker: &'a parking_lot::Mutex<RwMutexState>,
-    guard: parking_lot::RwLockWriteGuard<'a, T>,
+    guard: Option<parking_lot::RwLockWriteGuard<'a, T>>,
 }
 
 impl<'a, T> Drop for SimulatedRwMutexWriteGuard<'a, T> {
     fn drop(&mut self) {
+        if self.guard.is_none() {
+            return;
+        }
+
         park();
 
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_write_released");
+        log::trace!(thread_id=THREAD_ID.get(),rwmutex_id=self.id; "rwmutex_write_released");
         *self.locker.lock() = RwMutexState::Unlocked;
         release_all_rwmutex_waiter(self.id);
     }
@@ -678,13 +707,13 @@ impl<'a, T> Deref for SimulatedRwMutexWriteGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.guard.deref()
+        self.guard.as_ref().unwrap().deref()
     }
 }
 
 impl<'a, T> DerefMut for SimulatedRwMutexWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard.deref_mut()
+        self.guard.as_mut().unwrap().deref_mut()
     }
 }
 
@@ -714,6 +743,17 @@ impl runtime::JoinHandle for SimulatedJoinHandle {
 fn switch() {
     resume_any().expect("all thread are sleeping, a sign of deadlock");
     sleep();
+}
+
+fn clone_runtime() -> SimulatedRuntime {
+    RUNTIME.with_borrow(|r| r.as_ref().expect("runtime should be valid").clone())
+}
+
+fn next_thread_id() -> ThreadId {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        r.thread_id.next()
+    })
 }
 
 fn sleep() {
