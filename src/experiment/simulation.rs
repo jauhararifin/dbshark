@@ -3,6 +3,7 @@ use super::runtime::Runtime;
 use indexmap::IndexSet;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ thread_local! {
     static THREAD_WAITER: RefCell<Option<std::sync::mpsc::Receiver<()>>> = RefCell::default();
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 struct ThreadId(usize);
 
 impl ThreadId {
@@ -86,6 +87,8 @@ pub(crate) struct SimulatedRuntime {
 struct Internal {
     thread_id: ThreadId,
 
+    ticks: usize,
+
     active_threads: HashSet<ThreadId>,
     panicked_threads: Vec<ThreadId>,
 
@@ -98,8 +101,11 @@ struct Internal {
     rwmutex_id: RwMutexId,
     rwmutex_read_wait: HashMap<RwMutexId, IndexSet<ThreadId>>,
     rwmutex_write_wait: HashMap<RwMutexId, IndexSet<ThreadId>>,
+    timer_wait: BTreeSet<(usize, ThreadId)>,
+    thread_timer: HashMap<ThreadId, usize>,
 
     rng: StdRng,
+    ticks_per_milli: usize,
 }
 
 impl Runtime for SimulatedRuntime {
@@ -171,8 +177,18 @@ impl Runtime for SimulatedRuntime {
         log::trace!(thread_id; "thread_resumed");
     }
 
-    fn timer(_duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
-        todo!();
+    fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
+        let ticks_per_milli =
+            RUNTIME.with_borrow(|r| r.as_ref().unwrap().internal.lock().ticks_per_milli);
+        let state = Arc::new(parking_lot::Mutex::new(TimerState::Idle));
+        (
+            SimulatedTimer {
+                last_ticked: usize::MIN,
+                duration: duration.as_millis() as usize * ticks_per_milli,
+                state: state.clone(),
+            },
+            SimulatedTimerHandle(Arc::new(SimulatedTimerHandleInternal { state })),
+        )
     }
 
     fn create_dir_all<P: AsRef<std::path::Path>>(_path: P) -> std::io::Result<()> {
@@ -188,6 +204,7 @@ impl Drop for SpawnCleanup {
     fn drop(&mut self) {
         let is_panic = std::thread::panicking();
         if is_panic {
+            log::trace!(thread_id=self.thread_id; "thread_panicked");
             RUNTIME.with_borrow(|r| {
                 let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
                 r.panicked_threads.push(self.thread_id);
@@ -217,6 +234,7 @@ impl SimulatedRuntime {
         let r = Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
                 thread_id: ThreadId(1),
+                ticks: 0,
                 ready: vec![],
                 active_threads: HashSet::default(),
                 panicked_threads: Vec::default(),
@@ -227,7 +245,10 @@ impl SimulatedRuntime {
                 rwmutex_id: RwMutexId::default(),
                 rwmutex_read_wait: HashMap::default(),
                 rwmutex_write_wait: HashMap::default(),
+                timer_wait: BTreeSet::default(),
+                thread_timer: HashMap::default(),
                 rng: rand::rngs::StdRng::seed_from_u64(seed),
+                ticks_per_milli: 10,
             })),
         };
 
@@ -244,6 +265,7 @@ impl SimulatedRuntime {
         }
 
         RUNTIME.set(Some(r));
+        tick();
 
         let cleanup = RunCleanup { thread_id };
         f();
@@ -259,6 +281,7 @@ impl Drop for RunCleanup {
     fn drop(&mut self) {
         let is_panic = std::thread::panicking();
         if is_panic {
+            log::trace!(thread_id=self.thread_id; "main_thread_panicked");
             RUNTIME.with_borrow(|r| {
                 let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
                 r.panicked_threads.push(self.thread_id);
@@ -296,9 +319,33 @@ impl Drop for RunCleanup {
 fn resume_any() -> Option<ThreadId> {
     let (id, waker) = RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-        if r.ready.is_empty() {
-            return None;
+
+        // set threads that are awaken by the timer to ready
+        while let Some((tick, thread_id)) = r.timer_wait.first().cloned() {
+            if r.ticks >= tick {
+                r.timer_wait.pop_first().unwrap();
+                r.thread_timer.remove(&thread_id);
+                r.ready.push(thread_id);
+            } else {
+                break;
+            }
         }
+
+        // if nothing is ready, just wake up the first thread in
+        // the timer waiting list and update the ticks
+        // this is like jumping into the future.
+        if r.ready.is_empty() {
+            let (target, thread_id) = r.timer_wait.pop_first()?;
+            r.thread_timer.remove(&thread_id);
+            r.ticks = target;
+            let waker = r
+                .waker
+                .get(&thread_id)
+                .expect("waker should exists")
+                .clone();
+            return Some((thread_id, waker));
+        }
+
         let resuming_thread_index = r.rng.next_u64() as usize % r.ready.len();
         let resuming_thread_id = r.ready.remove(resuming_thread_index);
         log::trace!(thread_id=resuming_thread_id; "thread_resuming");
@@ -309,6 +356,7 @@ fn resume_any() -> Option<ThreadId> {
         Some((resuming_thread_id, waker.clone()))
     })?;
 
+    tick();
     waker
         .try_send(())
         .expect("resuming thread should always successfull");
@@ -324,25 +372,118 @@ impl Clone for SimulatedRuntime {
     }
 }
 
-pub(crate) struct SimulatedTimer {}
+pub(crate) struct SimulatedTimer {
+    last_ticked: usize,
+    duration: usize,
+    state: Arc<parking_lot::Mutex<TimerState>>,
+}
+
+enum TimerState {
+    Idle,
+    Wait(ThreadId),
+    Triggered(usize),
+    Closing,
+}
 
 impl runtime::Timer for SimulatedTimer {
     fn wait(&mut self) -> bool {
-        todo!();
+        park();
+
+        let thread_id = THREAD_ID.get();
+
+        loop {
+            let mut state = self.state.lock();
+            let current = get_tick();
+            match *state {
+                TimerState::Idle => {
+                    *state = TimerState::Wait(thread_id);
+                }
+                TimerState::Wait(t) => {
+                    assert!(t == thread_id);
+
+                    let elapsed = current - self.last_ticked;
+                    if elapsed >= self.duration {
+                        self.last_ticked = current;
+                        *state = TimerState::Idle;
+                        return true;
+                    }
+                    drop(state);
+
+                    RUNTIME.with_borrow(|r| {
+                        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+                        let next_tick = self.last_ticked + self.duration;
+                        r.timer_wait.insert((next_tick, thread_id));
+                        r.thread_timer.insert(thread_id, next_tick);
+                    });
+                    switch();
+                }
+                TimerState::Triggered(n) => {
+                    assert!(n > 0);
+                    if n == 1 {
+                        *state = TimerState::Idle;
+                    } else {
+                        *state = TimerState::Triggered(n - 1);
+                    }
+                    drop(state);
+
+                    return true;
+                }
+                TimerState::Closing => {
+                    drop(state);
+                    return false;
+                }
+            }
+        }
     }
 }
 
-pub(crate) struct SimulatedTimerHandle {}
+pub(crate) struct SimulatedTimerHandle(Arc<SimulatedTimerHandleInternal>);
+
+struct SimulatedTimerHandleInternal {
+    state: Arc<parking_lot::Mutex<TimerState>>,
+}
 
 impl Clone for SimulatedTimerHandle {
     fn clone(&self) -> Self {
-        todo!();
+        Self(self.0.clone())
     }
 }
 
 impl runtime::TimerHandle for SimulatedTimerHandle {
     fn trigger(&self) {
-        todo!();
+        log::trace!("simulated_timer_handle_dropped");
+        park();
+
+        let mut state = self.0.state.lock();
+        match *state {
+            TimerState::Idle => {
+                *state = TimerState::Triggered(1);
+            }
+            TimerState::Wait(thread_id) => {
+                log::trace!(triggered_by=THREAD_ID.get(), thread_id;"trigger_waiting_timer");
+                *state = TimerState::Triggered(1);
+                RUNTIME.with_borrow(|r| {
+                    let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+                    let tick = r
+                        .thread_timer
+                        .remove(&thread_id)
+                        .expect("the waiting thread should exists");
+                    r.timer_wait.remove(&(tick, thread_id));
+                    r.ready.push(thread_id);
+                });
+            }
+            TimerState::Triggered(n) => {
+                *state = TimerState::Triggered(n + 1);
+            }
+            TimerState::Closing => {}
+        }
+    }
+}
+
+impl Drop for SimulatedTimerHandleInternal {
+    fn drop(&mut self) {
+        park();
+        *self.state.lock() = TimerState::Closing;
     }
 }
 
@@ -756,6 +897,20 @@ fn next_thread_id() -> ThreadId {
     })
 }
 
+fn tick() {
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        r.ticks += 1;
+    })
+}
+
+fn get_tick() -> usize {
+    RUNTIME.with_borrow(|r| {
+        let r = r.as_ref().expect("runtime should be valid").internal.lock();
+        r.ticks
+    })
+}
+
 fn sleep() {
     THREAD_WAITER.with_borrow(|w| {
         w.as_ref()
@@ -1053,6 +1208,39 @@ mod tests {
             for h in joins {
                 h.join();
             }
+        });
+    }
+
+    #[test]
+    fn test_simple_timer() {
+        setup();
+        SimulatedRuntime::run(0, || {
+            let counter = AtomicUsize::new(0);
+            let timer_count = Arc::new(AtomicUsize::new(0));
+            let (mut timer, timer_handle) =
+                SimulatedRuntime::timer(std::time::Duration::from_millis(100));
+
+            let h1 = SimulatedRuntime::spawn(move || {
+                let timer_handle = timer_handle;
+                for i in 0..10000 {
+                    if i == 1234 {
+                        timer_handle.trigger();
+                    }
+                    counter.fetch_add(1);
+                }
+            });
+
+            let c = timer_count.clone();
+            let h2 = SimulatedRuntime::spawn(move || {
+                while timer.wait() {
+                    c.fetch_add(1);
+                }
+            });
+
+            h1.join();
+            h2.join();
+
+            assert_eq!(21, timer_count.load());
         });
     }
 }

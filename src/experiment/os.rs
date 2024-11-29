@@ -50,7 +50,7 @@ impl runtime::Runtime for OsRuntime {
                 cond: cond.clone(),
                 m: m.clone(),
             },
-            OsTimerHandle { cond, m },
+            OsTimerHandle(Arc::new(OsTimerHandleInternal { cond, m })),
         )
     }
 
@@ -106,25 +106,29 @@ impl runtime::Timer for OsTimer {
     }
 }
 
-pub(crate) struct OsTimerHandle {
+pub(crate) struct OsTimerHandle(Arc<OsTimerHandleInternal>);
+
+struct OsTimerHandleInternal {
     cond: Arc<parking_lot::Condvar>,
     m: Arc<parking_lot::Mutex<TimerState>>,
 }
 
 impl Clone for OsTimerHandle {
     fn clone(&self) -> Self {
-        Self {
-            cond: self.cond.clone(),
-            m: self.m.clone(),
-        }
+        Self(self.0.clone())
     }
 }
 
 impl runtime::TimerHandle for OsTimerHandle {
     fn trigger(&self) {
-        let mut state = self.m.lock();
-        state.trigger += 1;
-        drop(state);
+        self.0.m.lock().trigger += 1;
+        self.0.cond.notify_one();
+    }
+}
+
+impl Drop for OsTimerHandleInternal {
+    fn drop(&mut self) {
+        self.m.lock().closed = true;
         self.cond.notify_one();
     }
 }
