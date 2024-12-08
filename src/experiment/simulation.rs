@@ -1,12 +1,26 @@
 use super::runtime;
 use super::runtime::Runtime;
 use indexmap::IndexSet;
-use rand::{rngs::StdRng, RngCore, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, RngCore, SeedableRng};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+// TODO: make a better crash simulation.
+// Currently, we simulate crash scenario by panicking. When a crash is triggered, all threads
+// throw panics, and the simulator will just exit and report the the program is crash. However,
+// the behavior of crashing might not be the behavior you want to simulate. Normally, when a
+// process is crash, it just stopped immediately, no cleanup. Think about what happen when there
+// is a power outage, your whole computer just down, no cleanup. This simulation, doesn't do that.
+// Instead, the Drop functions will still be called. As a result, some cleanup might be executed
+// by the simulation.
+// In order to do better simulation, you might want to make sure that your Drop function doesn't
+// do any cleanup magic that can affect the next run. For example, don't try to flush your file
+// or write something to a file. As long as your cleanup function only happen on the memory
+// without side effect that can be perceived by the OS, everything should be fine.
 
 thread_local! {
     static RUNTIME: RefCell<Option<SimulatedRuntime>> = RefCell::default();
@@ -104,8 +118,20 @@ struct Internal {
     timer_wait: BTreeSet<(usize, ThreadId)>,
     thread_timer: HashMap<ThreadId, usize>,
 
+    files: HashMap<PathBuf, FileInternal>,
+
     rng: StdRng,
     ticks_per_milli: usize,
+}
+
+struct FileInternal {
+    is_opened: bool,
+
+    persisted_content: Vec<u8>,
+    buffered_content: Vec<u8>,
+    changes: Vec<(usize, usize)>,
+
+    cursor: usize,
 }
 
 impl Runtime for SimulatedRuntime {
@@ -247,6 +273,7 @@ impl SimulatedRuntime {
                 rwmutex_write_wait: HashMap::default(),
                 timer_wait: BTreeSet::default(),
                 thread_timer: HashMap::default(),
+                files: HashMap::default(),
                 rng: rand::rngs::StdRng::seed_from_u64(seed),
                 ticks_per_milli: 10,
             })),
@@ -924,6 +951,10 @@ fn park() {
     SimulatedRuntime::park();
 }
 
+fn crash() {
+    todo!();
+}
+
 fn enqueue_join(thread_id: ThreadId) {
     RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
@@ -965,47 +996,191 @@ fn enqueue_rwmutex_for_write(rwmutex_id: RwMutexId) {
     });
 }
 
-pub(crate) struct SimulatedFile;
+pub(crate) struct SimulatedFile {
+    path: PathBuf,
+}
+
+impl Drop for SimulatedFile {
+    fn drop(&mut self) {
+        park();
+
+        RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let file = r.files.get_mut(&self.path).expect("file is missing");
+            assert!(file.is_opened);
+            file.is_opened = false;
+            file.buffered_content.clear();
+            file.changes.clear();
+        });
+    }
+}
 
 impl runtime::File for SimulatedFile {
     #[inline]
-    fn open(_path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        todo!();
+    fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        // TODO: maybe need to simulate various io error when opening file, like permission denied.
+        // or just return generic error.
+        Ok(RUNTIME.with_borrow(|r| -> SimulatedFile {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let entry = r.files.entry(path.as_ref().to_path_buf());
+            let file = entry.or_insert(FileInternal {
+                is_opened: false,
+                persisted_content: vec![],
+                buffered_content: vec![],
+                changes: vec![],
+                cursor: 0,
+            });
+
+            if file.is_opened {
+                panic!("file is already opened");
+            }
+            file.is_opened = true;
+
+            SimulatedFile {
+                path: path.as_ref().to_path_buf(),
+            }
+        }))
+    }
+
+    fn is_file(&self) -> std::io::Result<bool> {
+        // TODO: maybe need to simulate these cases:
+        // - non regular file
+        // - io errors
+        Ok(true)
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        // TODO: simulate error case
+        // TODO: think about the error case. currently, when `truncate` returns,
+        // we assume everything is success even though we don't call fsync.
+        Ok(RUNTIME.with_borrow(|r| {
+            let r = r.as_ref().expect("runtime should be valid").internal.lock();
+            r.files
+                .get(&self.path)
+                .expect("the file should exists")
+                .buffered_content
+                .len() as u64
+        }))
     }
 
     #[inline]
-    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
-        todo!();
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<()> {
+        Ok(RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+            let mut current = file.cursor;
+            match position {
+                std::io::SeekFrom::Start(v) => current = v as usize,
+                std::io::SeekFrom::End(v) => current = file.buffered_content.len() + v as usize,
+                std::io::SeekFrom::Current(v) => current = (current as i64 + v) as usize,
+            }
+            file.cursor = current;
+        }))
     }
 
     #[inline]
-    fn seek(&mut self, _position: std::io::SeekFrom) -> std::io::Result<()> {
-        todo!();
+    fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
+        Ok(RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+
+            let mut size = buff.len();
+            if file.cursor + buff.len() as usize > file.buffered_content.len() {
+                size = file.buffered_content.len() - file.cursor;
+            }
+
+            for i in 0..size {
+                buff[i] = file.buffered_content[file.cursor + i];
+            }
+            file.cursor += size;
+
+            size
+        }))
     }
 
     #[inline]
-    fn read(&mut self, _buff: &mut [u8]) -> std::io::Result<usize> {
-        todo!();
+    fn read_exact(&mut self, buff: &mut [u8]) -> std::io::Result<()> {
+        Ok(RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+
+            if file.cursor + buff.len() as usize > file.buffered_content.len() {
+                todo!("read beyond file length, should this error or panic?");
+            }
+            for i in 0..buff.len() {
+                buff[i] = file.buffered_content[file.cursor + i];
+            }
+            file.cursor = file.cursor + buff.len();
+        }))
     }
 
     #[inline]
-    fn read_exact(&mut self, _buff: &mut [u8]) -> std::io::Result<()> {
-        todo!();
-    }
-
-    #[inline]
-    fn write_all(&mut self, _buff: &[u8]) -> std::io::Result<()> {
-        todo!();
+    fn write_all(&mut self, buff: &[u8]) -> std::io::Result<()> {
+        Ok(RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+            while file.cursor + buff.len() as usize > file.buffered_content.len() {
+                file.buffered_content.push(0);
+            }
+            for (i, b) in buff.iter().cloned().enumerate() {
+                file.buffered_content[file.cursor + i] = b;
+            }
+            file.cursor = file.cursor + buff.len();
+        }))
     }
 
     #[inline]
     fn sync(&mut self) -> std::io::Result<()> {
-        todo!();
+        RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let r = r.deref_mut();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+
+            let will_crash = r.rng.gen_bool(0.1);
+
+            if will_crash {
+                let mut changes = Vec::default();
+                for (offset, size) in file.changes.drain(..) {
+                    for i in offset..offset + size {
+                        changes[i] = (i, file.buffered_content[i]);
+                    }
+                }
+                changes.shuffle(&mut r.rng);
+
+                let changes_to_apply = r.rng.gen_range(0..=changes.len()) as usize;
+                for (i, b) in changes.drain(..changes_to_apply) {
+                    while file.persisted_content.len() <= i {
+                        file.persisted_content.push(0);
+                    }
+                    file.persisted_content[i] = b;
+
+                    park();
+                }
+                crash();
+                file.buffered_content.clear();
+                file.changes.clear();
+            } else {
+                file.persisted_content = std::mem::take(&mut file.buffered_content);
+                file.changes.clear();
+            }
+        });
+
+        Ok(())
     }
 
     #[inline]
-    fn truncate(&mut self, _size: u64) -> std::io::Result<()> {
-        todo!();
+    fn truncate(&mut self, size: u64) -> std::io::Result<()> {
+        Ok(RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+            if size as usize > file.buffered_content.len() {
+                let to_add = size as usize - file.buffered_content.len();
+                file.buffered_content
+                    .extend(std::iter::repeat(0).take(to_add));
+            } else {
+                file.buffered_content.truncate(size as usize);
+            }
+        }))
     }
 }
 

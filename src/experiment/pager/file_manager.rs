@@ -24,11 +24,11 @@ impl<R: Runtime> FileManager<R> {
         let double_buff_path = path.join("dbuff");
 
         let mut main = R::File::open(main_path)?;
-        if !main.metadata()?.is_file() {
+        if !main.is_file()? {
             return Err(anyhow!("db file is not a regular file"));
         }
         let mut double_buff = R::File::open(double_buff_path)?;
-        if !double_buff.metadata()?.is_file() {
+        if !double_buff.is_file()? {
             return Err(anyhow!("double buffer file is not a regular file"));
         }
 
@@ -50,7 +50,7 @@ impl<R: Runtime> FileManager<R> {
         dbuff: &mut R::File,
         page_size: usize,
     ) -> anyhow::Result<()> {
-        let size = dbuff.metadata()?.len();
+        let size = dbuff.len()?;
         let count = (size as usize) / page_size;
 
         let mut buff = vec![0u8; page_size * count];
@@ -75,7 +75,7 @@ impl<R: Runtime> FileManager<R> {
         id: PageId,
         buff: &[u8],
     ) -> anyhow::Result<()> {
-        let file_size = f.metadata()?.len();
+        let file_size = f.len()?;
         let min_size = id.get() * page_size + page_size;
         if min_size > file_size {
             f.truncate(id.get() * page_size + page_size)?;
@@ -124,7 +124,7 @@ impl<R: Runtime> FileManager<R> {
         for (i, pgid) in self.pgids.iter().enumerate() {
             // TODO: maybe we can use vectorized write to write them all in one single syscall
             let page_size = self.page_size as u64;
-            let file_size = self.main.metadata()?.len();
+            let file_size = self.main.len()?;
             let min_size = pgid.get() * page_size + page_size;
             if min_size > file_size {
                 self.main.truncate(pgid.get() * page_size + page_size)?;
@@ -145,7 +145,7 @@ impl<R: Runtime> FileManager<R> {
             Ok(true)
         } else {
             let page_size = self.page_size as u64;
-            let file_size = self.main.metadata()?.len();
+            let file_size = self.main.len()?;
             let min_size = pgid.get() * page_size + page_size;
             if min_size > file_size {
                 return Ok(false);

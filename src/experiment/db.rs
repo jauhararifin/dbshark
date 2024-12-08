@@ -110,7 +110,7 @@ impl<R: Runtime> Db<R> {
     }
 
     fn load_db_header(f: &mut R::File) -> anyhow::Result<Header> {
-        let size = f.metadata()?.len();
+        let size = f.len()?;
         if size < 2 * DB_HEADER_SIZE as u64 {
             return Self::init_db(f);
         }

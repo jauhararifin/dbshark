@@ -420,7 +420,7 @@ pub(crate) fn recover<R: Runtime>(
 ) -> anyhow::Result<Wal<R>> {
     let wal_path_1 = path.join("wal_1");
     let wal_file_1 = R::File::open(&wal_path_1)?;
-    if !wal_file_1.metadata()?.is_file() {
+    if !wal_file_1.is_file()? {
         return Err(anyhow!("{wal_path_1:?} is not a regular file"));
     }
     let mut f1 =
@@ -428,7 +428,7 @@ pub(crate) fn recover<R: Runtime>(
 
     let wal_path_2 = path.join("wal_2");
     let wal_file_2 = R::File::open(&wal_path_2)?;
-    if !wal_file_2.metadata()?.is_file() {
+    if !wal_file_2.is_file()? {
         return Err(anyhow!("{wal_path_2:?} is not a regular file"));
     }
     let mut f2 =
@@ -520,7 +520,7 @@ pub(crate) fn recover<R: Runtime>(
 }
 
 fn recover_wal_file<R: Runtime>(mut f: R::File) -> anyhow::Result<RecoveringWalFile<R>> {
-    let file_size = f.metadata()?.len();
+    let file_size = f.len()?;
     if file_size < WAL_HEADER_SIZE as u64 * 2 {
         return Ok(RecoveringWalFile {
             f,

@@ -252,8 +252,13 @@ impl runtime::File for OsFile {
     }
 
     #[inline]
-    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
-        self.0.metadata()
+    fn is_file(&self) -> std::io::Result<bool> {
+        Ok(self.0.metadata()?.is_file())
+    }
+
+    #[inline]
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.0.metadata()?.len())
     }
 
     #[inline]

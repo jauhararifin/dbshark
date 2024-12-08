@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -80,7 +79,9 @@ pub trait JoinHandle {
 pub trait File: Sized + Send + Sync {
     fn open(path: impl AsRef<Path>) -> io::Result<Self>;
 
-    fn metadata(&self) -> io::Result<fs::Metadata>;
+    fn is_file(&self) -> io::Result<bool>;
+
+    fn len(&self) -> io::Result<u64>;
 
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<()>;
 
