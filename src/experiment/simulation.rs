@@ -25,7 +25,7 @@ use std::sync::Arc;
 thread_local! {
     static RUNTIME: RefCell<Option<SimulatedRuntime>> = RefCell::default();
     static THREAD_ID: Cell<ThreadId> = Cell::default();
-    static THREAD_WAITER: RefCell<Option<std::sync::mpsc::Receiver<()>>> = RefCell::default();
+    static THREAD_WAITER: RefCell<Option<std::sync::mpsc::Receiver<bool>>> = RefCell::default();
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -100,13 +100,14 @@ pub(crate) struct SimulatedRuntime {
 
 struct Internal {
     thread_id: ThreadId,
+    is_crashing: bool,
 
     ticks: usize,
 
     active_threads: HashSet<ThreadId>,
     panicked_threads: Vec<ThreadId>,
 
-    waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<()>>,
+    waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<bool>>,
 
     ready: Vec<ThreadId>,
     joining: HashMap<ThreadId, IndexSet<ThreadId>>,
@@ -162,7 +163,7 @@ impl Runtime for SimulatedRuntime {
         let thread_id = next_thread_id();
         log::trace!(thread_id; "spawning_thread");
 
-        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
+        let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
 
         let runtime = clone_runtime();
         {
@@ -256,10 +257,11 @@ impl Drop for SpawnCleanup {
 
 impl SimulatedRuntime {
     #[allow(unused)]
-    pub(crate) fn run(seed: u64, f: impl FnOnce() + Send + 'static) {
-        let r = Self {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
                 thread_id: ThreadId(1),
+                is_crashing: false,
                 ticks: 0,
                 ready: vec![],
                 active_threads: HashSet::default(),
@@ -277,21 +279,24 @@ impl SimulatedRuntime {
                 rng: rand::rngs::StdRng::seed_from_u64(seed),
                 ticks_per_milli: 10,
             })),
-        };
+        }
+    }
 
+    #[allow(unused)]
+    pub(crate) fn run(&mut self, f: impl FnOnce() + Send + 'static) {
         let thread_id = ThreadId(1);
         THREAD_ID.set(thread_id);
         log::trace!(thread_id; "spawn_root");
 
-        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
+        let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
         THREAD_WAITER.set(Some(waiter));
         {
-            let mut r = r.internal.lock();
+            let mut r = self.internal.lock();
             r.waker.insert(thread_id, trigger);
             r.active_threads.insert(thread_id);
         }
 
-        RUNTIME.set(Some(r));
+        RUNTIME.set(Some(self.clone()));
         tick();
 
         let cleanup = RunCleanup { thread_id };
@@ -326,20 +331,46 @@ impl Drop for RunCleanup {
         drop(r);
 
         loop {
-            let r = runtime.internal.lock();
-            if r.active_threads.is_empty() {
+            let mut r = runtime.internal.lock();
+            if r.is_crashing {
+                for (_, waker) in r.waker.drain() {
+                    waker
+                        .send(true)
+                        .expect("canceling thread should always successfull");
+                }
                 break;
+                // TODO: wait untill all threads are joined
+            } else {
+                if r.active_threads.is_empty() {
+                    break;
+                }
+                drop(r);
+                resume_any().expect("all thread are sleeping, a sign of deadlock");
             }
-            drop(r);
-            resume_any().expect("all thread are sleeping, a sign of deadlock");
         }
 
-        let r = runtime.internal.lock();
+        let mut r = runtime.internal.lock();
         for panicked_thread_id in &r.panicked_threads {
             panic!("thread {panicked_thread_id} got panicked");
         }
 
         log::trace!("simulation_finished");
+
+        r.thread_id = ThreadId(1);
+        r.is_crashing = false;
+        r.ticks = 0;
+        r.ready = vec![];
+        r.active_threads = HashSet::default();
+        r.panicked_threads = Vec::default();
+        r.waker = HashMap::default();
+        r.joining = HashMap::default();
+        r.mutex_id = MutexId::default();
+        r.mutex_wait = HashMap::default();
+        r.rwmutex_id = RwMutexId::default();
+        r.rwmutex_read_wait = HashMap::default();
+        r.rwmutex_write_wait = HashMap::default();
+        r.timer_wait = BTreeSet::default();
+        r.thread_timer = HashMap::default();
     }
 }
 
@@ -385,7 +416,7 @@ fn resume_any() -> Option<ThreadId> {
 
     tick();
     waker
-        .try_send(())
+        .try_send(false)
         .expect("resuming thread should always successfull");
 
     Some(id)
@@ -940,10 +971,14 @@ fn get_tick() -> usize {
 
 fn sleep() {
     THREAD_WAITER.with_borrow(|w| {
-        w.as_ref()
+        let is_panicking = w
+            .as_ref()
             .expect("waiter should exists")
             .recv()
-            .expect("waiting a thread should never fail")
+            .expect("waiting a thread should never fail");
+        if is_panicking {
+            panic!("thread_aborted_due_to_panic");
+        }
     });
 }
 
@@ -952,7 +987,11 @@ fn park() {
 }
 
 fn crash() {
-    todo!();
+    RUNTIME.with_borrow(|r| {
+        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+        r.is_crashing = true;
+    });
+    panic!("simulated_crash");
 }
 
 fn enqueue_join(thread_id: ThreadId) {
@@ -1131,40 +1170,74 @@ impl runtime::File for SimulatedFile {
 
     #[inline]
     fn sync(&mut self) -> std::io::Result<()> {
+        let will_crash = RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let r = r.deref_mut();
+            r.rng.gen_bool(0.1)
+        });
+
+        log::trace!(will_crash; "sync_file");
+
+        if !will_crash {
+            RUNTIME.with_borrow(|r| {
+                let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+                let r = r.deref_mut();
+                let file = r.files.get_mut(&self.path).expect("the file should exists");
+                file.persisted_content = std::mem::take(&mut file.buffered_content);
+                file.changes.clear();
+            });
+            return Ok(());
+        }
+
+        let mut changes = RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let r = r.deref_mut();
+            let file = r.files.get_mut(&self.path).expect("the file should exists");
+            let mut changes = Vec::default();
+            for (offset, size) in file.changes.drain(..) {
+                for i in offset..offset + size {
+                    changes[i] = (i, file.buffered_content[i]);
+                }
+            }
+            changes.shuffle(&mut r.rng);
+            changes
+        });
+
+        let changes_to_apply = RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let r = r.deref_mut();
+            r.rng.gen_range(0..=changes.len()) as usize
+        });
+
+        for (i, b) in changes.drain(..changes_to_apply) {
+            let should_park = RUNTIME.with_borrow(|r| {
+                let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+                let r = r.deref_mut();
+                let file = r.files.get_mut(&self.path).expect("the file should exists");
+
+                log::trace!(i, b; "sync_file_1");
+                while file.persisted_content.len() <= i {
+                    file.persisted_content.push(0);
+                }
+                file.persisted_content[i] = b;
+                r.rng.gen_bool(0.1)
+            });
+
+            if should_park {
+                park();
+            }
+        }
+
         RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let r = r.deref_mut();
             let file = r.files.get_mut(&self.path).expect("the file should exists");
-
-            let will_crash = r.rng.gen_bool(0.1);
-
-            if will_crash {
-                let mut changes = Vec::default();
-                for (offset, size) in file.changes.drain(..) {
-                    for i in offset..offset + size {
-                        changes[i] = (i, file.buffered_content[i]);
-                    }
-                }
-                changes.shuffle(&mut r.rng);
-
-                let changes_to_apply = r.rng.gen_range(0..=changes.len()) as usize;
-                for (i, b) in changes.drain(..changes_to_apply) {
-                    while file.persisted_content.len() <= i {
-                        file.persisted_content.push(0);
-                    }
-                    file.persisted_content[i] = b;
-
-                    park();
-                }
-                crash();
-                file.buffered_content.clear();
-                file.changes.clear();
-            } else {
-                file.persisted_content = std::mem::take(&mut file.buffered_content);
-                file.changes.clear();
-            }
+            file.buffered_content.clear();
+            file.changes.clear();
+            file.cursor = 0;
         });
 
+        crash();
         Ok(())
     }
 
@@ -1256,7 +1329,8 @@ mod tests {
     #[test]
     fn test_simple_join() {
         setup();
-        SimulatedRuntime::run(0, || {
+        let mut runtime = SimulatedRuntime::new(0);
+        runtime.run(|| {
             let handle = SimulatedRuntime::spawn(|| {});
             handle.join();
         });
@@ -1265,7 +1339,8 @@ mod tests {
     #[test]
     fn test_simple_atomic() {
         setup();
-        SimulatedRuntime::run(0, || {
+        let mut runtime = SimulatedRuntime::new(0);
+        runtime.run(|| {
             let a = Arc::new(AtomicI32::new(0));
             let x = a.clone();
             let handle1 = SimulatedRuntime::spawn(move || {
@@ -1289,7 +1364,8 @@ mod tests {
     #[test]
     fn test_simple_mutex() {
         setup();
-        SimulatedRuntime::run(0, || {
+        let mut runtime = SimulatedRuntime::new(0);
+        runtime.run(|| {
             let a = Arc::new(SimulatedMutex::new(0));
             let x = a.clone();
             let handle1 = SimulatedRuntime::spawn(move || {
@@ -1341,7 +1417,8 @@ mod tests {
     #[test]
     fn test_simple_rwmutex() {
         setup();
-        SimulatedRuntime::run(0, || {
+        let mut runtime = SimulatedRuntime::new(0);
+        runtime.run(|| {
             let a = Arc::new(SimulatedRwMutex::new((0, 0)));
 
             let mut joins = vec![];
@@ -1389,7 +1466,8 @@ mod tests {
     #[test]
     fn test_simple_timer() {
         setup();
-        SimulatedRuntime::run(0, || {
+        let mut runtime = SimulatedRuntime::new(0);
+        runtime.run(|| {
             let counter = AtomicUsize::new(0);
             let timer_count = Arc::new(AtomicUsize::new(0));
             let (mut timer, timer_handle) =
@@ -1417,5 +1495,34 @@ mod tests {
 
             assert_eq!(21, timer_count.load());
         });
+    }
+
+    #[test]
+    fn test_writing_file() {
+        setup();
+        let mut runtime = SimulatedRuntime::new(0);
+        let rng: Arc<parking_lot::Mutex<StdRng>> = Arc::new(parking_lot::Mutex::new(
+            rand::rngs::StdRng::seed_from_u64(0),
+        ));
+
+        for _ in 0..100 {
+            let rng = rng.clone();
+            runtime.run(move || {
+                let mut f = SimulatedFile::open("dummy").expect("cannot open file");
+                let size = f.len().unwrap();
+                assert!(size == 0 || size == 10);
+                if size == 10 {
+                    let mut buff = [0u8; 10];
+                    f.read_exact(&mut buff).unwrap();
+                    assert!(buff[1..].iter().all(|b| *b == buff[0]));
+                }
+
+                let v = rng.lock().next_u64() as u8;
+                f.write_all(&[v, v, v, v, v, v, v, v, v, v])
+                    .expect("cannot write bytes");
+
+                f.sync().unwrap();
+            });
+        }
     }
 }
