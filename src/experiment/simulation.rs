@@ -101,6 +101,7 @@ pub(crate) struct SimulatedRuntime {
 struct Internal {
     thread_id: ThreadId,
     is_crashing: bool,
+    main_trigger: Option<std::sync::mpsc::SyncSender<()>>,
 
     ticks: usize,
 
@@ -159,36 +160,12 @@ impl Runtime for SimulatedRuntime {
 
     fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
         park();
-
-        let thread_id = next_thread_id();
-        log::trace!(thread_id; "spawning_thread");
-
-        let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
-
-        let runtime = clone_runtime();
-        {
-            let mut r = runtime.internal.lock();
-            r.waker.insert(thread_id, trigger);
-            r.active_threads.insert(thread_id);
-            r.ready.push(thread_id);
-        }
-
-        std::thread::spawn(move || {
-            RUNTIME.set(Some(runtime));
-            THREAD_ID.set(thread_id);
-            THREAD_WAITER.set(Some(waiter));
-
-            sleep();
-
-            log::trace!(thread_id; "thread_started");
-            let cleanup = SpawnCleanup { thread_id };
-            f();
-            drop(cleanup);
+        let result = RUNTIME.with_borrow(|r| {
+            let r = r.as_ref().expect("runtime should be valid");
+            r.spawn_internal(f)
         });
-
         park();
-
-        SimulatedJoinHandle(thread_id)
+        result
     }
 
     fn park() {
@@ -231,10 +208,10 @@ impl Drop for SpawnCleanup {
     fn drop(&mut self) {
         let is_panic = std::thread::panicking();
         if is_panic {
-            log::trace!(thread_id=self.thread_id; "thread_panicked");
             RUNTIME.with_borrow(|r| {
                 let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
                 r.panicked_threads.push(self.thread_id);
+                log::trace!(thread_id=self.thread_id; "thread_panicked");
             });
         }
 
@@ -251,17 +228,19 @@ impl Drop for SpawnCleanup {
             }
         });
 
-        resume_any().expect("all thread are sleeping, a sign of deadlock");
+        resume_any();
     }
 }
 
 impl SimulatedRuntime {
     #[allow(unused)]
     pub(crate) fn new(seed: u64) -> Self {
+        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
-                thread_id: ThreadId(1),
+                thread_id: ThreadId(0),
                 is_crashing: false,
+                main_trigger: None,
                 ticks: 0,
                 ready: vec![],
                 active_threads: HashSet::default(),
@@ -284,80 +263,42 @@ impl SimulatedRuntime {
 
     #[allow(unused)]
     pub(crate) fn run(&mut self, f: impl FnOnce() + Send + 'static) {
-        let thread_id = ThreadId(1);
-        THREAD_ID.set(thread_id);
-        log::trace!(thread_id; "spawn_root");
-
-        let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
-        THREAD_WAITER.set(Some(waiter));
+        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         {
-            let mut r = self.internal.lock();
-            r.waker.insert(thread_id, trigger);
-            r.active_threads.insert(thread_id);
+            self.internal.lock().main_trigger = Some(trigger);
         }
 
         RUNTIME.set(Some(self.clone()));
-        tick();
+        self.spawn_internal(f);
+        resume_any();
 
-        let cleanup = RunCleanup { thread_id };
-        f();
-        drop(cleanup);
-    }
-}
+        waiter
+            .recv()
+            .expect("waiting main thread should never fail");
 
-struct RunCleanup {
-    thread_id: ThreadId,
-}
-
-impl Drop for RunCleanup {
-    fn drop(&mut self) {
-        let is_panic = std::thread::panicking();
-        if is_panic {
-            log::trace!(thread_id=self.thread_id; "main_thread_panicked");
-            RUNTIME.with_borrow(|r| {
-                let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-                r.panicked_threads.push(self.thread_id);
-            });
-        }
-
-        let runtime = RUNTIME.take().unwrap();
-        let mut r = runtime.internal.lock();
-        r.active_threads.remove(&self.thread_id);
-        if let Some(s) = r.joining.remove(&self.thread_id) {
-            for t in s {
-                r.ready.push(t);
+        let mut r = self.internal.lock();
+        if r.is_crashing {
+            for (_, waker) in r.waker.drain() {
+                waker
+                    .send(true)
+                    .expect("canceling thread should always successfull");
             }
-        }
-        drop(r);
-
-        loop {
-            let mut r = runtime.internal.lock();
-            if r.is_crashing {
-                for (_, waker) in r.waker.drain() {
-                    waker
-                        .send(true)
-                        .expect("canceling thread should always successfull");
-                }
-                break;
-                // TODO: wait untill all threads are joined
-            } else {
-                if r.active_threads.is_empty() {
-                    break;
-                }
-                drop(r);
-                resume_any().expect("all thread are sleeping, a sign of deadlock");
-            }
+        } else if !r.active_threads.is_empty() {
+            panic!(
+                "some of the thread are not finished yet {:?}",
+                r.active_threads
+            );
         }
 
-        let mut r = runtime.internal.lock();
         for panicked_thread_id in &r.panicked_threads {
             panic!("thread {panicked_thread_id} got panicked");
         }
 
         log::trace!("simulation_finished");
 
-        r.thread_id = ThreadId(1);
+        r.thread_id = ThreadId(0);
         r.is_crashing = false;
+        r.main_trigger = None;
         r.ticks = 0;
         r.ready = vec![];
         r.active_threads = HashSet::default();
@@ -372,10 +313,47 @@ impl Drop for RunCleanup {
         r.timer_wait = BTreeSet::default();
         r.thread_timer = HashMap::default();
     }
+
+    fn spawn_internal(&self, f: impl FnOnce() + Send + 'static) -> SimulatedJoinHandle {
+        let thread_id = next_thread_id();
+        log::trace!(thread_id; "spawning_thread");
+
+        let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
+
+        let runtime = clone_runtime();
+        {
+            let mut r = runtime.internal.lock();
+            r.waker.insert(thread_id, trigger);
+            r.active_threads.insert(thread_id);
+            r.ready.push(thread_id);
+        }
+
+        std::thread::spawn(move || {
+            RUNTIME.set(Some(runtime));
+            THREAD_ID.set(thread_id);
+            THREAD_WAITER.set(Some(waiter));
+
+            sleep();
+
+            log::trace!(thread_id; "thread_started");
+            let cleanup = SpawnCleanup { thread_id };
+            f();
+            drop(cleanup);
+        });
+        SimulatedJoinHandle(thread_id)
+    }
 }
 
-fn resume_any() -> Option<ThreadId> {
-    let (id, waker) = RUNTIME.with_borrow(|r| {
+//struct RunCleanup {
+//    thread_id: ThreadId,
+//}
+//
+//impl Drop for RunCleanup {
+//    fn drop(&mut self) {}
+//}
+//
+fn resume_any() {
+    RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
 
         // set threads that are awaken by the timer to ready
@@ -389,37 +367,47 @@ fn resume_any() -> Option<ThreadId> {
             }
         }
 
-        // if nothing is ready, just wake up the first thread in
-        // the timer waiting list and update the ticks
-        // this is like jumping into the future.
-        if r.ready.is_empty() {
-            let (target, thread_id) = r.timer_wait.pop_first()?;
+        if !r.ready.is_empty() {
+            let resuming_thread_index = r.rng.next_u64() as usize % r.ready.len();
+            let resuming_thread_id = r.ready.remove(resuming_thread_index);
+            log::trace!(thread_id=resuming_thread_id; "thread_resuming");
+            r.ticks += 1;
+            let waker = r
+                .waker
+                .get(&resuming_thread_id)
+                .expect("waker should exists");
+            waker
+                .try_send(false)
+                .expect("resuming thread should always successfull");
+            return;
+        }
+
+        if !r.timer_wait.is_empty() {
+            // if nothing is ready, just wake up the first thread in
+            // the timer waiting list and update the ticks
+            // this is like jumping into the future.
+            let (target, thread_id) = r.timer_wait.pop_first().expect("nothing is ready");
             r.thread_timer.remove(&thread_id);
-            r.ticks = target;
+            r.ticks = target + 1;
             let waker = r
                 .waker
                 .get(&thread_id)
                 .expect("waker should exists")
                 .clone();
-            return Some((thread_id, waker));
+            waker
+                .try_send(false)
+                .expect("resuming thread should always successfull");
+            return;
         }
 
-        let resuming_thread_index = r.rng.next_u64() as usize % r.ready.len();
-        let resuming_thread_id = r.ready.remove(resuming_thread_index);
-        log::trace!(thread_id=resuming_thread_id; "thread_resuming");
-        let waker = r
-            .waker
-            .get(&resuming_thread_id)
-            .expect("waker should exists");
-        Some((resuming_thread_id, waker.clone()))
-    })?;
-
-    tick();
-    waker
-        .try_send(false)
-        .expect("resuming thread should always successfull");
-
-    Some(id)
+        let trigger = r
+            .main_trigger
+            .as_ref()
+            .expect("main trigger should be valid");
+        trigger
+            .send(())
+            .expect("resuming main thread should always successfull");
+    });
 }
 
 impl Clone for SimulatedRuntime {
@@ -940,7 +928,7 @@ impl runtime::JoinHandle for SimulatedJoinHandle {
 }
 
 fn switch() {
-    resume_any().expect("all thread are sleeping, a sign of deadlock");
+    resume_any();
     sleep();
 }
 
@@ -952,13 +940,6 @@ fn next_thread_id() -> ThreadId {
     RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
         r.thread_id.next()
-    })
-}
-
-fn tick() {
-    RUNTIME.with_borrow(|r| {
-        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-        r.ticks += 1;
     })
 }
 
