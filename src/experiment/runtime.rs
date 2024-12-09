@@ -28,6 +28,8 @@ pub trait Runtime: 'static {
     type AtomicI32: Atomic<i32>;
     type AtomicI64: Atomic<i64>;
 
+    // TODO: consider making this non-static. For testing, everything is scoped,
+    // so we don't really need the static bound per se.
     fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
 
     fn park();

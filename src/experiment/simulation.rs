@@ -105,6 +105,8 @@ struct Internal {
 
     ticks: usize,
 
+    // TODO: maybe we don't need active_threads. Instead, we can assume
+    // anything in the waker are active;
     active_threads: HashSet<ThreadId>,
     panicked_threads: Vec<ThreadId>,
 
@@ -206,6 +208,41 @@ struct SpawnCleanup {
 
 impl Drop for SpawnCleanup {
     fn drop(&mut self) {
+        park();
+
+        log::trace!(thread_id=self.thread_id; "thread_finished");
+        RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            r.active_threads.remove(&self.thread_id);
+            r.waker.remove(&self.thread_id);
+            if let Some(s) = r.joining.remove(&self.thread_id) {
+                for t in s {
+                    r.ready.push(t);
+                }
+            }
+        });
+
+        let is_crash = RUNTIME.with_borrow(|r| {
+            r.as_ref()
+                .expect("runtime should be valid")
+                .internal
+                .lock()
+                .is_crashing
+        });
+        if is_crash {
+            RUNTIME.with_borrow(|r| {
+                let r = r.as_ref().expect("runtime should be valid").internal.lock();
+                let trigger = r
+                    .main_trigger
+                    .as_ref()
+                    .expect("main trigger should be valid");
+                trigger
+                    .send(())
+                    .expect("resuming main thread should always successfull");
+            });
+            return;
+        }
+
         let is_panic = std::thread::panicking();
         if is_panic {
             RUNTIME.with_borrow(|r| {
@@ -214,19 +251,6 @@ impl Drop for SpawnCleanup {
                 log::trace!(thread_id=self.thread_id; "thread_panicked");
             });
         }
-
-        park();
-
-        log::trace!(thread_id=self.thread_id; "thread_finished");
-        RUNTIME.with_borrow(|r| {
-            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-            r.active_threads.remove(&self.thread_id);
-            if let Some(s) = r.joining.remove(&self.thread_id) {
-                for t in s {
-                    r.ready.push(t);
-                }
-            }
-        });
 
         resume_any();
     }
@@ -1029,7 +1053,7 @@ impl Drop for SimulatedFile {
             let file = r.files.get_mut(&self.path).expect("file is missing");
             assert!(file.is_opened);
             file.is_opened = false;
-            file.buffered_content.clear();
+            file.buffered_content = file.persisted_content.clone();
             file.changes.clear();
         });
     }
@@ -1055,6 +1079,9 @@ impl runtime::File for SimulatedFile {
                 panic!("file is already opened");
             }
             file.is_opened = true;
+            file.cursor = 0;
+            file.changes = vec![];
+            file.buffered_content = file.persisted_content.clone();
 
             SimulatedFile {
                 path: path.as_ref().to_path_buf(),
@@ -1145,6 +1172,7 @@ impl runtime::File for SimulatedFile {
             for (i, b) in buff.iter().cloned().enumerate() {
                 file.buffered_content[file.cursor + i] = b;
             }
+            file.changes.push((file.cursor, buff.len()));
             file.cursor = file.cursor + buff.len();
         }))
     }
@@ -1164,7 +1192,7 @@ impl runtime::File for SimulatedFile {
                 let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
                 let r = r.deref_mut();
                 let file = r.files.get_mut(&self.path).expect("the file should exists");
-                file.persisted_content = std::mem::take(&mut file.buffered_content);
+                file.persisted_content = file.buffered_content.clone();
                 file.changes.clear();
             });
             return Ok(());
@@ -1177,7 +1205,7 @@ impl runtime::File for SimulatedFile {
             let mut changes = Vec::default();
             for (offset, size) in file.changes.drain(..) {
                 for i in offset..offset + size {
-                    changes[i] = (i, file.buffered_content[i]);
+                    changes.push((i, file.buffered_content[i]));
                 }
             }
             changes.shuffle(&mut r.rng);
@@ -1213,7 +1241,7 @@ impl runtime::File for SimulatedFile {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let r = r.deref_mut();
             let file = r.files.get_mut(&self.path).expect("the file should exists");
-            file.buffered_content.clear();
+            file.buffered_content = file.persisted_content.clone();
             file.changes.clear();
             file.cursor = 0;
         });
@@ -1231,8 +1259,10 @@ impl runtime::File for SimulatedFile {
                 let to_add = size as usize - file.buffered_content.len();
                 file.buffered_content
                     .extend(std::iter::repeat(0).take(to_add));
+                // TODO: should the file.changes recorded?
             } else {
                 file.buffered_content.truncate(size as usize);
+                // TODO: should the file.changes recorded?
             }
         }))
     }
@@ -1485,24 +1515,93 @@ mod tests {
         let rng: Arc<parking_lot::Mutex<StdRng>> = Arc::new(parking_lot::Mutex::new(
             rand::rngs::StdRng::seed_from_u64(0),
         ));
+        let n = 10u64;
+
+        let success = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        use std::sync::atomic::Ordering::SeqCst;
+
+        for _ in 0..100 {
+            let rng = rng.clone();
+            let success = success.clone();
+            let failed = failed.clone();
+            runtime.run(move || {
+                let mut f = SimulatedFile::open("dummy").expect("cannot open file");
+                let size = f.len().unwrap();
+                assert!(size <= n);
+                if size == n {
+                    let mut buff = vec![0u8; n as usize];
+                    f.read_exact(&mut buff).unwrap();
+                    let is_fail = buff[1..].iter().any(|b| *b != buff[0]);
+                    if is_fail {
+                        failed.store(true, SeqCst);
+                    } else {
+                        success.store(true, SeqCst);
+                    }
+                }
+
+                let v = rng.lock().next_u64() as u8;
+                f.seek(std::io::SeekFrom::Start(0)).unwrap();
+                f.write_all(vec![v; n as usize].as_slice())
+                    .expect("cannot write bytes");
+
+                f.sync().unwrap();
+            });
+        }
+
+        assert!(success.load(SeqCst) && failed.load(SeqCst))
+    }
+
+    #[test]
+    fn test_atomically_writing_file() {
+        setup();
+        let mut runtime = SimulatedRuntime::new(0);
+        let rng: Arc<parking_lot::Mutex<StdRng>> = Arc::new(parking_lot::Mutex::new(
+            rand::rngs::StdRng::seed_from_u64(0),
+        ));
+        let n = 10u64;
 
         for _ in 0..100 {
             let rng = rng.clone();
             runtime.run(move || {
-                let mut f = SimulatedFile::open("dummy").expect("cannot open file");
-                let size = f.len().unwrap();
-                assert!(size == 0 || size == 10);
-                if size == 10 {
-                    let mut buff = [0u8; 10];
-                    f.read_exact(&mut buff).unwrap();
+                let mut f1 = SimulatedFile::open("dummy_1").expect("cannot open file");
+                let mut f2 = SimulatedFile::open("dummy_2").expect("cannot open file");
+
+                if f2.len().unwrap() == n + 8 {
+                    let mut buff = vec![0u8; n as usize + 8];
+                    f2.read_exact(&mut buff).unwrap();
+                    let calculated_checksum = crc64::crc64(0x1d0f, &buff[..n as usize]);
+                    let checksum = u64::from_be_bytes(buff[n as usize..].try_into().unwrap());
+                    if calculated_checksum == checksum {
+                        f1.seek(std::io::SeekFrom::Start(0)).unwrap();
+                        f1.write_all(&buff[..n as usize]).unwrap();
+                    }
+                }
+
+                let size = f1.len().unwrap();
+                assert!(size == 0 || size == n);
+                if size == n {
+                    let mut buff = vec![0u8; n as usize];
+                    f1.seek(std::io::SeekFrom::Start(0)).unwrap();
+                    f1.read_exact(&mut buff).unwrap();
                     assert!(buff[1..].iter().all(|b| *b == buff[0]));
                 }
 
                 let v = rng.lock().next_u64() as u8;
-                f.write_all(&[v, v, v, v, v, v, v, v, v, v])
-                    .expect("cannot write bytes");
+                let to_write = vec![v; n as usize];
 
-                f.sync().unwrap();
+                let checksum = crc64::crc64(0x1d0f, &to_write);
+                let checksum = checksum.to_be_bytes();
+
+                f2.seek(std::io::SeekFrom::Start(0)).unwrap();
+                f2.write_all(&to_write).unwrap();
+                f2.write_all(&checksum).unwrap();
+                f2.sync().unwrap();
+
+                f1.seek(std::io::SeekFrom::Start(0)).unwrap();
+                f1.write_all(&to_write).expect("cannot write bytes");
+                f1.sync().unwrap();
             });
         }
     }
