@@ -1,16 +1,15 @@
-use crate::file_lock::FileLock;
 use crate::id::{Lsn, PageId};
 use crate::pager::log::WalSync;
 use crate::pager::page::PageMeta;
+use crate::runtime::{File, Runtime};
 use anyhow::anyhow;
 use indexmap::IndexSet;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::path::Path;
 
-pub(crate) struct FileManager {
-    main: File,
-    double_buff: File,
+pub(crate) struct FileManager<R: Runtime> {
+    main: R::File,
+    double_buff: R::File,
     page_size: usize,
 
     n: usize,
@@ -19,29 +18,17 @@ pub(crate) struct FileManager {
     lsns: Box<[Lsn]>,
 }
 
-impl FileManager {
+impl<R: Runtime> FileManager<R> {
     pub(crate) fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
         let main_path = path.join("main");
         let double_buff_path = path.join("dbuff");
 
-        let mut main = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(main_path)?
-            .lock()?;
-        if !main.metadata()?.is_file() {
+        let mut main = R::File::open(main_path)?;
+        if !main.is_file()? {
             return Err(anyhow!("db file is not a regular file"));
         }
-        let mut double_buff = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(double_buff_path)?
-            .lock()?;
-        if !double_buff.metadata()?.is_file() {
+        let mut double_buff = R::File::open(double_buff_path)?;
+        if !double_buff.is_file()? {
             return Err(anyhow!("double buffer file is not a regular file"));
         }
 
@@ -59,11 +46,11 @@ impl FileManager {
     }
 
     fn recover_non_atomic_writes(
-        f: &mut File,
-        dbuff: &mut File,
+        f: &mut R::File,
+        dbuff: &mut R::File,
         page_size: usize,
     ) -> anyhow::Result<()> {
-        let size = dbuff.metadata()?.len();
+        let size = dbuff.len()?;
         let count = (size as usize) / page_size;
 
         let mut buff = vec![0u8; page_size * count];
@@ -78,20 +65,20 @@ impl FileManager {
             Self::write_page_no_sync(f, page_size as u64, meta.id(), buff)?;
         }
 
-        f.sync_all()?;
+        f.sync()?;
         Ok(())
     }
 
     fn write_page_no_sync(
-        f: &mut File,
+        f: &mut R::File,
         page_size: u64,
         id: PageId,
         buff: &[u8],
     ) -> anyhow::Result<()> {
-        let file_size = f.metadata()?.len();
+        let file_size = f.len()?;
         let min_size = id.get() * page_size + page_size;
         if min_size > file_size {
-            f.set_len(id.get() * page_size + page_size)?;
+            f.truncate(id.get() * page_size + page_size)?;
         }
         f.seek(SeekFrom::Start(id.get() * page_size))?;
         f.write_all(buff)?;
@@ -125,10 +112,10 @@ impl FileManager {
     }
 
     pub(crate) fn sync(&mut self, wal: &impl WalSync) -> anyhow::Result<()> {
-        self.double_buff.set_len(0)?;
+        self.double_buff.truncate(0)?;
         self.double_buff.seek(SeekFrom::Start(0))?;
         self.double_buff.write_all(&self.pages)?;
-        self.double_buff.sync_all()?;
+        self.double_buff.sync()?;
 
         if let Some(max_lsn) = (0..self.pgids.len()).map(|i| self.lsns[i]).max() {
             wal.sync(max_lsn)?;
@@ -137,16 +124,16 @@ impl FileManager {
         for (i, pgid) in self.pgids.iter().enumerate() {
             // TODO: maybe we can use vectorized write to write them all in one single syscall
             let page_size = self.page_size as u64;
-            let file_size = self.main.metadata()?.len();
+            let file_size = self.main.len()?;
             let min_size = pgid.get() * page_size + page_size;
             if min_size > file_size {
-                self.main.set_len(pgid.get() * page_size + page_size)?;
+                self.main.truncate(pgid.get() * page_size + page_size)?;
             }
             self.main.seek(SeekFrom::Start(pgid.get() * page_size))?;
             let buff = &self.pages[i * self.page_size..(i + 1) * self.page_size];
             self.main.write_all(buff)?;
         }
-        self.main.sync_all()?;
+        self.main.sync()?;
         self.pgids.clear();
 
         Ok(())
@@ -158,7 +145,7 @@ impl FileManager {
             Ok(true)
         } else {
             let page_size = self.page_size as u64;
-            let file_size = self.main.metadata()?.len();
+            let file_size = self.main.len()?;
             let min_size = pgid.get() * page_size + page_size;
             if min_size > file_size {
                 return Ok(false);

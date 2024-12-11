@@ -447,6 +447,7 @@ fn resume_any() {
             // the timer waiting list and update the ticks
             // this is like jumping into the future.
             let (target, thread_id) = r.timer_wait.pop_first().expect("nothing is ready");
+            log::trace!(thread_id; "timer_resuming");
             r.thread_timer.remove(&thread_id);
             r.ticks = target + 1;
             let waker = r
@@ -696,14 +697,20 @@ impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
         {
             *self.locker.lock() = None;
         }
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_1");
         RUNTIME.with_borrow(|r| {
+            log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_1.5");
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_2");
             if let Some(s) = r.mutex_wait.remove(&self.id) {
+                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_3");
                 for t in s {
                     r.ready.push(t);
                 }
             }
+            log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_4");
         });
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_5");
     }
 }
 
@@ -747,9 +754,11 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
         }
     }
 
+    #[track_caller]
     fn read(&self) -> Self::ReadGuard<'_> {
         park();
         let current = THREAD_ID.get();
+        let loc = format!("{}", std::panic::Location::caller());
 
         loop {
             let mut locker = self.locker.lock();
@@ -760,13 +769,13 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
                 }
                 RwMutexState::ReadBlocked(_) => {
                     drop(locker);
-                    log::trace!(thread_id=current,rwmutex_id=self.id; "rwmutex_read_acquiring_blocked_1");
+                    log::trace!(thread_id=current,rwmutex_id=self.id,loc; "rwmutex_read_acquiring_blocked_1");
                     enqueue_rwmutex_for_read(self.id);
                     switch();
                 }
                 RwMutexState::Write(writer) => {
                     drop(locker);
-                    log::trace!(thread_id=current,rwmutex_id=self.id,writer; "rwmutex_read_acquiring_blocked_2");
+                    log::trace!(thread_id=current,rwmutex_id=self.id,writer,loc; "rwmutex_read_acquiring_blocked_2");
                     enqueue_rwmutex_for_read(self.id);
                     switch();
                 }
@@ -777,7 +786,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
             }
         }
 
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_read_acquired");
+        log::trace!(thread_id=current,mutex_id=self.id,loc; "rwmutex_read_acquired");
 
         park();
         SimulatedRwMutexReadGuard {
@@ -787,22 +796,25 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
         }
     }
 
+    #[track_caller]
     fn write(&self) -> Self::WriteGuard<'_> {
         park();
+
+        let loc = format!("{}", std::panic::Location::caller());
 
         loop {
             let current = THREAD_ID.get();
             let mut locker = self.locker.lock();
             match *locker {
                 RwMutexState::Read(n) => {
-                    log::trace!(thread_id=current,rwmutex_id=self.id; "rwmutex_write_acquiring_blocked_1");
+                    log::trace!(thread_id=current,rwmutex_id=self.id,loc; "rwmutex_write_acquiring_blocked_1");
                     *locker = RwMutexState::ReadBlocked(n);
                     drop(locker);
                     enqueue_rwmutex_for_write(self.id);
                     switch();
                 }
                 RwMutexState::ReadBlocked(_) | RwMutexState::Write(_) => {
-                    log::trace!(thread_id=current,rwmutex_id=self.id; "rwmutex_write_acquiring_blocked_2");
+                    log::trace!(thread_id=current,rwmutex_id=self.id,loc; "rwmutex_write_acquiring_blocked_2");
                     drop(locker);
                     enqueue_rwmutex_for_write(self.id);
                     switch();
@@ -816,7 +828,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
 
         park();
 
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_write_acquired");
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,loc; "rwmutex_write_acquired");
         SimulatedRwMutexWriteGuard {
             id: self.id,
             locker: &self.locker,
@@ -824,8 +836,11 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
         }
     }
 
+    #[track_caller]
     fn try_write(&self) -> Option<Self::WriteGuard<'_>> {
         park();
+
+        let loc = format!("{}", std::panic::Location::caller());
 
         let current = THREAD_ID.get();
         let mut locker = self.locker.lock();
@@ -840,7 +855,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
 
         park();
 
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_try_write_acquired");
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,loc; "rwmutex_try_write_acquired");
         Some(SimulatedRwMutexWriteGuard {
             id: self.id,
             locker: &self.locker,
@@ -1363,7 +1378,7 @@ impl_atomic!(AtomicI64, i64);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::experiment::runtime::*;
+    use crate::runtime::*;
 
     use std::sync::Once;
     static INIT: Once = Once::new();

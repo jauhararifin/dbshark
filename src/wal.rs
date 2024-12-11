@@ -1,29 +1,25 @@
-use crate::file_lock::FileLock;
-use crate::id::Lsn;
-use crate::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
-use crate::pager::MAXIMUM_PAGE_SIZE;
+use super::id::Lsn;
+use super::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
+use super::pager::MAXIMUM_PAGE_SIZE;
+use super::runtime::{File, Mutex, Runtime, RwMutex, Timer, TimerHandle};
 use anyhow::{anyhow, Context};
-use parking_lot::{Mutex, RwLock};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::sync::Arc;
-use std::thread::spawn;
 
 const BUFFER_SIZE: usize = MAXIMUM_PAGE_SIZE * 20;
 
-pub(crate) struct Wal {
-    f1: Arc<Mutex<WalFile>>,
-    f2: Arc<Mutex<WalFile>>,
-    buffer: Arc<RwLock<Buffer>>,
-    internal: Arc<RwLock<WalInternal>>,
-    flush_trigger: SyncSender<()>,
-    iter_backward_lock: Mutex<Vec<u8>>,
+pub(crate) struct Wal<R: Runtime> {
+    f1: Arc<R::Mutex<WalFile<R>>>,
+    f2: Arc<R::Mutex<WalFile<R>>>,
+    buffer: Arc<R::RwMutex<Buffer>>,
+    internal: Arc<R::RwMutex<WalInternal>>,
+    flush_trigger: R::TimerHandle,
+    iter_backward_lock: R::Mutex<Vec<u8>>,
 }
 
-struct WalFile {
-    f: File,
+struct WalFile<R: Runtime> {
+    f: R::File,
     relative_lsn: u64,
     is_empty: bool,
     checkpoint: bool,
@@ -59,37 +55,35 @@ struct WalInternal {
     first_unflushed: Lsn,
 }
 
-impl Wal {
-    fn new(f1: WalFile, f2: WalFile, use_wal_1: bool, next_lsn: Lsn) -> Self {
-        let internal = Arc::new(RwLock::new(WalInternal {
+impl<R: Runtime> Wal<R> {
+    fn new(f1: WalFile<R>, f2: WalFile<R>, use_wal_1: bool, next_lsn: Lsn) -> Self {
+        let internal = Arc::new(R::RwMutex::new(WalInternal {
             temp_buffer: vec![0u8; MAXIMUM_PAGE_SIZE],
             use_wal_1,
             next: next_lsn,
             first_unflushed: next_lsn,
         }));
-        let f1 = Arc::new(Mutex::new(f1));
-        let f2 = Arc::new(Mutex::new(f2));
-        let buffer = Arc::new(RwLock::new(Buffer {
+        let f1 = Arc::new(R::Mutex::new(f1));
+        let f2 = Arc::new(R::Mutex::new(f2));
+        let buffer = Arc::new(R::RwMutex::new(Buffer {
             buff: vec![0u8; BUFFER_SIZE],
             start_offset: 0,
             end_offset: 0,
         }));
 
-        let (flush_trigger, flush_signal) = std::sync::mpsc::sync_channel::<()>(0);
+        let (mut timer, timer_handle) = R::timer(std::time::Duration::from_secs(3600));
         {
             let internal = internal.clone();
             let buffer = buffer.clone();
             let f1 = f1.clone();
             let f2 = f2.clone();
-            spawn(move || loop {
-                let result = flush_signal.recv_timeout(std::time::Duration::from_secs(3600));
-                if result == Err(RecvTimeoutError::Disconnected) {
-                    return;
-                }
-                let mut internal = internal.write();
-                let mut buffer = buffer.write();
-                if let Err(err) = Wal::flush(&mut internal, &mut buffer, &f1, &f2) {
-                    log::error!("wal_flush_error err={err}");
+            R::spawn(move || {
+                while timer.wait() {
+                    let mut internal = internal.write();
+                    let mut buffer = buffer.write();
+                    if let Err(err) = Self::flush(&mut internal, &mut buffer, &f1, &f2) {
+                        log::error!("wal_flush_error err={err}");
+                    }
                 }
             });
         }
@@ -100,7 +94,7 @@ impl Wal {
             f2,
             buffer,
             internal,
-            flush_trigger,
+            flush_trigger: timer_handle,
             iter_backward_lock: Mutex::new(backward_buffer),
         }
     }
@@ -124,12 +118,17 @@ impl Wal {
             relative_lsn: old_f.relative_lsn,
         };
 
-        let mut buff = [0u8; WAL_HEADER_SIZE * 2];
+        let mut buff = [0u8; WAL_HEADER_SIZE];
         header.encode(&mut buff[..WAL_HEADER_SIZE]);
-        header.encode(&mut buff[WAL_HEADER_SIZE..]);
+
         old_f.f.seek(SeekFrom::Start(0))?;
         old_f.f.write_all(&buff)?;
-        old_f.f.sync_all()?;
+        old_f.f.sync()?;
+
+        old_f.f.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        old_f.f.write_all(&buff)?;
+        old_f.f.sync()?;
+
         old_f.is_empty = false;
         old_f.checkpoint = true;
 
@@ -138,10 +137,10 @@ impl Wal {
 
     fn end_transaction(
         internal: &mut WalInternal,
-        f1: &Mutex<WalFile>,
-        f2: &Mutex<WalFile>,
+        f1: &R::Mutex<WalFile<R>>,
+        f2: &R::Mutex<WalFile<R>>,
         buffer: &mut Buffer,
-        iter_backward_lock: &Mutex<Vec<u8>>,
+        iter_backward_lock: &R::Mutex<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let backward_iter_guard = iter_backward_lock.try_lock();
         assert!(
@@ -201,7 +200,7 @@ impl Wal {
         internal.next.add_assign(size as u64);
 
         if buffer.len() > buffer.size() / 4 {
-            let _ = self.flush_trigger.try_send(());
+            self.flush_trigger.trigger();
         }
 
         if matches!(entry.kind, WalKind::End { .. }) {
@@ -221,8 +220,8 @@ impl Wal {
     fn flush(
         internal: &mut WalInternal,
         buffer: &mut Buffer,
-        f1: &Mutex<WalFile>,
-        f2: &Mutex<WalFile>,
+        f1: &R::Mutex<WalFile<R>>,
+        f2: &R::Mutex<WalFile<R>>,
     ) -> anyhow::Result<()> {
         let f = if internal.use_wal_1 { f1 } else { f2 };
         let mut f = f.lock();
@@ -232,7 +231,7 @@ impl Wal {
     fn flush_internal(
         internal: &mut WalInternal,
         buffer: &mut Buffer,
-        f: &mut WalFile,
+        f: &mut WalFile<R>,
     ) -> anyhow::Result<()> {
         log::debug!(
             "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={} first_unflushed={:?} next={:?}",
@@ -254,7 +253,7 @@ impl Wal {
             };
             header.encode(&mut buff[..WAL_HEADER_SIZE]);
             header.encode(&mut buff[WAL_HEADER_SIZE..]);
-            f.f.set_len(0)?;
+            f.f.truncate(0)?;
             f.f.seek(SeekFrom::Start(0))?;
             f.f.write_all(&buff)?;
             f.is_empty = false;
@@ -269,7 +268,7 @@ impl Wal {
         } else {
             f.f.write_all(&buffer.buff[buffer.start_offset..buffer.end_offset])?;
         }
-        f.f.sync_all()?;
+        f.f.sync()?;
 
         buffer.start_offset = 0;
         buffer.end_offset = 0;
@@ -280,7 +279,7 @@ impl Wal {
 
     #[cfg(test)]
     pub(crate) fn trigger_flush(&self) -> anyhow::Result<()> {
-        Wal::flush(
+        Self::flush(
             &mut self.internal.write(),
             &mut self.buffer.write(),
             &self.f1,
@@ -377,7 +376,7 @@ impl Wal {
                 start_offset = buffer_len - len;
                 end_offset = buffer_len;
 
-                let f: &mut WalFile = &mut f.lock();
+                let f: &mut WalFile<R> = &mut f.lock();
                 if f.is_empty {
                     break;
                 }
@@ -420,35 +419,25 @@ impl Wal {
     }
 }
 
-pub(crate) fn recover<F>(path: &Path, mut handler: F) -> anyhow::Result<Wal>
-where
-    F: FnMut(Lsn, WalEntry) -> anyhow::Result<()>,
-{
+pub(crate) fn recover<R: Runtime>(
+    path: &Path,
+    mut handler: impl FnMut(Lsn, WalEntry) -> anyhow::Result<()>,
+) -> anyhow::Result<Wal<R>> {
     let wal_path_1 = path.join("wal_1");
-    let wal_file_1 = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&wal_path_1)?
-        .lock()?;
-    if !wal_file_1.metadata()?.is_file() {
+    let wal_file_1 = R::File::open(&wal_path_1)?;
+    if !wal_file_1.is_file()? {
         return Err(anyhow!("{wal_path_1:?} is not a regular file"));
     }
-    let mut f1 = recover_wal_file(wal_file_1).context("cannot init wal file {wal_path_1:?}")?;
+    let mut f1 = recover_wal_file::<R>(wal_file_1)
+        .with_context(|| format!("cannot init wal file {wal_path_1:?}"))?;
 
     let wal_path_2 = path.join("wal_2");
-    let wal_file_2 = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&wal_path_2)?
-        .lock()?;
-    if !wal_file_2.metadata()?.is_file() {
+    let wal_file_2 = R::File::open(&wal_path_2)?;
+    if !wal_file_2.is_file()? {
         return Err(anyhow!("{wal_path_2:?} is not a regular file"));
     }
-    let mut f2 = recover_wal_file(wal_file_2).context("cannot init wal file {wal_path_2:?}")?;
+    let mut f2 = recover_wal_file::<R>(wal_file_2)
+        .with_context(|| format!("cannot init wal file {wal_path_2:?}"))?;
 
     let (mut use_wal_1, checkpoint) = match (f1.checkpoint, f2.checkpoint) {
         (Some(f1_lsn), Some(f2_lsn)) => {
@@ -463,9 +452,7 @@ where
         (None, None) => (true, Lsn::new(0)),
     };
 
-    log::debug!(
-        "recovering f1={f1:?} f2={f2:?} start_with_1={use_wal_1} checkpoint={checkpoint:?}"
-    );
+    log::debug!(f1:?,f2:?,use_wal_1,checkpoint:?; "recovering");
 
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut next_lsn = checkpoint;
@@ -535,8 +522,8 @@ where
     Ok(Wal::new(f1.into(), f2.into(), use_wal_1, next_lsn))
 }
 
-fn recover_wal_file(mut f: File) -> anyhow::Result<RecoveringWalFile> {
-    let file_size = f.metadata()?.len();
+fn recover_wal_file<R: Runtime>(mut f: R::File) -> anyhow::Result<RecoveringWalFile<R>> {
+    let file_size = f.len()?;
     if file_size < WAL_HEADER_SIZE as u64 * 2 {
         return Ok(RecoveringWalFile {
             f,
@@ -553,12 +540,18 @@ fn recover_wal_file(mut f: File) -> anyhow::Result<RecoveringWalFile> {
     let Some(header) = WalHeader::decode(&buff[..WAL_HEADER_SIZE])
         .or_else(|| WalHeader::decode(&buff[WAL_HEADER_SIZE..]))
     else {
-        return Err(anyhow!(
-            "corrupted wal file header, both header segment are corrupted"
-        ));
+        // if the first and second part of the wal header is invalid, this means
+        // that the wal file is not written successfully, and we can assume that
+        // it never been written just like an empty wal.
+        return Ok(RecoveringWalFile {
+            f,
+            relative_lsn: 0,
+            checkpoint: None,
+            is_empty: true,
+        });
     };
 
-    log::debug!("wal_header_decoded header={header:?}");
+    log::info!("wal_header_decoded header={header:?}");
 
     if header.version != 0 {
         return Err(anyhow!("only wal version 0 is supported"));
@@ -572,15 +565,15 @@ fn recover_wal_file(mut f: File) -> anyhow::Result<RecoveringWalFile> {
     })
 }
 
-struct RecoveringWalFile {
-    f: File,
+struct RecoveringWalFile<R: Runtime> {
+    f: R::File,
     relative_lsn: u64,
     checkpoint: Option<Lsn>,
     is_empty: bool,
 }
 
-impl From<RecoveringWalFile> for WalFile {
-    fn from(value: RecoveringWalFile) -> Self {
+impl<R: Runtime> From<RecoveringWalFile<R>> for WalFile<R> {
+    fn from(value: RecoveringWalFile<R>) -> Self {
         Self {
             f: value.f,
             relative_lsn: value.relative_lsn,
@@ -590,7 +583,7 @@ impl From<RecoveringWalFile> for WalFile {
     }
 }
 
-impl std::fmt::Debug for RecoveringWalFile {
+impl<R: Runtime> std::fmt::Debug for RecoveringWalFile<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -602,16 +595,17 @@ impl std::fmt::Debug for RecoveringWalFile {
 
 #[cfg(test)]
 mod tests {
+    use super::super::id::{PageId, TxId};
+    use super::super::log::TxState;
+    use super::super::os::OsRuntime;
     use super::*;
-    use crate::id::{PageId, TxId};
-    use crate::log::TxState;
     use rand::Rng;
 
     #[test]
     fn test_flushing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
         let mut last_seen_lsn = None;
         for i in 1..=10 {
             let lsn = wal.append_log(WalEntry {
@@ -631,7 +625,7 @@ mod tests {
         }
         drop(wal);
 
-        let wal = recover(dir.path(), |_, _| {
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| {
             panic!("since the wal is not flushed yet, there should be no entry")
         })?;
 
@@ -657,7 +651,7 @@ mod tests {
 
         let mut i = 1;
         let mut last_seen_lsn = None;
-        let wal = recover(dir.path(), |lsn, entry| {
+        let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
             if let Some(last_seen_lsn) = last_seen_lsn {
                 assert!(
                     lsn > last_seen_lsn,
@@ -684,7 +678,7 @@ mod tests {
     fn test_checkpoint() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -732,7 +726,7 @@ mod tests {
 
         let mut i = 11;
         let mut checkpoint_consumed = false;
-        let wal = recover(dir.path(), |lsn, entry| {
+        let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
@@ -776,7 +770,7 @@ mod tests {
     fn test_recovering_from_wal_1_and_2() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -844,7 +838,7 @@ mod tests {
 
         let mut i = 11;
         let mut checkpoint_consumed = false;
-        let wal = recover(dir.path(), |lsn, entry| {
+        let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
@@ -937,7 +931,7 @@ mod tests {
 
         let mut i = 31;
         let mut checkpoint_consumed = false;
-        let wal = recover(dir.path(), |lsn, entry| {
+        let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
@@ -998,7 +992,7 @@ mod tests {
             },
         };
 
-        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
         for i in 1..=5 {
             wal.append_log(dummy_entry(i))?;
         }
@@ -1032,7 +1026,7 @@ mod tests {
 
         let mut i = 16;
         let mut checkpoint_consumed = false;
-        let wal = recover(dir.path(), |lsn, entry| {
+        let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
@@ -1102,7 +1096,7 @@ mod tests {
 
         let mut i = 36;
         let mut checkpoint_consumed = false;
-        let wal = recover(dir.path(), |lsn, entry| {
+        let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
@@ -1155,7 +1149,7 @@ mod tests {
         let n = BUFFER_SIZE as u64 / entry.size() as u64;
 
         {
-            let wal = recover(dir.path(), |_, _| Ok(()))?;
+            let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
 
             for i in 0u64..3 * n {
                 wal.append_log(WalEntry {
@@ -1177,7 +1171,7 @@ mod tests {
         }
 
         let mut i = 0;
-        recover(dir.path(), |_, entry| {
+        recover::<OsRuntime>(dir.path(), |_, entry| {
             if i < 3 * n {
                 assert_eq!(
                     WalKind::Begin {
@@ -1214,7 +1208,8 @@ mod tests {
 
         for _ in 0..100 {
             let mut checkpoint_consumed = false;
-            let wal = recover(dir.path(), |lsn, entry| {
+
+            let wal = recover::<OsRuntime>(dir.path(), |lsn, entry| {
                 assert!(lsn >= last_lsn);
                 last_lsn = lsn;
                 assert!(entry.clr.is_none());
@@ -1349,7 +1344,7 @@ mod tests {
 
         let mut entries = vec![];
 
-        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
         for i in 1..=5 {
             let entry = dummy_entry(i);
             let lsn = wal.append_log(entry.clone())?;
@@ -1407,7 +1402,7 @@ mod tests {
 
         let mut entries = vec![];
 
-        let wal = recover(dir.path(), |_, _| Ok(()))?;
+        let wal = recover::<OsRuntime>(dir.path(), |_, _| Ok(()))?;
         for i in 1..=5 {
             let entry = dummy_entry(i);
             let lsn = wal.append_log(entry.clone())?;

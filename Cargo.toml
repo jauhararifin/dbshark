@@ -22,7 +22,3 @@ tempfile = "3.10.1"
 [[bench]]
 name = "db_benchmark"
 harness = false
-
-[[test]]
-name = "db_crash"
-harness = false

@@ -4,23 +4,24 @@ use crate::pager::{
     BTreeCell, InteriorPage, InteriorPageWrite, LeafCell, LeafPage, LeafPageRead, LeafPageWrite,
     LogContext, OverflowPage, OverflowPageRead, PageOps, PageRead, PageWrite, PageWriteOps, Pager,
 };
+use crate::runtime::Runtime;
 use crate::wal::Wal;
 use anyhow::anyhow;
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 
-pub(crate) struct BTree<'a> {
+pub(crate) struct BTree<'a, R: Runtime> {
     txid: TxId,
-    pager: &'a Pager,
-    ctx: LogContext<'a>,
+    pager: &'a Pager<R>,
+    ctx: LogContext<'a, R>,
     root: PageId,
 }
 
 const MAX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
 
-struct LookupForUpdateResult<'a> {
-    interiors: Vec<LookupHop<InteriorPageWrite<PageWrite<'a>>>>,
-    leaf: LookupHop<LeafPageWrite<PageWrite<'a>>>,
+struct LookupForUpdateResult<'a, R: Runtime> {
+    interiors: Vec<LookupHop<InteriorPageWrite<PageWrite<'a, R>>>>,
+    leaf: LookupHop<LeafPageWrite<PageWrite<'a, R>>>,
 }
 
 struct LookupHop<T> {
@@ -29,7 +30,12 @@ struct LookupHop<T> {
     found: bool,
 }
 
-pub(crate) fn new<'a>(txid: TxId, pager: &'a Pager, wal: &'a Wal, root: PageId) -> BTree<'a> {
+pub(crate) fn new<'a, R: Runtime>(
+    txid: TxId,
+    pager: &'a Pager<R>,
+    wal: &'a Wal<R>,
+    root: PageId,
+) -> BTree<'a, R> {
     BTree {
         txid,
         pager,
@@ -38,7 +44,7 @@ pub(crate) fn new<'a>(txid: TxId, pager: &'a Pager, wal: &'a Wal, root: PageId) 
     }
 }
 
-impl<'a> BTree<'a> {
+impl<'a, R: Runtime> BTree<'a, R> {
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         if key.len() + value.len() > MAX_ENTRY_SIZE {
             return Err(anyhow!("key-value pair is too large"));
@@ -99,7 +105,7 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    fn lookup_for_insert(&self, key: &[u8]) -> anyhow::Result<LookupForUpdateResult<'a>> {
+    fn lookup_for_insert(&self, key: &[u8]) -> anyhow::Result<LookupForUpdateResult<'a, R>> {
         let mut hops = Vec::default();
 
         let mut current = self.pager.write(&self.ctx, self.txid, self.root)?;
@@ -144,7 +150,7 @@ impl<'a> BTree<'a> {
 
     fn delete_leaf_cell(
         &self,
-        page: &mut LeafPageWrite<PageWrite>,
+        page: &mut LeafPageWrite<PageWrite<R>>,
         index: usize,
     ) -> anyhow::Result<()> {
         let cell = page.get(index);
@@ -165,7 +171,7 @@ impl<'a> BTree<'a> {
 
     fn insert_content_to_leaf(
         &self,
-        node: &mut LeafPageWrite<PageWrite>,
+        node: &mut LeafPageWrite<PageWrite<R>>,
         index: usize,
         mut content: impl Content,
         key_size: usize,
@@ -201,7 +207,7 @@ impl<'a> BTree<'a> {
     // TODO: maybe can combine this to insert_content_to_leaf.
     fn insert_content_to_interior(
         &self,
-        node: &mut InteriorPageWrite<PageWrite>,
+        node: &mut InteriorPageWrite<PageWrite<R>>,
         index: usize,
         content: &mut impl Content,
         ptr: PageId,
@@ -236,12 +242,12 @@ impl<'a> BTree<'a> {
 
     fn leaf_split_and_insert<'b>(
         &self,
-        left_leaf: &mut LeafPageWrite<PageWrite>,
-        new_right_leaf: &'b mut LeafPageWrite<PageWrite>,
+        left_leaf: &mut LeafPageWrite<PageWrite<R>>,
+        new_right_leaf: &'b mut LeafPageWrite<PageWrite<R>>,
         index: usize,
         key: &[u8],
         value: &[u8],
-    ) -> anyhow::Result<BTreeContent<'b>>
+    ) -> anyhow::Result<BTreeContent<'b, R>>
     where
         'a: 'b,
     {
@@ -286,8 +292,8 @@ impl<'a> BTree<'a> {
     //  [B]->[C]  - The other half of A's initial items will be moved to C
     fn split_root_leaf(
         &self,
-        a: LeafPageWrite<PageWrite>,
-        mut b: LeafPageWrite<PageWrite>,
+        a: LeafPageWrite<PageWrite<R>>,
+        mut b: LeafPageWrite<PageWrite<R>>,
         c: PageId,
         pivot: &mut impl Content,
     ) -> anyhow::Result<()> {
@@ -308,7 +314,7 @@ impl<'a> BTree<'a> {
 
     fn propagate_interior_splitting(
         &mut self,
-        mut interiors: Vec<LookupHop<InteriorPageWrite<PageWrite>>>,
+        mut interiors: Vec<LookupHop<InteriorPageWrite<PageWrite<R>>>>,
         mut right_pgid: PageId,
         mut pivot: impl Content,
     ) -> anyhow::Result<()> {
@@ -355,12 +361,12 @@ impl<'a> BTree<'a> {
 
     fn interior_split_and_insert<'b>(
         &mut self,
-        left_interior: &mut InteriorPageWrite<PageWrite>,
-        new_right_interior: &'b mut InteriorPageWrite<PageWrite>,
+        left_interior: &mut InteriorPageWrite<PageWrite<R>>,
+        new_right_interior: &'b mut InteriorPageWrite<PageWrite<R>>,
         index: usize,
         mut pivot: impl Content,
         ptr: PageId,
-    ) -> anyhow::Result<BTreeContent<'b>>
+    ) -> anyhow::Result<BTreeContent<'b, R>>
     where
         'a: 'b,
     {
@@ -443,8 +449,8 @@ impl<'a> BTree<'a> {
     //  [B]->[C]  - The other half of A's initial items will be moved to C
     fn split_interior_root(
         &self,
-        a: InteriorPageWrite<PageWrite>,
-        b: PageWrite,
+        a: InteriorPageWrite<PageWrite<R>>,
+        b: PageWrite<R>,
         c: PageId,
         pivot: &mut impl Content,
     ) -> anyhow::Result<()> {
@@ -465,7 +471,7 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    fn new_page(&self) -> anyhow::Result<PageWrite<'a>> {
+    fn new_page(&self) -> anyhow::Result<PageWrite<'a, R>> {
         let Some(_freelist_pgid) = self.pager.read_state().freelist else {
             let page = self.pager.alloc(self.ctx, self.txid)?;
             return Ok(page);
@@ -483,7 +489,7 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> anyhow::Result<Option<GetResult>> {
+    pub(crate) fn get(&self, key: &[u8]) -> anyhow::Result<Option<GetResult<R>>> {
         let mut current = self.pager.read(&self.ctx, self.txid, self.root)?;
         let page = loop {
             if !current.is_interior() {
@@ -523,7 +529,7 @@ impl<'a> BTree<'a> {
 
     fn search_key_in_interior(
         &self,
-        node: &'a impl InteriorPage<'a>,
+        node: &impl InteriorPage<'a>,
         key: &[u8],
     ) -> anyhow::Result<(usize, bool)> {
         // TODO: use binary search instead
@@ -547,7 +553,7 @@ impl<'a> BTree<'a> {
 
     fn search_key_in_leaf(
         &self,
-        node: &'a impl LeafPage<'a>,
+        node: &impl LeafPage<'a>,
         key: &[u8],
     ) -> anyhow::Result<(usize, bool)> {
         // TODO: use binary search instead
@@ -569,7 +575,7 @@ impl<'a> BTree<'a> {
         Ok((i, found))
     }
 
-    pub(crate) fn range(&self, range: impl RangeBounds<[u8]>) -> anyhow::Result<Cursor> {
+    pub(crate) fn range(&self, range: impl RangeBounds<[u8]>) -> anyhow::Result<Cursor<R>> {
         let (start, skip_first) = match range.start_bound() {
             Bound::Included(key) => (self.find_position(key)?, false),
             Bound::Excluded(key) => (self.find_position(key)?, true),
@@ -609,7 +615,7 @@ impl<'a> BTree<'a> {
     fn find_position(
         &self,
         key: &[u8],
-    ) -> anyhow::Result<Option<(LeafPageRead<PageRead<'a>>, usize)>> {
+    ) -> anyhow::Result<Option<(LeafPageRead<PageRead<'a, R>>, usize)>> {
         let mut current = self.pager.read(&self.ctx, self.txid, self.root)?;
         let page = loop {
             if !current.is_interior() {
@@ -637,15 +643,15 @@ impl<'a> BTree<'a> {
     }
 }
 
-pub(crate) struct GetResult<'a> {
-    ctx: LogContext<'a>,
-    pager: &'a Pager,
+pub(crate) struct GetResult<'a, R: Runtime> {
+    ctx: LogContext<'a, R>,
+    pager: &'a Pager<R>,
     txid: TxId,
-    page: LeafPageRead<PageRead<'a>>,
+    page: LeafPageRead<PageRead<'a, R>>,
     index: usize,
 }
 
-impl GetResult<'_> {
+impl<R: Runtime> GetResult<'_, R> {
     pub(crate) fn get(self) -> anyhow::Result<KVItem> {
         let cell = self.page.get(self.index);
         let total_size = cell.key_size() + cell.val_size();
@@ -675,22 +681,22 @@ impl KVItem {
     }
 }
 
-pub(crate) enum Cursor<'a> {
+pub(crate) enum Cursor<'a, R: Runtime> {
     Empty,
     Leaf {
         txid: TxId,
-        ctx: LogContext<'a>,
-        pager: &'a Pager,
+        ctx: LogContext<'a, R>,
+        pager: &'a Pager<R>,
         skip_current: bool,
 
-        current_page: Option<LeafPageRead<PageRead<'a>>>,
+        current_page: Option<LeafPageRead<PageRead<'a, R>>>,
         current_index: usize,
 
         end: Bound<(PageId, usize)>,
     },
 }
 
-impl<'a> Cursor<'a> {
+impl<'a, R: Runtime> Cursor<'a, R> {
     pub(crate) fn next(&mut self) -> anyhow::Result<Option<KVItem>> {
         if let Self::Leaf { skip_current, .. } = self {
             if *skip_current {
@@ -799,16 +805,16 @@ impl Content for KeyValContent<'_> {
     }
 }
 
-struct BTreeContent<'a> {
-    ctx: LogContext<'a>,
-    pager: &'a Pager,
+struct BTreeContent<'a, R: Runtime> {
+    ctx: LogContext<'a, R>,
+    pager: &'a Pager<R>,
     remaining: usize,
     txid: TxId,
 
-    kind: BTreeContentKind<'a>,
+    kind: BTreeContentKind<'a, R>,
 }
 
-enum BTreeContentKind<'a> {
+enum BTreeContentKind<'a, R: Runtime> {
     None,
     Owned {
         raw: Box<[u8]>,
@@ -820,15 +826,15 @@ enum BTreeContentKind<'a> {
         overflow: Option<PageId>,
     },
     Overflow {
-        overflow: OverflowPageRead<PageRead<'a>>,
+        overflow: OverflowPageRead<PageRead<'a, R>>,
         offset: usize,
     },
 }
 
-impl<'a> BTreeContent<'a> {
+impl<'a, R: Runtime> BTreeContent<'a, R> {
     fn from_pivot(
-        ctx: LogContext<'a>,
-        pager: &'a Pager,
+        ctx: LogContext<'a, R>,
+        pager: &'a Pager<R>,
         txid: TxId,
         raw: Box<[u8]>,
         overflow: Option<PageId>,
@@ -848,8 +854,8 @@ impl<'a> BTreeContent<'a> {
     }
 
     fn from_cell(
-        ctx: LogContext<'a>,
-        pager: &'a Pager,
+        ctx: LogContext<'a, R>,
+        pager: &'a Pager<R>,
         txid: TxId,
         cell: impl BTreeCell<'a>,
     ) -> Self {
@@ -868,8 +874,8 @@ impl<'a> BTreeContent<'a> {
     }
 
     fn from_leaf_content(
-        ctx: LogContext<'a>,
-        pager: &'a Pager,
+        ctx: LogContext<'a, R>,
+        pager: &'a Pager<R>,
         txid: TxId,
         cell: &'a LeafCell,
     ) -> Self {
@@ -886,7 +892,7 @@ impl<'a> BTreeContent<'a> {
     }
 }
 
-impl<'a> Content for BTreeContent<'a> {
+impl<'a, R: Runtime> Content for BTreeContent<'a, R> {
     fn remaining(&self) -> usize {
         self.remaining
     }

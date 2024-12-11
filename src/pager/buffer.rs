@@ -1,22 +1,21 @@
+use super::page::PageMeta;
 use crate::id::TxId;
-use crate::pager::page::PageMeta;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::runtime::{Atomic, Runtime, RwMutex, RwMutexReadGuard, RwMutexWriteGuard};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) struct BufferPool {
+pub(crate) struct BufferPool<R: Runtime> {
     page_size: usize,
     n: usize,
-    allocated: AtomicUsize,
-    locks: Box<[RwLock<()>]>,
+    allocated: R::AtomicUsize,
+    locks: Box<[R::RwMutex<()>]>,
     metas: *mut MaybeUninit<PageMeta>,
     buffer: *mut u8,
 }
 
-unsafe impl std::marker::Send for BufferPool {}
-unsafe impl std::marker::Sync for BufferPool {}
+unsafe impl<R: Runtime> std::marker::Send for BufferPool<R> {}
+unsafe impl<R: Runtime> std::marker::Sync for BufferPool<R> {}
 
-impl BufferPool {
+impl<R: Runtime> BufferPool<R> {
     pub(crate) fn new(page_size: usize, n: usize) -> Self {
         let metas = (0..n)
             .map(|_| MaybeUninit::uninit())
@@ -24,21 +23,21 @@ impl BufferPool {
             .leak()
             .as_mut_ptr();
         let locks = (0..n)
-            .map(|_| RwLock::new(()))
+            .map(|_| R::RwMutex::new(()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
             page_size,
             n,
-            allocated: AtomicUsize::new(0),
+            allocated: R::AtomicUsize::new(0),
             locks,
             metas,
             buffer: vec![0u8; page_size * n].leak().as_mut_ptr(),
         }
     }
 
-    pub(crate) fn read(&self, index: usize) -> ReadFrame {
-        assert!(index < self.allocated.load(Ordering::SeqCst));
+    pub(crate) fn read(&self, index: usize) -> ReadFrame<R> {
+        assert!(index < self.allocated.load());
         assert!(index < self.n);
 
         let _guard = self.locks[index].read();
@@ -69,7 +68,7 @@ impl BufferPool {
         }
     }
 
-    pub(crate) fn write(&self, txid: TxId, index: usize) -> WriteFrame {
+    pub(crate) fn write(&self, txid: TxId, index: usize) -> WriteFrame<R> {
         let item = self.write_internal(index);
         WriteFrame {
             index,
@@ -80,8 +79,8 @@ impl BufferPool {
         }
     }
 
-    pub(crate) fn write_internal(&self, index: usize) -> BufferPoolItem {
-        assert!(index < self.allocated.load(Ordering::SeqCst));
+    pub(crate) fn write_internal(&self, index: usize) -> BufferPoolItem<R> {
+        assert!(index < self.allocated.load());
         assert!(index < self.n);
 
         let guard = self.locks[index].write();
@@ -111,22 +110,19 @@ impl BufferPool {
         }
     }
 
-    pub(crate) fn alloc(&self, txid: TxId, init: PageMeta) -> Option<WriteFrame> {
+    pub(crate) fn alloc(&self, txid: TxId, init: PageMeta) -> Option<WriteFrame<R>> {
         let (guard, index) = loop {
-            let allocated = self.allocated.load(Ordering::SeqCst);
+            let allocated = self.allocated.load();
             if allocated >= self.n {
                 return None;
             }
             let Some(guard) = self.locks[allocated].try_write() else {
                 continue;
             };
-            let result = self.allocated.compare_exchange(
-                allocated,
-                allocated + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-            if result.is_ok() {
+            let result = self
+                .allocated
+                .compare_and_exchange(allocated, allocated + 1);
+            if result {
                 break (guard, allocated);
             }
         };
@@ -161,7 +157,7 @@ impl BufferPool {
     }
 }
 
-impl Drop for BufferPool {
+impl<R: Runtime> Drop for BufferPool<R> {
     fn drop(&mut self) {
         unsafe {
             drop(Vec::from_raw_parts(self.metas, self.n, self.n));
@@ -174,41 +170,41 @@ impl Drop for BufferPool {
     }
 }
 
-pub(crate) struct ReadFrame<'a> {
+pub(crate) struct ReadFrame<'a, R: Runtime> {
     pub(crate) index: usize,
-    _guard: RwLockReadGuard<'a, ()>,
+    _guard: RwMutexReadGuard<'a, R, ()>,
     pub(super) meta: &'a PageMeta,
     pub(super) buffer: &'a [u8],
 }
 
-impl<'a> From<WriteFrame<'a>> for ReadFrame<'a> {
-    fn from(value: WriteFrame<'a>) -> Self {
+impl<'a, R: Runtime> From<WriteFrame<'a, R>> for ReadFrame<'a, R> {
+    fn from(value: WriteFrame<'a, R>) -> Self {
         Self {
             index: value.index,
-            _guard: RwLockWriteGuard::downgrade(value.guard),
+            _guard: RwMutexReadGuard::<'a, R, ()>::from(value.guard),
             meta: value.meta,
             buffer: value.buffer,
         }
     }
 }
 
-pub(crate) struct WriteFrame<'a> {
+pub(crate) struct WriteFrame<'a, R: Runtime> {
     pub(super) index: usize,
-    guard: RwLockWriteGuard<'a, ()>,
+    guard: RwMutexWriteGuard<'a, R, ()>,
     pub(super) txid: TxId,
     pub(super) meta: &'a mut PageMeta,
     pub(super) buffer: &'a mut [u8],
 }
 
-impl std::fmt::Debug for WriteFrame<'_> {
+impl<R: Runtime> std::fmt::Debug for WriteFrame<'_, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.meta.fmt(f)
     }
 }
 
-impl BufferPool {
-    pub(crate) fn walk(&self) -> impl Iterator<Item = BufferPoolItem> {
-        let allocated = self.allocated.load(Ordering::SeqCst);
+impl<R: Runtime> BufferPool<R> {
+    pub(crate) fn walk(&self) -> impl Iterator<Item = BufferPoolItem<R>> {
+        let allocated = self.allocated.load();
         let allocated = std::cmp::min(allocated, self.n);
         BufferPoolWalk {
             pool: self,
@@ -218,20 +214,20 @@ impl BufferPool {
     }
 }
 
-pub(crate) struct BufferPoolWalk<'a> {
-    pool: &'a BufferPool,
+pub(crate) struct BufferPoolWalk<'a, R: Runtime> {
+    pool: &'a BufferPool<R>,
     i: usize,
     count: usize,
 }
 
-pub(crate) struct BufferPoolItem<'a> {
-    guard: RwLockWriteGuard<'a, ()>,
+pub(crate) struct BufferPoolItem<'a, R: Runtime> {
+    guard: RwMutexWriteGuard<'a, R, ()>,
     pub(super) meta: &'a mut PageMeta,
     pub(super) buffer: &'a mut [u8],
 }
 
-impl<'a> Iterator for BufferPoolWalk<'a> {
-    type Item = BufferPoolItem<'a>;
+impl<'a, R: Runtime> Iterator for BufferPoolWalk<'a, R> {
+    type Item = BufferPoolItem<'a, R>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.count {
@@ -248,18 +244,19 @@ impl<'a> Iterator for BufferPoolWalk<'a> {
 mod tests {
     use super::*;
     use crate::id::{Lsn, PageId};
+    use crate::os::OsRuntime;
     use crate::pager::page::PageKind;
+    use crate::runtime::{Atomic, Runtime};
     use rand::Rng;
-    use std::sync::atomic::AtomicI32;
 
     #[test]
     fn test_allocation() {
         let iteration = 100;
         let txid = TxId::new(1).unwrap();
         for _ in 0..iteration {
-            let pool = BufferPool::new(128, 100);
-            let success_count = AtomicI32::new(0);
-            let failed_count = AtomicI32::new(0);
+            let pool = BufferPool::<OsRuntime>::new(128, 100);
+            let success_count = <OsRuntime as Runtime>::AtomicI32::new(0);
+            let failed_count = <OsRuntime as Runtime>::AtomicI32::new(0);
 
             std::thread::scope(|scope| {
                 for _ in 0..150 {
@@ -276,23 +273,23 @@ mod tests {
                             )
                             .is_some();
                         if success {
-                            success_count.fetch_add(1, Ordering::SeqCst);
+                            success_count.fetch_add(1);
                         } else {
-                            failed_count.fetch_add(1, Ordering::SeqCst);
+                            failed_count.fetch_add(1);
                         }
                     });
                 }
             });
 
-            assert_eq!(100, success_count.into_inner());
-            assert_eq!(50, failed_count.into_inner());
+            assert_eq!(100, success_count.load());
+            assert_eq!(50, failed_count.load());
         }
     }
 
     #[test]
     fn test_concurrent_read_write() {
         let n = 100;
-        let pool = BufferPool::new(128, n);
+        let pool = BufferPool::<OsRuntime>::new(128, n);
         let txid = TxId::new(1).unwrap();
         for i in 0u64..n as u64 {
             let result = pool.alloc(
@@ -335,7 +332,7 @@ mod tests {
         let n = 100;
         let txid = TxId::new(1).unwrap();
         loop {
-            let pool = BufferPool::new(128, n);
+            let pool = BufferPool::<OsRuntime>::new(128, n);
             std::thread::scope(|scope| {
                 let pool = &pool;
                 let mut randomizer = rand::thread_rng();

@@ -2,6 +2,7 @@ use super::log::LogContext;
 use crate::bins::SliceExt;
 use crate::content::{Bytes, Content};
 use crate::id::{Lsn, LsnExt, PageId, PageIdExt, TxId};
+use crate::runtime::Runtime;
 use anyhow::anyhow;
 use std::ops::Range;
 
@@ -522,9 +523,9 @@ pub(crate) struct PageInternalWrite<'a> {
 pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
     fn internal_mut(&mut self) -> PageInternalWrite;
 
-    fn init_interior(
+    fn init_interior<R: Runtime>(
         mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         last: PageId,
     ) -> anyhow::Result<InteriorPageWrite<Self>> {
         let page_size = self.internal().buffer.len();
@@ -561,9 +562,9 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
         }
     }
 
-    fn set_interior(
+    fn set_interior<R: Runtime>(
         mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         payload: &'a [u8],
     ) -> anyhow::Result<InteriorPageWrite<Self>> {
         assert!(
@@ -584,7 +585,10 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
             .expect("the page should be an interior now"))
     }
 
-    fn init_leaf(mut self, ctx: LogContext<'_>) -> anyhow::Result<LeafPageWrite<Self>> {
+    fn init_leaf<R: Runtime>(
+        mut self,
+        ctx: LogContext<'_, R>,
+    ) -> anyhow::Result<LeafPageWrite<Self>> {
         let page_size = self.internal().buffer.len();
         if let PageKind::None = self.internal().meta.kind {
             let pgid = self.id();
@@ -608,9 +612,9 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
         Ok(leaf)
     }
 
-    fn set_leaf(
+    fn set_leaf<R: Runtime>(
         mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         payload: &'a [u8],
     ) -> anyhow::Result<LeafPageWrite<Self>> {
         assert!(
@@ -639,7 +643,10 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
         }
     }
 
-    fn init_overflow(mut self, ctx: LogContext<'_>) -> anyhow::Result<OverflowPageWrite<Self>> {
+    fn init_overflow<R: Runtime>(
+        mut self,
+        ctx: LogContext<'_, R>,
+    ) -> anyhow::Result<OverflowPageWrite<Self>> {
         if let PageKind::None = self.internal().meta.kind {
             let pgid = self.id();
             let internal = self.internal_mut();
@@ -660,9 +667,9 @@ pub(crate) trait PageWriteOps<'a>: PageOps<'a> {
         Ok(overflow)
     }
 
-    fn set_overflow(
+    fn set_overflow<R: Runtime>(
         mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         payload: &'a [u8],
     ) -> anyhow::Result<OverflowPageWrite<Self>> {
         assert!(
@@ -815,7 +822,7 @@ impl<'a, T> InteriorPageWrite<T>
 where
     T: PageWriteOps<'a>,
 {
-    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
+    pub(crate) fn reset<R: Runtime>(mut self, ctx: LogContext<'_, R>) -> anyhow::Result<T> {
         let pgid = self.id();
         let internal = self.internal_mut();
         internal.meta.encode(internal.buffer)?;
@@ -827,7 +834,11 @@ where
         Ok(self.0)
     }
 
-    pub(crate) fn set_last(&mut self, ctx: LogContext<'_>, new_last: PageId) -> anyhow::Result<()> {
+    pub(crate) fn set_last<R: Runtime>(
+        &mut self,
+        ctx: LogContext<'_, R>,
+        new_last: PageId,
+    ) -> anyhow::Result<()> {
         let pgid = self.id();
         let internal = self.internal_mut();
         let PageKind::Interior(ref mut kind) = internal.meta.kind else {
@@ -841,9 +852,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_cell_ptr(
+    pub(crate) fn set_cell_ptr<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         index: usize,
         ptr: PageId,
     ) -> anyhow::Result<()> {
@@ -863,9 +874,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_cell_overflow(
+    pub(crate) fn set_cell_overflow<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         index: usize,
         overflow_pgid: Option<PageId>,
     ) -> anyhow::Result<()> {
@@ -890,9 +901,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn insert_cell(
+    pub(crate) fn insert_cell<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         i: usize,
         cell: InteriorCell,
     ) -> anyhow::Result<()> {
@@ -943,9 +954,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn insert_content(
+    pub(crate) fn insert_content<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,
@@ -1077,7 +1088,11 @@ where
         })
     }
 
-    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, mut f: F) -> anyhow::Result<usize>
+    pub(crate) fn split<F, R: Runtime>(
+        &mut self,
+        ctx: LogContext<'_, R>,
+        mut f: F,
+    ) -> anyhow::Result<usize>
     where
         for<'c> F: FnMut(InteriorCell<'c>) -> anyhow::Result<()>,
     {
@@ -1146,7 +1161,11 @@ where
         Ok(n_cells_to_keep)
     }
 
-    pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
+    pub(crate) fn delete<R: Runtime>(
+        &mut self,
+        ctx: LogContext<'_, R>,
+        index: usize,
+    ) -> anyhow::Result<()> {
         let pgid = self.id();
         let internal = self.internal();
         log::debug!(
@@ -1298,7 +1317,7 @@ impl<'a, T> LeafPageWrite<T>
 where
     T: PageWriteOps<'a>,
 {
-    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
+    pub(crate) fn reset<R: Runtime>(mut self, ctx: LogContext<'_, R>) -> anyhow::Result<T> {
         let pgid = self.id();
         let internal = self.internal_mut();
         internal.meta.encode(internal.buffer)?;
@@ -1310,7 +1329,11 @@ where
         Ok(self.0)
     }
 
-    pub(crate) fn delete(&mut self, ctx: LogContext<'_>, index: usize) -> anyhow::Result<()> {
+    pub(crate) fn delete<R: Runtime>(
+        &mut self,
+        ctx: LogContext<'_, R>,
+        index: usize,
+    ) -> anyhow::Result<()> {
         let pgid = self.id();
         let internal = self.internal();
         log::debug!(
@@ -1359,9 +1382,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_next(
+    pub(crate) fn set_next<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         new_next: Option<PageId>,
     ) -> anyhow::Result<()> {
         let pgid = self.id();
@@ -1377,9 +1400,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_cell_overflow(
+    pub(crate) fn set_cell_overflow<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         index: usize,
         overflow_pgid: Option<PageId>,
     ) -> anyhow::Result<()> {
@@ -1404,9 +1427,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn insert_cell(
+    pub(crate) fn insert_cell<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         i: usize,
         cell: LeafCell,
     ) -> anyhow::Result<()> {
@@ -1472,9 +1495,9 @@ where
         kind.offset - raw_size
     }
 
-    pub(crate) fn insert_content(
+    pub(crate) fn insert_content<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         i: usize,
         content: &mut impl Content,
         key_size: usize,
@@ -1587,7 +1610,11 @@ where
         })
     }
 
-    pub(crate) fn split<F>(&mut self, ctx: LogContext<'_>, mut f: F) -> anyhow::Result<usize>
+    pub(crate) fn split<F, R: Runtime>(
+        &mut self,
+        ctx: LogContext<'_, R>,
+        mut f: F,
+    ) -> anyhow::Result<usize>
     where
         for<'c> F: FnMut(LeafCell<'c>) -> anyhow::Result<()>,
     {
@@ -1713,9 +1740,9 @@ impl<'a, T> OverflowPageWrite<T>
 where
     T: PageWriteOps<'a>,
 {
-    pub(crate) fn set_next(
+    pub(crate) fn set_next<R: Runtime>(
         &mut self,
-        ctx: LogContext,
+        ctx: LogContext<'_, R>,
         new_next: Option<PageId>,
     ) -> anyhow::Result<()> {
         let pgid = self.id();
@@ -1732,9 +1759,9 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_content(
+    pub(crate) fn set_content<R: Runtime>(
         &mut self,
-        ctx: LogContext<'_>,
+        ctx: LogContext<'_, R>,
         content: &mut impl Content,
         next: Option<PageId>,
     ) -> anyhow::Result<()> {
@@ -1761,7 +1788,10 @@ where
         Ok(())
     }
 
-    pub(crate) fn unset_content(&mut self, ctx: LogContext<'_>) -> anyhow::Result<()> {
+    pub(crate) fn unset_content<R: Runtime>(
+        &mut self,
+        ctx: LogContext<'_, R>,
+    ) -> anyhow::Result<()> {
         let pgid = self.id();
         let internal = self.internal_mut();
         let kind = internal.meta.kind.overflow_mut();
@@ -1777,7 +1807,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn reset(mut self, ctx: LogContext<'_>) -> anyhow::Result<T> {
+    pub(crate) fn reset<R: Runtime>(mut self, ctx: LogContext<'_, R>) -> anyhow::Result<T> {
         let pgid = self.id();
         let internal = self.internal_mut();
         internal.meta.encode(internal.buffer)?;

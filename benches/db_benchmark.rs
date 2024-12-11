@@ -1,6 +1,6 @@
 use criterion::profiler::Profiler;
 use criterion::{criterion_group, criterion_main, Criterion};
-use dbshark::experiment::{Db, OsRuntime, Setting};
+use dbshark::{Db, OsRuntime, Setting};
 use pprof::ProfilerGuard;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;

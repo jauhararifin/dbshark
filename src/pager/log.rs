@@ -1,20 +1,21 @@
 use crate::content::Bytes;
 use crate::id::{Lsn, PageId, TxId};
 use crate::log::{WalEntry, WalKind};
+use crate::runtime::Runtime;
 use crate::wal::Wal;
 
 pub(crate) trait WalSync {
     fn sync(&self, lsn: Lsn) -> anyhow::Result<()>;
 }
 
-impl WalSync for Wal {
+impl<R: Runtime> WalSync for Wal<R> {
     fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
         Wal::sync(self, lsn)?;
         Ok(())
     }
 }
 
-impl WalSync for LogContext<'_> {
+impl<R: Runtime> WalSync for LogContext<'_, R> {
     fn sync(&self, lsn: Lsn) -> anyhow::Result<()> {
         let wal = match self {
             Self::Runtime(wal) => wal,
@@ -27,14 +28,25 @@ impl WalSync for LogContext<'_> {
     }
 }
 
-#[derive(Copy, Clone)]
-pub(crate) enum LogContext<'a> {
-    Runtime(&'a Wal),
+pub(crate) enum LogContext<'a, R: Runtime> {
+    Runtime(&'a Wal<R>),
     Redo(Lsn),
-    Undo(&'a Wal, Lsn),
+    Undo(&'a Wal<R>, Lsn),
 }
 
-impl<'a> LogContext<'a> {
+impl<'a, R: Runtime> Clone for LogContext<'a, R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Runtime(wal) => Self::Runtime(wal),
+            Self::Redo(lsn) => Self::Redo(*lsn),
+            Self::Undo(wal, lsn) => Self::Undo(wal, *lsn),
+        }
+    }
+}
+
+impl<'a, R: Runtime> Copy for LogContext<'a, R> {}
+
+impl<'a, R: Runtime> LogContext<'a, R> {
     pub(crate) fn record1<'e, F>(&self, entry: F) -> anyhow::Result<Lsn>
     where
         F: FnOnce() -> WalKind<'e>,

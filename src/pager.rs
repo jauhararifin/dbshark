@@ -1,31 +1,45 @@
+mod buffer;
+mod evictor;
+mod file_manager;
+mod log;
+mod page;
+
 use crate::id::{Lsn, PageId, TxId};
-use crate::pager::buffer::{BufferPool, ReadFrame, WriteFrame};
-use crate::pager::evictor::Evictor;
-use crate::pager::file_manager::FileManager;
-use crate::pager::log::{LogContext, WalSync};
-use crate::pager::page::{
-    PageInternal, PageInternalWrite, PageKind, PageMeta, PageOps, PageWriteOps,
-};
-use crate::pager::{MAXIMUM_PAGE_SIZE, MINIMUM_PAGE_SIZE};
+use crate::runtime::{Mutex, Runtime, RwMutex, RwMutexReadGuard};
 use crate::wal::Wal;
 use anyhow::anyhow;
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use buffer::{BufferPool, ReadFrame, WriteFrame};
+use evictor::Evictor;
+use file_manager::FileManager;
+use log::WalSync;
+use page::{PageInternal, PageInternalWrite, PageKind, PageMeta};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub(crate) struct Pager {
-    state: RwLock<DbState>,
-    pool: BufferPool,
-    internal: RwLock<PagerInternal>,
-    evictor: Mutex<Evictor>,
-    file: RwLock<FileManager>,
+pub(crate) use crate::pager::log::LogContext;
+pub(crate) use page::{
+    BTreeCell, InteriorPage, InteriorPageWrite, LeafCell, LeafPage, LeafPageRead, LeafPageWrite,
+    OverflowPage, OverflowPageRead, PageOps, PageWriteOps,
+};
+
+extern crate log as logging;
+
+pub(crate) const MINIMUM_PAGE_SIZE: usize = 256;
+pub(crate) const MAXIMUM_PAGE_SIZE: usize = 0x4000;
+
+pub(crate) struct Pager<R: Runtime> {
+    state: R::RwMutex<DbState>,
+    pool: BufferPool<R>,
+    internal: R::RwMutex<PagerInternal>,
+    evictor: R::Mutex<Evictor>,
+    file: R::RwMutex<FileManager<R>>,
 }
 
 struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
 }
 
-impl Pager {
+impl<R: Runtime> Pager<R> {
     pub(crate) fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
         Self::check_page_size(page_size)?;
         if n < 10 {
@@ -35,13 +49,13 @@ impl Pager {
         }
 
         Ok(Self {
-            state: RwLock::new(DbState::default()),
+            state: R::RwMutex::new(DbState::default()),
             pool: BufferPool::new(page_size, n),
-            internal: RwLock::new(PagerInternal {
+            internal: R::RwMutex::new(PagerInternal {
                 page_to_frame: HashMap::with_capacity(n),
             }),
-            evictor: Mutex::new(Evictor::new(n)),
-            file: RwLock::new(FileManager::new(path, page_size, 10)?),
+            evictor: R::Mutex::new(Evictor::new(n)),
+            file: RwMutex::new(FileManager::new(path, page_size, 10)?),
         })
     }
 
@@ -75,8 +89,8 @@ impl Pager {
         wal: &impl WalSync,
         txid: TxId,
         pgid: PageId,
-    ) -> anyhow::Result<PageRead> {
-        log::trace!("read {txid:?} {pgid:?}");
+    ) -> anyhow::Result<PageRead<R>> {
+        logging::trace!("read {txid:?} {pgid:?}");
 
         let page_count = self.state.read().page_count;
         assert!(
@@ -94,7 +108,7 @@ impl Pager {
         }
         drop(internal);
 
-        let frame = self.acquire::<ReadFrame>(wal, txid, pgid)?;
+        let frame = self.acquire::<ReadFrame<R>>(wal, txid, pgid)?;
         Ok(PageRead { pager: self, frame })
     }
 
@@ -103,7 +117,7 @@ impl Pager {
         wal: &impl WalSync,
         txid: TxId,
         pgid: PageId,
-    ) -> anyhow::Result<PageWrite> {
+    ) -> anyhow::Result<PageWrite<R>> {
         let page_count = self.state.read().page_count;
         assert!(
             pgid.get() < page_count,
@@ -120,15 +134,15 @@ impl Pager {
         }
         drop(internal);
 
-        let frame = self.acquire::<WriteFrame>(wal, txid, pgid)?;
+        let frame = self.acquire::<WriteFrame<R>>(wal, txid, pgid)?;
         Ok(PageWrite { pager: self, frame })
     }
 
     fn acquire<'a, T>(&'a self, wal: &impl WalSync, txid: TxId, pgid: PageId) -> anyhow::Result<T>
     where
-        T: BufferPoolFrame<'a> + From<WriteFrame<'a>>,
+        T: BufferPoolFrame<'a, R> + From<WriteFrame<'a, R>>,
     {
-        log::trace!("acquire {txid:?} {pgid:?}");
+        logging::trace!("acquire {txid:?} {pgid:?}");
         let mut internal = self.internal.write();
         let page_count = self.state.read().page_count;
         assert!(
@@ -162,7 +176,7 @@ impl Pager {
     }
 
     fn fetch_page(
-        file: &mut FileManager,
+        file: &mut FileManager<R>,
         pgid: PageId,
         buff: &mut [u8],
     ) -> anyhow::Result<PageMeta> {
@@ -189,8 +203,12 @@ impl Pager {
         Ok(meta)
     }
 
-    pub(crate) fn alloc(&self, ctx: LogContext, txid: TxId) -> anyhow::Result<PageWrite> {
-        log::trace!("alloc {txid:?}");
+    pub(crate) fn alloc(
+        &self,
+        ctx: LogContext<'_, R>,
+        txid: TxId,
+    ) -> anyhow::Result<PageWrite<R>> {
+        logging::trace!("alloc {txid:?}");
         let pgid = {
             let mut state = self.state.write();
             state.page_count += 1;
@@ -224,10 +242,10 @@ impl Pager {
 
     pub(crate) fn dealloc(
         &self,
-        ctx: LogContext,
+        ctx: LogContext<'_, R>,
         txid: TxId,
         pgid: PageId,
-    ) -> anyhow::Result<PageWrite> {
+    ) -> anyhow::Result<PageWrite<R>> {
         let page = self.write(&ctx, txid, pgid)?;
         page.frame.meta.lsn = ctx.record_dealloc(txid, pgid)?;
         page.frame.meta.dirty = true;
@@ -235,7 +253,7 @@ impl Pager {
         Ok(page)
     }
 
-    pub(crate) fn set_state<F>(&self, ctx: LogContext, f: F) -> anyhow::Result<()>
+    pub(crate) fn set_state<F>(&self, ctx: LogContext<'_, R>, f: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut DbState),
     {
@@ -253,7 +271,7 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn read_state(&self) -> RwLockReadGuard<DbState> {
+    pub(crate) fn read_state(&self) -> RwMutexReadGuard<'_, R, DbState> {
         self.state.read()
     }
 
@@ -261,7 +279,7 @@ impl Pager {
     // considered different component, this DB combines them together. During checkpoint, all
     // dirty pages are flushed. This makes the checkpoint process longer, but simpler. We also
     // don't need checkpoint-end log record.
-    pub(crate) fn checkpoint(&self, wal: &Wal) -> anyhow::Result<()> {
+    pub(crate) fn checkpoint(&self, wal: &Wal<R>) -> anyhow::Result<()> {
         let mut first_unflushed = wal.first_unflushed();
         for item in self.pool.walk() {
             let should_flush = item.meta.lsn >= first_unflushed;
@@ -280,7 +298,7 @@ impl Pager {
     }
 
     fn release(&self, frame_id: usize, is_dirty: bool) {
-        log::trace!("release frame_id={frame_id} is_dirty={is_dirty}");
+        logging::trace!("release frame_id={frame_id} is_dirty={is_dirty}");
         self.evictor.lock().released(frame_id, is_dirty);
     }
 
@@ -296,34 +314,34 @@ pub(crate) struct DbState {
     pub(crate) page_count: u64,
 }
 
-pub(crate) trait BufferPoolFrame<'a> {
-    fn get(pool: &'a BufferPool, txid: TxId, index: usize) -> Self;
+pub(crate) trait BufferPoolFrame<'a, R: Runtime> {
+    fn get(pool: &'a BufferPool<R>, txid: TxId, index: usize) -> Self;
 }
 
-impl<'a> BufferPoolFrame<'a> for ReadFrame<'a> {
-    fn get(pool: &'a BufferPool, _txid: TxId, index: usize) -> Self {
+impl<'a, R: Runtime> BufferPoolFrame<'a, R> for ReadFrame<'a, R> {
+    fn get(pool: &'a BufferPool<R>, _txid: TxId, index: usize) -> Self {
         pool.read(index)
     }
 }
 
-impl<'a> BufferPoolFrame<'a> for WriteFrame<'a> {
-    fn get(pool: &'a BufferPool, txid: TxId, index: usize) -> Self {
+impl<'a, R: Runtime> BufferPoolFrame<'a, R> for WriteFrame<'a, R> {
+    fn get(pool: &'a BufferPool<R>, txid: TxId, index: usize) -> Self {
         pool.write(txid, index)
     }
 }
 
-pub(crate) struct PageRead<'a> {
-    pub(super) pager: &'a Pager,
-    pub(super) frame: ReadFrame<'a>,
+pub(crate) struct PageRead<'a, R: Runtime> {
+    pub(super) pager: &'a Pager<R>,
+    pub(super) frame: ReadFrame<'a, R>,
 }
 
-impl<'a> Drop for PageRead<'a> {
+impl<'a, R: Runtime> Drop for PageRead<'a, R> {
     fn drop(&mut self) {
         self.pager.release(self.frame.index, self.frame.meta.dirty);
     }
 }
 
-impl<'a> PageOps<'a> for PageRead<'a> {
+impl<'a, R: Runtime> PageOps<'a> for PageRead<'a, R> {
     #[inline]
     fn internal(&self) -> PageInternal {
         PageInternal {
@@ -333,18 +351,18 @@ impl<'a> PageOps<'a> for PageRead<'a> {
     }
 }
 
-pub(crate) struct PageWrite<'a> {
-    pub(super) pager: &'a Pager,
-    pub(super) frame: WriteFrame<'a>,
+pub(crate) struct PageWrite<'a, R: Runtime> {
+    pub(super) pager: &'a Pager<R>,
+    pub(super) frame: WriteFrame<'a, R>,
 }
 
-impl<'a> std::fmt::Debug for PageWrite<'a> {
+impl<'a, R: Runtime> std::fmt::Debug for PageWrite<'a, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.frame.fmt(f)
     }
 }
 
-impl<'a> PageOps<'a> for PageWrite<'a> {
+impl<'a, R: Runtime> PageOps<'a> for PageWrite<'a, R> {
     #[inline]
     fn internal(&self) -> PageInternal {
         PageInternal {
@@ -354,7 +372,7 @@ impl<'a> PageOps<'a> for PageWrite<'a> {
     }
 }
 
-impl<'a> PageWriteOps<'a> for PageWrite<'a> {
+impl<'a, R: Runtime> PageWriteOps<'a> for PageWrite<'a, R> {
     #[inline]
     fn internal_mut(&mut self) -> PageInternalWrite {
         PageInternalWrite {
@@ -365,7 +383,7 @@ impl<'a> PageWriteOps<'a> for PageWrite<'a> {
     }
 }
 
-impl<'a> Drop for PageWrite<'a> {
+impl<'a, R: Runtime> Drop for PageWrite<'a, R> {
     fn drop(&mut self) {
         self.pager.release(self.frame.index, self.frame.meta.dirty);
     }
@@ -375,6 +393,7 @@ impl<'a> Drop for PageWrite<'a> {
 mod tests {
     use super::*;
     use crate::content::Bytes;
+    use crate::os::OsRuntime;
 
     struct NoopWalSync;
 
@@ -391,12 +410,12 @@ mod tests {
         let txid = TxId::new(1).unwrap();
 
         for i in 0..20 {
-            let ctx = LogContext::Redo(Lsn::new(1));
+            let ctx = LogContext::<OsRuntime>::Redo(Lsn::new(1));
             let page = pager.alloc(ctx, txid).unwrap();
             assert_eq!(i, page.id().get());
             let mut leaf = page.init_leaf(ctx).unwrap();
             for j in 0..5 {
-                leaf.insert_content(ctx, j, &mut Bytes::new(b"abc"), 3, 0, None)
+                leaf.insert_content::<OsRuntime>(ctx, j, &mut Bytes::new(b"abc"), 3, 0, None)
                     .unwrap();
             }
             leaf.set_next(ctx, PageId::new(5)).unwrap();
@@ -406,7 +425,7 @@ mod tests {
             let page = pager
                 .write(&NoopWalSync, txid, PageId::new(i).unwrap())
                 .unwrap();
-            let ctx = LogContext::Redo(Lsn::new(1));
+            let ctx = LogContext::<OsRuntime>::Redo(Lsn::new(1));
             let mut leaf = page.into_write_leaf().unwrap();
             leaf.set_next(ctx, None).unwrap();
             for j in (0..5).rev() {

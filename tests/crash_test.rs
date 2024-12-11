@@ -1,4 +1,4 @@
-use dbshark::experiment::{Db, JoinHandle, Runtime, Setting, SimulatedRuntime};
+use dbshark::{Db, JoinHandle, Runtime, Setting, SimulatedRuntime};
 use rand::{Rng, SeedableRng};
 use std::path::PathBuf;
 use std::sync::Arc;

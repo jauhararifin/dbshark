@@ -1,33 +1,31 @@
 use crate::bins::SliceExt;
 use crate::btree::{BTree, Cursor};
-use crate::file_lock::FileLock;
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
 use crate::pager::{LogContext, PageOps, Pager};
 use crate::recovery::{recover, undo_txn};
+use crate::runtime::{
+    Atomic, File, JoinHandle, Runtime, RwMutex, RwMutexReadGuard, RwMutexWriteGuard, Timer,
+    TimerHandle,
+};
 use crate::wal::Wal;
 use anyhow::anyhow;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
 use std::ops::RangeBounds;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::path::Path;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
-use std::{fs::File, path::Path};
 
-pub struct Db {
-    pager: Arc<Pager>,
-    wal: Arc<Wal>,
+pub struct Db<R: Runtime> {
+    pager: Arc<Pager<R>>,
+    wal: Arc<Wal<R>>,
 
-    tx_lock: RwLock<()>,
-    next_txid: AtomicU64,
-    tx_state: Arc<RwLock<TxState>>,
+    tx_lock: R::RwMutex<()>,
+    next_txid: R::AtomicU64,
+    tx_state: Arc<R::RwMutex<TxState>>,
 
-    background_chan: Sender<()>,
-    background_thread: JoinHandle<()>,
+    timer_handle: R::TimerHandle,
+    background_handle: R::JoinHandle,
+    shutting_down: Arc<R::AtomicUsize>,
 }
 
 pub struct Setting {
@@ -52,7 +50,7 @@ impl Setting {
     }
 }
 
-impl Db {
+impl<R: Runtime> Db<R> {
     pub fn open(path: &Path, setting: Setting) -> anyhow::Result<Self> {
         setting.validate()?;
 
@@ -64,13 +62,7 @@ impl Db {
         }
 
         let db_header_path = path.join("info");
-        let mut db_header_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(db_header_path)?
-            .lock()?;
+        let mut db_header_file = R::File::open(db_header_path)?;
         let header = Self::load_db_header(&mut db_header_file)?;
         drop(db_header_file);
 
@@ -83,30 +75,32 @@ impl Db {
         let result = recover(path, &pager)?;
         let wal = Arc::new(result.wal);
 
-        let next_txid = AtomicU64::new(result.next_txid.get());
+        let next_txid = R::AtomicU64::new(result.next_txid.get());
 
         // at this point, the recovery is already finished, so there is no active transaction
-        let tx_state = Arc::new(RwLock::new(TxState::None));
+        let tx_state = Arc::new(R::RwMutex::new(TxState::None));
 
-        let (sender, receiver) = channel();
-        let background_thread = {
+        let shutting_down = Arc::new(R::AtomicUsize::new(0));
+
+        let (mut timer, timer_handle) = R::timer(setting.checkpoint_period);
+        let background_handle = {
             let wal = wal.clone();
             let pager = pager.clone();
             let tx_state = tx_state.clone();
-            std::thread::spawn(move || loop {
-                let Err(err) = receiver.recv_timeout(setting.checkpoint_period) else {
-                    break;
-                };
-                if err != std::sync::mpsc::RecvTimeoutError::Timeout {
-                    break;
-                }
+            let shutting_down = shutting_down.clone();
+            R::spawn(move || {
+                while timer.wait() {
+                    if let Err(err) = Self::checkpoint(&pager, &wal, &tx_state) {
+                        // TODO: handle the error.
+                        // Maybe we can send the error to the DB, so that any next operation in the DB
+                        // will return an error. If we can't flush the dirty pages, we might not be
+                        // able to do anything anyway.
+                        log::error!("cannot perform checkpoint: {err}");
+                    }
 
-                if let Err(err) = Self::checkpoint(&pager, &wal, &tx_state) {
-                    // TODO: handle the error.
-                    // Maybe we can send the error to the DB, so that any next operation in the DB
-                    // will return an error. If we can't flush the dirty pages, we might not be
-                    // able to do anything anyway.
-                    log::error!("cannot perform checkpoint: {err}");
+                    if shutting_down.load() == 1 {
+                        break;
+                    }
                 }
             })
         };
@@ -114,16 +108,18 @@ impl Db {
         Ok(Self {
             pager,
             wal,
-            tx_lock: RwLock::new(()),
+            tx_lock: R::RwMutex::new(()),
             next_txid,
             tx_state,
-            background_chan: sender,
-            background_thread,
+
+            timer_handle,
+            background_handle,
+            shutting_down,
         })
     }
 
-    fn load_db_header(f: &mut File) -> anyhow::Result<Header> {
-        let size = f.metadata()?.len();
+    fn load_db_header(f: &mut R::File) -> anyhow::Result<Header> {
+        let size = f.len()?;
         if size < 2 * DB_HEADER_SIZE as u64 {
             return Self::init_db(f);
         }
@@ -146,7 +142,11 @@ impl Db {
         Err(anyhow!("database is corrupted, both db header are broken"))
     }
 
-    fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<TxState>) -> anyhow::Result<()> {
+    fn checkpoint(
+        pager: &Pager<R>,
+        wal: &Wal<R>,
+        tx_state: &R::RwMutex<TxState>,
+    ) -> anyhow::Result<()> {
         let tx_state = tx_state.read();
         // Warning: it is important that tx_state is locked first before
         // db_state because there might be concurrent rollback running during
@@ -156,7 +156,6 @@ impl Db {
         // and db_state later. If in this checkpoint process we lock the db_state
         // first then the tx_state, we might get a deadlock.
         let db_state = pager.read_state();
-
         let checkpoint_lsn = wal.append_log(WalEntry {
             clr: None,
             kind: WalKind::Checkpoint {
@@ -173,7 +172,7 @@ impl Db {
         Ok(())
     }
 
-    fn init_db(f: &mut File) -> anyhow::Result<Header> {
+    fn init_db(f: &mut R::File) -> anyhow::Result<Header> {
         let header = Header {
             version: 0,
             page_size: DEFAULT_PAGE_SIZE as u32,
@@ -187,13 +186,13 @@ impl Db {
         Ok(header)
     }
 
-    pub fn update(&self) -> anyhow::Result<Tx> {
+    pub fn update(&self) -> anyhow::Result<Tx<R>> {
         let tx_guard = self.tx_lock.write();
 
         let mut tx_state = self.tx_state.write();
         self.finish_dangling_tx(&mut tx_state)?;
 
-        let txid = self.next_txid.fetch_add(1, Ordering::SeqCst);
+        let txid = self.next_txid.fetch_add(1);
         let txid = TxId::new(txid).unwrap();
         *tx_state = TxState::Active(txid);
 
@@ -262,13 +261,13 @@ impl Db {
         }
     }
 
-    pub fn read(&self) -> anyhow::Result<ReadTx> {
+    pub fn read(&self) -> anyhow::Result<ReadTx<R>> {
         let tx_guard = self.tx_lock.read();
 
         let mut tx_state = self.tx_state.write();
         self.finish_dangling_tx(&mut tx_state)?;
 
-        let txid = self.next_txid.fetch_add(1, Ordering::SeqCst);
+        let txid = self.next_txid.fetch_add(1);
         let txid = TxId::new(txid).unwrap();
 
         let tx = ReadTx::new(txid, self, tx_guard)?;
@@ -281,10 +280,11 @@ impl Db {
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {
-        self.background_chan.send(())?;
-        if self.background_thread.join().is_err() {
-            return Err(anyhow!("cannot join background thread"));
-        }
+        let shutdowned = self.shutting_down.compare_and_exchange(0, 1);
+        assert!(shutdowned);
+
+        self.timer_handle.trigger();
+        self.background_handle.join();
 
         // Since we own self, it means there are no active transaction since active transaction
         // borrows the db. And there are no ongoing flush and checkpoint since they also borrow
@@ -343,18 +343,22 @@ impl Header {
     }
 }
 
-pub struct Tx<'db> {
+pub struct Tx<'db, R: Runtime> {
     id: TxId,
-    wal: Arc<Wal>,
-    pager: Arc<Pager>,
+    wal: Arc<Wal<R>>,
+    pager: Arc<Pager<R>>,
 
-    _tx_guard: RwLockWriteGuard<'db, ()>,
+    _tx_guard: RwMutexWriteGuard<'db, R, ()>,
 
-    tx_state: &'db RwLock<TxState>,
+    tx_state: &'db R::RwMutex<TxState>,
 }
 
-impl<'db> Tx<'db> {
-    fn new(id: TxId, db: &'db Db, tx_guard: RwLockWriteGuard<'db, ()>) -> anyhow::Result<Self> {
+impl<'db, R: Runtime> Tx<'db, R> {
+    fn new(
+        id: TxId,
+        db: &'db Db<R>,
+        tx_guard: RwMutexWriteGuard<'db, R, ()>,
+    ) -> anyhow::Result<Self> {
         let tx = Self {
             id,
             wal: db.wal.clone(),
@@ -369,7 +373,7 @@ impl<'db> Tx<'db> {
         Ok(tx)
     }
 
-    pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket> {
+    pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket<R>> {
         let root_pgid = self.init_root()?;
 
         let mut btree = crate::btree::new(self.id, &self.pager, &self.wal, root_pgid);
@@ -467,11 +471,11 @@ impl<'db> Tx<'db> {
     }
 }
 
-pub struct Bucket<'a> {
-    btree: BTree<'a>,
+pub struct Bucket<'a, R: Runtime> {
+    btree: BTree<'a, R>,
 }
 
-impl<'a> Bucket<'a> {
+impl<'a, R: Runtime> Bucket<'a, R> {
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.btree.put(key, value)?;
         Ok(())
@@ -486,9 +490,9 @@ impl<'a> Bucket<'a> {
         Ok(Some(value))
     }
 
-    pub fn range<R>(&'a self, range: R) -> anyhow::Result<Range<'a>>
+    pub fn range<Rg>(&'a self, range: Rg) -> anyhow::Result<Range<'a, R>>
     where
-        R: RangeBounds<[u8]> + 'static,
+        Rg: RangeBounds<[u8]> + 'static,
     {
         let cursor = self.btree.range(range)?;
         Ok(Range {
@@ -498,12 +502,12 @@ impl<'a> Bucket<'a> {
     }
 }
 
-pub struct Range<'a> {
+pub struct Range<'a, R: Runtime> {
     error: bool,
-    cursor: Cursor<'a>,
+    cursor: Cursor<'a, R>,
 }
 
-impl<'a> Iterator for Range<'a> {
+impl<'a, R: Runtime> Iterator for Range<'a, R> {
     type Item = anyhow::Result<KeyValue>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.error {
@@ -530,16 +534,16 @@ pub struct KeyValue {
     pub value: Box<[u8]>,
 }
 
-pub struct ReadTx<'db> {
+pub struct ReadTx<'db, R: Runtime> {
     txid: TxId,
-    pager: Arc<Pager>,
-    wal: Arc<Wal>,
+    pager: Arc<Pager<R>>,
+    wal: Arc<Wal<R>>,
 
-    _tx_guard: RwLockReadGuard<'db, ()>,
+    _tx_guard: RwMutexReadGuard<'db, R, ()>,
 }
 
-impl<'db> ReadTx<'db> {
-    fn new(txid: TxId, db: &Db, tx_guard: RwLockReadGuard<'db, ()>) -> anyhow::Result<Self> {
+impl<'db, R: Runtime> ReadTx<'db, R> {
+    fn new(txid: TxId, db: &Db<R>, tx_guard: RwMutexReadGuard<'db, R, ()>) -> anyhow::Result<Self> {
         let tx = Self {
             txid,
             pager: db.pager.clone(),
@@ -549,7 +553,7 @@ impl<'db> ReadTx<'db> {
         Ok(tx)
     }
 
-    pub fn bucket(&self, name: &str) -> anyhow::Result<Option<ReadBucket>> {
+    pub fn bucket(&self, name: &str) -> anyhow::Result<Option<ReadBucket<R>>> {
         let Some(root_pgid) = self.pager.read_state().root else {
             return Ok(None);
         };
@@ -576,11 +580,11 @@ impl<'db> ReadTx<'db> {
     }
 }
 
-pub struct ReadBucket<'a> {
-    btree: BTree<'a>,
+pub struct ReadBucket<'a, R: Runtime> {
+    btree: BTree<'a, R>,
 }
 
-impl<'a> ReadBucket<'a> {
+impl<'a, R: Runtime> ReadBucket<'a, R> {
     pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         let result = self.btree.get(key)?;
         let Some(result) = result else {
@@ -590,9 +594,9 @@ impl<'a> ReadBucket<'a> {
         Ok(Some(value))
     }
 
-    pub fn range<R>(&'a self, range: R) -> anyhow::Result<Range<'a>>
+    pub fn range<Rg>(&'a self, range: Rg) -> anyhow::Result<Range<'a, R>>
     where
-        R: RangeBounds<[u8]> + 'static,
+        Rg: RangeBounds<[u8]> + 'static,
     {
         let cursor = self.btree.range(range)?;
         Ok(Range {

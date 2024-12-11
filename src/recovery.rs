@@ -2,16 +2,20 @@ use crate::content::Bytes;
 use crate::id::{Lsn, PageId, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
 use crate::pager::{DbState, LogContext, PageOps, PageWriteOps, Pager};
+use crate::runtime::Runtime;
 use crate::wal::Wal;
 use anyhow::anyhow;
 use std::path::Path;
 
-pub(crate) struct RecoveryResult {
-    pub(crate) wal: Wal,
+pub(crate) struct RecoveryResult<R: Runtime> {
+    pub(crate) wal: Wal<R>,
     pub(crate) next_txid: TxId,
 }
 
-pub(crate) fn recover(path: &Path, pager: &Pager) -> anyhow::Result<RecoveryResult> {
+pub(crate) fn recover<R: Runtime>(
+    path: &Path,
+    pager: &Pager<R>,
+) -> anyhow::Result<RecoveryResult<R>> {
     let mut analyzer = Analyzer::new();
     let mut redoer = Redoer::new(pager);
 
@@ -165,12 +169,12 @@ struct AnalyzeResult {
     last_txid: Option<TxId>,
 }
 
-struct Redoer<'a> {
-    pager: &'a Pager,
+struct Redoer<'a, R: Runtime> {
+    pager: &'a Pager<R>,
 }
 
-impl<'a> Redoer<'a> {
-    fn new(pager: &'a Pager) -> Self {
+impl<'a, R: Runtime> Redoer<'a, R> {
+    fn new(pager: &'a Pager<R>) -> Self {
         Self { pager }
     }
 
@@ -255,7 +259,7 @@ impl<'a> Redoer<'a> {
         txid: TxId,
         pgid: PageId,
     ) -> anyhow::Result<()> {
-        let ctx = LogContext::Redo(lsn);
+        let ctx = LogContext::<R>::Redo(lsn);
 
         let page = self.pager.write(&ctx, txid, pgid)?;
         if page.lsn() >= lsn {
@@ -456,7 +460,11 @@ impl<'a> Redoer<'a> {
     }
 }
 
-fn undo(pager: &Pager, wal: &Wal, analyze_result: &AnalyzeResult) -> anyhow::Result<()> {
+fn undo<R: Runtime>(
+    pager: &Pager<R>,
+    wal: &Wal<R>,
+    analyze_result: &AnalyzeResult,
+) -> anyhow::Result<()> {
     log::debug!("undo_started analyze_result={analyze_result:?}");
 
     let mut active_tx = analyze_result.active_tx;
@@ -500,9 +508,9 @@ fn undo(pager: &Pager, wal: &Wal, analyze_result: &AnalyzeResult) -> anyhow::Res
     Ok(())
 }
 
-pub(crate) fn undo_txn(
-    pager: &Pager,
-    wal: &Wal,
+pub(crate) fn undo_txn<R: Runtime>(
+    pager: &Pager<R>,
+    wal: &Wal<R>,
     txid: TxId,
     last_undone: &mut Lsn,
 ) -> anyhow::Result<()> {
