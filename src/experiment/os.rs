@@ -3,7 +3,7 @@ use std::io::{Read, Seek, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-pub(crate) struct OsRuntime;
+pub struct OsRuntime;
 
 impl runtime::Runtime for OsRuntime {
     type Timer = OsTimer;
@@ -59,7 +59,7 @@ impl runtime::Runtime for OsRuntime {
     }
 }
 
-pub(crate) struct OsTimer {
+pub struct OsTimer {
     duration: std::time::Duration,
     cond: Arc<parking_lot::Condvar>,
     m: Arc<parking_lot::Mutex<TimerState>>,
@@ -106,7 +106,7 @@ impl runtime::Timer for OsTimer {
     }
 }
 
-pub(crate) struct OsTimerHandle(Arc<OsTimerHandleInternal>);
+pub struct OsTimerHandle(Arc<OsTimerHandleInternal>);
 
 struct OsTimerHandleInternal {
     cond: Arc<parking_lot::Condvar>,
@@ -133,7 +133,7 @@ impl Drop for OsTimerHandleInternal {
     }
 }
 
-pub(crate) struct OsMutex<T: Send + Sync>(parking_lot::Mutex<T>);
+pub struct OsMutex<T: Send + Sync>(parking_lot::Mutex<T>);
 
 impl<T: Send + Sync> runtime::Mutex<T> for OsMutex<T> {
     type Guard<'a> = OsMutexGuard<'a, T>
@@ -153,7 +153,7 @@ impl<T: Send + Sync> runtime::Mutex<T> for OsMutex<T> {
     }
 }
 
-pub(crate) struct OsMutexGuard<'a, T>(parking_lot::MutexGuard<'a, T>);
+pub struct OsMutexGuard<'a, T>(parking_lot::MutexGuard<'a, T>);
 
 impl<'a, T> Deref for OsMutexGuard<'a, T> {
     type Target = T;
@@ -169,7 +169,7 @@ impl<'a, T> DerefMut for OsMutexGuard<'a, T> {
     }
 }
 
-pub(crate) struct OsRwMutex<T: Send + Sync>(parking_lot::RwLock<T>);
+pub struct OsRwMutex<T: Send + Sync>(parking_lot::RwLock<T>);
 
 impl<T: Send + Sync> runtime::RwMutex<T> for OsRwMutex<T> {
     type ReadGuard<'a> = OsRwMutexReadGuard<'a,T>
@@ -196,7 +196,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for OsRwMutex<T> {
     }
 }
 
-pub(crate) struct OsRwMutexReadGuard<'a, T>(parking_lot::RwLockReadGuard<'a, T>);
+pub struct OsRwMutexReadGuard<'a, T>(parking_lot::RwLockReadGuard<'a, T>);
 
 impl<'a, T> Deref for OsRwMutexReadGuard<'a, T> {
     type Target = T;
@@ -212,7 +212,7 @@ impl<'a, T> From<OsRwMutexWriteGuard<'a, T>> for OsRwMutexReadGuard<'a, T> {
     }
 }
 
-pub(crate) struct OsRwMutexWriteGuard<'a, T>(parking_lot::RwLockWriteGuard<'a, T>);
+pub struct OsRwMutexWriteGuard<'a, T>(parking_lot::RwLockWriteGuard<'a, T>);
 
 impl<'a, T> Deref for OsRwMutexWriteGuard<'a, T> {
     type Target = T;
@@ -228,7 +228,7 @@ impl<'a, T> DerefMut for OsRwMutexWriteGuard<'a, T> {
     }
 }
 
-pub(crate) struct OsJoinHandle(std::thread::JoinHandle<()>);
+pub struct OsJoinHandle(std::thread::JoinHandle<()>);
 
 impl runtime::JoinHandle for OsJoinHandle {
     fn join(self) {
@@ -236,7 +236,7 @@ impl runtime::JoinHandle for OsJoinHandle {
     }
 }
 
-pub(crate) struct OsFile(std::fs::File);
+pub struct OsFile(std::fs::File);
 
 impl runtime::File for OsFile {
     #[inline]
@@ -310,7 +310,7 @@ fn lock(f: &std::fs::File) -> std::io::Result<()> {
 
 macro_rules! impl_atomic {
     ($name:ident, $ty:ident) => {
-        pub(crate) struct $name(atomic::$name);
+        pub struct $name(atomic::$name);
 
         impl runtime::Atomic<$ty> for $name {
             #[inline]

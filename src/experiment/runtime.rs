@@ -98,7 +98,7 @@ pub trait File: Sized + Send + Sync {
     fn truncate(&mut self, size: u64) -> io::Result<()>;
 }
 
-pub trait Atomic<T> {
+pub trait Atomic<T>: Send + Sync {
     fn new(value: T) -> Self;
     fn load(&self) -> T;
     fn compare_and_exchange(&self, old: T, new: T) -> bool;

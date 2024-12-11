@@ -1,6 +1,6 @@
 use criterion::profiler::Profiler;
 use criterion::{criterion_group, criterion_main, Criterion};
-use dbshark::{Db, Setting};
+use dbshark::experiment::{Db, OsRuntime, Setting};
 use pprof::ProfilerGuard;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -25,7 +25,7 @@ pub fn tx_single_operation(c: &mut Criterion) {
     }
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
 
-    let db = Db::open(path, Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(path, Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
     let mut bucket = tx.bucket("sample").unwrap();
 

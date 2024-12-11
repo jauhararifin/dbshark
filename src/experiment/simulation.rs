@@ -94,7 +94,7 @@ impl std::fmt::Display for RwMutexId {
     }
 }
 
-pub(crate) struct SimulatedRuntime {
+pub struct SimulatedRuntime {
     internal: Arc<parking_lot::Mutex<Internal>>,
 }
 
@@ -258,7 +258,7 @@ impl Drop for SpawnCleanup {
 
 impl SimulatedRuntime {
     #[allow(unused)]
-    pub(crate) fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
@@ -286,7 +286,7 @@ impl SimulatedRuntime {
     }
 
     #[allow(unused)]
-    pub(crate) fn run(&mut self, f: impl FnOnce() + Send + 'static) {
+    pub fn run(&mut self, f: impl FnOnce() + Send + 'static) {
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         {
             self.internal.lock().main_trigger = Some(trigger);
@@ -442,7 +442,7 @@ impl Clone for SimulatedRuntime {
     }
 }
 
-pub(crate) struct SimulatedTimer {
+pub struct SimulatedTimer {
     last_ticked: usize,
     duration: usize,
     state: Arc<parking_lot::Mutex<TimerState>>,
@@ -507,7 +507,7 @@ impl runtime::Timer for SimulatedTimer {
     }
 }
 
-pub(crate) struct SimulatedTimerHandle(Arc<SimulatedTimerHandleInternal>);
+pub struct SimulatedTimerHandle(Arc<SimulatedTimerHandleInternal>);
 
 struct SimulatedTimerHandleInternal {
     state: Arc<parking_lot::Mutex<TimerState>>,
@@ -557,7 +557,7 @@ impl Drop for SimulatedTimerHandleInternal {
     }
 }
 
-pub(crate) struct SimulatedMutex<T: Send + Sync> {
+pub struct SimulatedMutex<T: Send + Sync> {
     id: MutexId,
     locker: parking_lot::Mutex<Option<ThreadId>>,
     value: parking_lot::Mutex<T>,
@@ -633,7 +633,7 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
     }
 }
 
-pub(crate) struct SimulatedMutexGuard<'a, T: Send + Sync> {
+pub struct SimulatedMutexGuard<'a, T: Send + Sync> {
     id: MutexId,
     locker: &'a parking_lot::Mutex<Option<ThreadId>>,
     guard: parking_lot::MutexGuard<'a, T>,
@@ -672,7 +672,7 @@ impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
     }
 }
 
-pub(crate) struct SimulatedRwMutex<T: Send + Sync> {
+pub struct SimulatedRwMutex<T: Send + Sync> {
     id: RwMutexId,
     locker: parking_lot::Mutex<RwMutexState>,
     value: parking_lot::RwLock<T>,
@@ -814,7 +814,7 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
     }
 }
 
-pub(crate) struct SimulatedRwMutexReadGuard<'a, T> {
+pub struct SimulatedRwMutexReadGuard<'a, T> {
     id: RwMutexId,
     locker: &'a parking_lot::Mutex<RwMutexState>,
     guard: parking_lot::RwLockReadGuard<'a, T>,
@@ -878,7 +878,7 @@ impl<'a, T> From<SimulatedRwMutexWriteGuard<'a, T>> for SimulatedRwMutexReadGuar
     }
 }
 
-pub(crate) struct SimulatedRwMutexWriteGuard<'a, T> {
+pub struct SimulatedRwMutexWriteGuard<'a, T> {
     id: RwMutexId,
     locker: &'a parking_lot::Mutex<RwMutexState>,
     guard: Option<parking_lot::RwLockWriteGuard<'a, T>>,
@@ -928,7 +928,7 @@ impl<'a, T> DerefMut for SimulatedRwMutexWriteGuard<'a, T> {
     }
 }
 
-pub(crate) struct SimulatedJoinHandle(ThreadId);
+pub struct SimulatedJoinHandle(ThreadId);
 
 impl runtime::JoinHandle for SimulatedJoinHandle {
     fn join(self) {
@@ -1040,7 +1040,7 @@ fn enqueue_rwmutex_for_write(rwmutex_id: RwMutexId) {
     });
 }
 
-pub(crate) struct SimulatedFile {
+pub struct SimulatedFile {
     path: PathBuf,
 }
 
@@ -1270,7 +1270,7 @@ impl runtime::File for SimulatedFile {
 
 macro_rules! impl_atomic {
     ($name:ident, $ty:ident) => {
-        pub(crate) struct $name(parking_lot::Mutex<$ty>);
+        pub struct $name(parking_lot::Mutex<$ty>);
         impl runtime::Atomic<$ty> for $name {
             #[inline]
             fn new(value: $ty) -> Self {

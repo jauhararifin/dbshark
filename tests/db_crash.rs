@@ -1,4 +1,4 @@
-use dbshark::{Db, Setting};
+use dbshark::experiment::{Db, Setting, SimulatedRuntime};
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use std::path::PathBuf;
@@ -70,7 +70,7 @@ fn worker() {
     env_logger::init();
 
     let path = std::env::args().nth(1).unwrap();
-    let db = Db::open(
+    let db = Db::<SimulatedRuntime>::open(
         &PathBuf::from(path),
         Setting {
             checkpoint_period: Duration::from_secs(5),

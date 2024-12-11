@@ -25,6 +25,7 @@ pub struct Db<R: Runtime> {
 
     timer_handle: R::TimerHandle,
     background_handle: R::JoinHandle,
+    shutting_down: Arc<R::AtomicUsize>,
 }
 
 pub struct Setting {
@@ -79,11 +80,14 @@ impl<R: Runtime> Db<R> {
         // at this point, the recovery is already finished, so there is no active transaction
         let tx_state = Arc::new(R::RwMutex::new(TxState::None));
 
+        let shutting_down = Arc::new(R::AtomicUsize::new(0));
+
         let (mut timer, timer_handle) = R::timer(setting.checkpoint_period);
         let background_handle = {
             let wal = wal.clone();
             let pager = pager.clone();
             let tx_state = tx_state.clone();
+            let shutting_down = shutting_down.clone();
             R::spawn(move || {
                 while timer.wait() {
                     if let Err(err) = Self::checkpoint(&pager, &wal, &tx_state) {
@@ -92,6 +96,10 @@ impl<R: Runtime> Db<R> {
                         // will return an error. If we can't flush the dirty pages, we might not be
                         // able to do anything anyway.
                         log::error!("cannot perform checkpoint: {err}");
+                    }
+
+                    if shutting_down.load() == 1 {
+                        break;
                     }
                 }
             })
@@ -106,6 +114,7 @@ impl<R: Runtime> Db<R> {
 
             timer_handle,
             background_handle,
+            shutting_down,
         })
     }
 
@@ -264,6 +273,9 @@ impl<R: Runtime> Db<R> {
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {
+        let shutdowned = self.shutting_down.compare_and_exchange(0, 1);
+        assert!(shutdowned);
+
         self.timer_handle.trigger();
         self.background_handle.join();
 

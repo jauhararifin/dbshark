@@ -1,4 +1,4 @@
-use dbshark::{Db, Setting};
+use dbshark::experiment::{Db, OsRuntime, Setting};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::path::Path;
@@ -17,7 +17,7 @@ fn test_db_happy_path() {
 
     _ = std::fs::remove_dir_all("test1");
 
-    let db = Db::open(Path::new("test1"), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new("test1"), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
 
     let mut bucket = tx.bucket("table1").unwrap();
@@ -42,7 +42,7 @@ fn test_db_happy_path() {
     tx.commit().expect("commit must succeed");
     drop(db);
 
-    let db = Db::open(Path::new("test1"), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new("test1"), Setting::default()).unwrap();
     drop(db);
 }
 
@@ -66,7 +66,7 @@ fn test_db_btree() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
     items.shuffle(&mut rng);
 
-    let db = Db::open(Path::new("test_btree"), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new("test_btree"), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
 
     let mut bucket = tx.bucket("table1").unwrap();
@@ -132,7 +132,7 @@ fn test_db_rollback() {
 
     _ = std::fs::remove_dir_all("test2");
 
-    let db = Db::open(Path::new("test2"), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new("test2"), Setting::default()).unwrap();
 
     // When a transaction is rollback, all the changes made in that
     // transaction will be undone and the next txn won't see them
@@ -172,7 +172,7 @@ fn test_db_rollback() {
     // need to drop the first db to unlock the files
     drop(db);
 
-    let db = Db::open(Path::new("test2"), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new("test2"), Setting::default()).unwrap();
     drop(db);
 }
 
@@ -182,14 +182,14 @@ fn test_crash_after_commit() {
 
     let dir = tempfile::tempdir().unwrap();
 
-    let db = Db::open(Path::new(dir.path()), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new(dir.path()), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
     let mut bucket = tx.bucket("table1").unwrap();
     bucket.put(b"key00001", b"val00001").unwrap();
     tx.commit().unwrap();
     drop(db);
 
-    let db = Db::open(dir.path(), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(dir.path(), Setting::default()).unwrap();
     let tx = db.read().unwrap();
     let bucket = tx.bucket("table1").unwrap().unwrap();
     let result = bucket.get(b"key00001").unwrap().unwrap();
@@ -202,7 +202,7 @@ fn test_db_recovery1() {
 
     let dir = tempfile::tempdir().unwrap();
 
-    let db = Db::open(Path::new(dir.path()), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(Path::new(dir.path()), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
     let mut bucket = tx.bucket("table1").unwrap();
     bucket.put(b"key00001", b"val00001").unwrap();
@@ -212,7 +212,7 @@ fn test_db_recovery1() {
     drop(tx);
     drop(db);
 
-    let db = Db::open(dir.path(), Setting::default()).unwrap();
+    let db = Db::<OsRuntime>::open(dir.path(), Setting::default()).unwrap();
     let mut tx = db.update().unwrap();
     let bucket = tx.bucket("table1").unwrap();
     let result = bucket.get(b"key00001").unwrap();
