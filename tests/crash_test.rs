@@ -22,7 +22,7 @@ fn test_db_crashing() {
     let seed = 0u64;
     let mut runtime = SimulatedRuntime::new(seed);
 
-    for i in 0..10 {
+    for i in 0..20 {
         log::info!(i; "running program");
 
         runtime.run(move || {
