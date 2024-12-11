@@ -147,8 +147,16 @@ impl Db {
     }
 
     fn checkpoint(pager: &Pager, wal: &Wal, tx_state: &RwLock<TxState>) -> anyhow::Result<()> {
-        let db_state = pager.read_state();
         let tx_state = tx_state.read();
+        // Warning: it is important that tx_state is locked first before
+        // db_state because there might be concurrent rollback running during
+        // checkpoint. The rollback process will lock the tx_state the whole
+        // time. Occassionally, the rollback process might lock the db_state
+        // as well. As you can see, the rollback process could lock tx_state first
+        // and db_state later. If in this checkpoint process we lock the db_state
+        // first then the tx_state, we might get a deadlock.
+        let db_state = pager.read_state();
+
         let checkpoint_lsn = wal.append_log(WalEntry {
             clr: None,
             kind: WalKind::Checkpoint {
@@ -158,8 +166,8 @@ impl Db {
                 page_count: db_state.page_count,
             },
         })?;
-        drop(tx_state);
         drop(db_state);
+        drop(tx_state);
         pager.checkpoint(wal)?;
         wal.complete_checkpoint(checkpoint_lsn)?;
         Ok(())

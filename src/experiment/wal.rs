@@ -118,12 +118,17 @@ impl<R: Runtime> Wal<R> {
             relative_lsn: old_f.relative_lsn,
         };
 
-        let mut buff = [0u8; WAL_HEADER_SIZE * 2];
+        let mut buff = [0u8; WAL_HEADER_SIZE];
         header.encode(&mut buff[..WAL_HEADER_SIZE]);
-        header.encode(&mut buff[WAL_HEADER_SIZE..]);
+
         old_f.f.seek(SeekFrom::Start(0))?;
         old_f.f.write_all(&buff)?;
         old_f.f.sync()?;
+
+        old_f.f.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        old_f.f.write_all(&buff)?;
+        old_f.f.sync()?;
+
         old_f.is_empty = false;
         old_f.checkpoint = true;
 
@@ -423,16 +428,16 @@ pub(crate) fn recover<R: Runtime>(
     if !wal_file_1.is_file()? {
         return Err(anyhow!("{wal_path_1:?} is not a regular file"));
     }
-    let mut f1 =
-        recover_wal_file::<R>(wal_file_1).context("cannot init wal file {wal_path_1:?}")?;
+    let mut f1 = recover_wal_file::<R>(wal_file_1)
+        .with_context(|| format!("cannot init wal file {wal_path_1:?}"))?;
 
     let wal_path_2 = path.join("wal_2");
     let wal_file_2 = R::File::open(&wal_path_2)?;
     if !wal_file_2.is_file()? {
         return Err(anyhow!("{wal_path_2:?} is not a regular file"));
     }
-    let mut f2 =
-        recover_wal_file::<R>(wal_file_2).context("cannot init wal file {wal_path_2:?}")?;
+    let mut f2 = recover_wal_file::<R>(wal_file_2)
+        .with_context(|| format!("cannot init wal file {wal_path_2:?}"))?;
 
     let (mut use_wal_1, checkpoint) = match (f1.checkpoint, f2.checkpoint) {
         (Some(f1_lsn), Some(f2_lsn)) => {
@@ -447,9 +452,7 @@ pub(crate) fn recover<R: Runtime>(
         (None, None) => (true, Lsn::new(0)),
     };
 
-    log::debug!(
-        "recovering f1={f1:?} f2={f2:?} start_with_1={use_wal_1} checkpoint={checkpoint:?}"
-    );
+    log::debug!(f1:?,f2:?,use_wal_1,checkpoint:?; "recovering");
 
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut next_lsn = checkpoint;
@@ -537,9 +540,15 @@ fn recover_wal_file<R: Runtime>(mut f: R::File) -> anyhow::Result<RecoveringWalF
     let Some(header) = WalHeader::decode(&buff[..WAL_HEADER_SIZE])
         .or_else(|| WalHeader::decode(&buff[WAL_HEADER_SIZE..]))
     else {
-        return Err(anyhow!(
-            "corrupted wal file header, both header segment are corrupted"
-        ));
+        // if the first and second part of the wal header is invalid, this means
+        // that the wal file is not written successfully, and we can assume that
+        // it never been written just like an empty wal.
+        return Ok(RecoveringWalFile {
+            f,
+            relative_lsn: 0,
+            checkpoint: None,
+            is_empty: true,
+        });
     };
 
     log::debug!("wal_header_decoded header={header:?}");

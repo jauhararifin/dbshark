@@ -100,10 +100,19 @@ impl WalEntry<'_> {
         let kind = buff[10];
 
         let total_length = Self::size_by_kind_size(kind_size);
+        if total_length >= 1 << 16 {
+            return WalDecodeResult::Incomplete;
+        }
         if buff.len() < total_length {
             return WalDecodeResult::NeedMoreBytes;
         }
-        assert!(total_length < 1 << 16);
+
+        let checksum_offset = pad8(16 + kind_size) + 8;
+        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..checksum_offset]);
+        let stored_checksum = buff[checksum_offset..checksum_offset + 8].read_u64();
+        if calculated_checksum != stored_checksum {
+            return WalDecodeResult::Incomplete;
+        }
 
         let kind = match WalKind::decode(&buff[16..16 + kind_size], kind) {
             Ok(record) => record,
@@ -116,13 +125,6 @@ impl WalEntry<'_> {
 
         let magic_bytes = &buff[next + 2..next + 8];
         assert_eq!(magic_bytes, b"abcxyz");
-
-        let next = pad8(next + 2);
-        let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..next]);
-        let stored_checksum = buff[next..next + 8].read_u64();
-        if calculated_checksum != stored_checksum {
-            return WalDecodeResult::Incomplete;
-        }
 
         WalDecodeResult::Ok(WalEntry { clr, kind })
     }

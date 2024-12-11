@@ -111,6 +111,7 @@ struct Internal {
     panicked_threads: Vec<ThreadId>,
 
     waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<bool>>,
+    joiner: HashMap<ThreadId, std::thread::JoinHandle<()>>,
 
     ready: Vec<ThreadId>,
     joining: HashMap<ThreadId, IndexSet<ThreadId>>,
@@ -171,6 +172,11 @@ impl Runtime for SimulatedRuntime {
     }
 
     fn park() {
+        let is_panic = std::thread::panicking();
+        if is_panic {
+            return;
+        }
+
         let thread_id = THREAD_ID.get();
         log::trace!(thread_id; "thread_parked");
 
@@ -215,6 +221,7 @@ impl Drop for SpawnCleanup {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             r.active_threads.remove(&self.thread_id);
             r.waker.remove(&self.thread_id);
+            r.joiner.remove(&self.thread_id);
             if let Some(s) = r.joining.remove(&self.thread_id) {
                 for t in s {
                     r.ready.push(t);
@@ -236,9 +243,10 @@ impl Drop for SpawnCleanup {
                     .main_trigger
                     .as_ref()
                     .expect("main trigger should be valid");
-                trigger
-                    .send(())
-                    .expect("resuming main thread should always successfull");
+
+                // it is possible that the main thread already triggered to start the cleanup
+                // if there are multiple threads running when the program simulated to crash
+                let _ = trigger.try_send(());
             });
             return;
         }
@@ -270,6 +278,7 @@ impl SimulatedRuntime {
                 active_threads: HashSet::default(),
                 panicked_threads: Vec::default(),
                 waker: HashMap::default(),
+                joiner: HashMap::default(),
                 joining: HashMap::default(),
                 mutex_id: MutexId::default(),
                 mutex_wait: HashMap::default(),
@@ -287,6 +296,16 @@ impl SimulatedRuntime {
 
     #[allow(unused)]
     pub fn run(&mut self, f: impl FnOnce() + Send + 'static) {
+        {
+            let r = self.internal.lock();
+            log::trace!(
+                starting_thread_id=r.thread_id,
+                starting_mutex_id=r.mutex_id,
+                starting_twmutex_id=r.rwmutex_id;
+                "simulation_started"
+            );
+        }
+
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         {
             self.internal.lock().main_trigger = Some(trigger);
@@ -301,26 +320,44 @@ impl SimulatedRuntime {
             .expect("waiting main thread should never fail");
 
         let mut r = self.internal.lock();
-        if r.is_crashing {
-            for (_, waker) in r.waker.drain() {
+
+        let mut active_threads = String::default();
+        for s in r.active_threads.iter().map(|x| format!("{},", x.0)) {
+            active_threads.push_str(&s);
+        }
+        log::trace!(active_threads,count=r.active_threads.len();"main_thread_start_cleanup");
+
+        let is_crashing = r.is_crashing;
+        let wakers = std::mem::take(&mut r.waker);
+        let joiners = std::mem::take(&mut r.joiner);
+        let active_threads = std::mem::take(&mut r.active_threads);
+        let panicked_threads = std::mem::take(&mut r.panicked_threads);
+        drop(r);
+
+        if is_crashing {
+            for (_, waker) in wakers {
                 waker
                     .send(true)
                     .expect("canceling thread should always successfull");
             }
-        } else if !r.active_threads.is_empty() {
+
+            for (_, joiner) in joiners {
+                let _ = joiner.join();
+            }
+        } else if !active_threads.is_empty() {
             panic!(
                 "some of the thread are not finished yet {:?}",
-                r.active_threads
+                active_threads
             );
         }
 
-        for panicked_thread_id in &r.panicked_threads {
+        for panicked_thread_id in &panicked_threads {
             panic!("thread {panicked_thread_id} got panicked");
         }
 
         log::trace!("simulation_finished");
 
-        r.thread_id = ThreadId(0);
+        let mut r = self.internal.lock();
         r.is_crashing = false;
         r.main_trigger = None;
         r.ticks = 0;
@@ -328,10 +365,11 @@ impl SimulatedRuntime {
         r.active_threads = HashSet::default();
         r.panicked_threads = Vec::default();
         r.waker = HashMap::default();
+        r.joiner = HashMap::default();
         r.joining = HashMap::default();
-        r.mutex_id = MutexId::default();
+        //r.mutex_id = MutexId::default();
         r.mutex_wait = HashMap::default();
-        r.rwmutex_id = RwMutexId::default();
+        //r.rwmutex_id = RwMutexId::default();
         r.rwmutex_read_wait = HashMap::default();
         r.rwmutex_write_wait = HashMap::default();
         r.timer_wait = BTreeSet::default();
@@ -352,30 +390,28 @@ impl SimulatedRuntime {
             r.ready.push(thread_id);
         }
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             RUNTIME.set(Some(runtime));
             THREAD_ID.set(thread_id);
             THREAD_WAITER.set(Some(waiter));
 
-            sleep();
-
-            log::trace!(thread_id; "thread_started");
             let cleanup = SpawnCleanup { thread_id };
+            sleep();
+            log::trace!(thread_id; "thread_started");
             f();
             drop(cleanup);
         });
+
+        {
+            let runtime = clone_runtime();
+            let mut r = runtime.internal.lock();
+            r.joiner.insert(thread_id, handle);
+        }
+
         SimulatedJoinHandle(thread_id)
     }
 }
 
-//struct RunCleanup {
-//    thread_id: ThreadId,
-//}
-//
-//impl Drop for RunCleanup {
-//    fn drop(&mut self) {}
-//}
-//
 fn resume_any() {
     RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
@@ -401,7 +437,7 @@ fn resume_any() {
                 .get(&resuming_thread_id)
                 .expect("waker should exists");
             waker
-                .try_send(false)
+                .try_send(r.is_crashing)
                 .expect("resuming thread should always successfull");
             return;
         }
@@ -419,18 +455,17 @@ fn resume_any() {
                 .expect("waker should exists")
                 .clone();
             waker
-                .try_send(false)
+                .try_send(r.is_crashing)
                 .expect("resuming thread should always successfull");
             return;
         }
 
+        log::trace!("no_more_thread_to_resume");
         let trigger = r
             .main_trigger
             .as_ref()
             .expect("main trigger should be valid");
-        trigger
-            .send(())
-            .expect("resuming main thread should always successfull");
+        let _ = trigger.try_send(());
     });
 }
 
@@ -714,9 +749,9 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
 
     fn read(&self) -> Self::ReadGuard<'_> {
         park();
+        let current = THREAD_ID.get();
 
         loop {
-            let current = THREAD_ID.get();
             let mut locker = self.locker.lock();
             match *locker {
                 RwMutexState::Read(n) => {
@@ -975,16 +1010,17 @@ fn get_tick() -> usize {
 }
 
 fn sleep() {
-    THREAD_WAITER.with_borrow(|w| {
-        let is_panicking = w
-            .as_ref()
+    let is_crashing = THREAD_WAITER.with_borrow(|w| {
+        w.as_ref()
             .expect("waiter should exists")
             .recv()
-            .expect("waiting a thread should never fail");
-        if is_panicking {
-            panic!("thread_aborted_due_to_panic");
-        }
+            .expect("waiting a thread should never fail")
     });
+
+    if is_crashing {
+        log::trace!(thread_id=THREAD_ID.get(); "thread_aborted_due_to_crash");
+        panic!("thread_aborted_due_to_crash");
+    }
 }
 
 fn park() {

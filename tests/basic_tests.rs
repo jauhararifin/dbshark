@@ -1,7 +1,8 @@
-use dbshark::experiment::{Db, OsRuntime, Setting};
+use dbshark::experiment::{Db, JoinHandle, OsRuntime, Runtime, Setting};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::path::Path;
+use std::sync::Arc;
 
 use std::sync::Once;
 static INIT: Once = Once::new();
@@ -219,4 +220,44 @@ fn test_db_recovery1() {
     assert_eq!(None, result);
     drop(tx);
     drop(db);
+}
+
+#[test]
+fn test_concurrent_checkpoint_and_rollback() {
+    setup();
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let db = Db::<OsRuntime>::open(Path::new(dir.path()), Setting::default()).unwrap();
+    let db = Arc::new(db);
+
+    let h1 = {
+        let db = db.clone();
+        OsRuntime::spawn(move || {
+            for i in 0..1000 {
+                println!("rollback transaction round#{i}");
+                let mut tx = db.update().unwrap();
+                let mut bucket = tx.bucket("table1").unwrap();
+                for i in 0..3 {
+                    let key = format!("key{i:05}");
+                    let val = format!("val{i:05}");
+                    bucket.put(key.as_bytes(), val.as_bytes()).unwrap();
+                }
+                tx.rollback().unwrap();
+            }
+        })
+    };
+
+    let h2 = {
+        let db = db.clone();
+        OsRuntime::spawn(move || {
+            for i in 0..100 {
+                println!("force checkpoint round#{i}");
+                db.force_checkpoint().unwrap();
+            }
+        })
+    };
+
+    h1.join();
+    h2.join();
 }

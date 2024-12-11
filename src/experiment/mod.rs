@@ -13,4 +13,5 @@ mod wal;
 
 pub use db::{Db, Setting};
 pub use os::OsRuntime;
+pub use runtime::*;
 pub use simulation::SimulatedRuntime;
