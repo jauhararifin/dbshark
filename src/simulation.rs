@@ -267,7 +267,6 @@ impl Drop for SpawnCleanup {
 impl SimulatedRuntime {
     #[allow(unused)]
     pub fn new(seed: u64) -> Self {
-        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
                 thread_id: ThreadId(0),
@@ -294,8 +293,18 @@ impl SimulatedRuntime {
         }
     }
 
-    #[allow(unused)]
     pub fn run(&mut self, f: impl FnOnce() + Send + 'static) {
+        let original_panic_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let Some(s) = panic_info.payload().downcast_ref::<&str>() else {
+                return original_panic_hook(panic_info);
+            };
+            if *s == "simulated_crash" {
+                return;
+            }
+            return original_panic_hook(panic_info);
+        }));
+
         {
             let r = self.internal.lock();
             log::trace!(
@@ -350,6 +359,8 @@ impl SimulatedRuntime {
                 active_threads
             );
         }
+
+        let _ = std::panic::take_hook();
 
         for panicked_thread_id in &panicked_threads {
             panic!("thread {panicked_thread_id} got panicked");
@@ -697,20 +708,14 @@ impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
         {
             *self.locker.lock() = None;
         }
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_1");
         RUNTIME.with_borrow(|r| {
-            log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_1.5");
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-            log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_2");
             if let Some(s) = r.mutex_wait.remove(&self.id) {
-                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_3");
                 for t in s {
                     r.ready.push(t);
                 }
             }
-            log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_4");
         });
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released_5");
     }
 }
 
@@ -1034,7 +1039,7 @@ fn sleep() {
 
     if is_crashing {
         log::trace!(thread_id=THREAD_ID.get(); "thread_aborted_due_to_crash");
-        panic!("thread_aborted_due_to_crash");
+        panic!("simulated_crash");
     }
 }
 
