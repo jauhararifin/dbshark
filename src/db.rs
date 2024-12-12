@@ -88,7 +88,7 @@ impl<R: Runtime> Db<R> {
             let pager = pager.clone();
             let tx_state = tx_state.clone();
             let shutting_down = shutting_down.clone();
-            R::spawn(move || {
+            R::spawn("checkpointer", move || {
                 while timer.wait() {
                     if let Err(err) = Self::checkpoint(&pager, &wal, &tx_state) {
                         // TODO: handle the error.
@@ -442,11 +442,19 @@ impl<'db, R: Runtime> Tx<'db, R> {
     pub fn rollback(self) -> anyhow::Result<()> {
         log::debug!("rollback transaction txid={:?}", self.id);
 
+        let mut tx_state = self.tx_state.write();
+
+        // WARNING: it is important that the wal is written after
+        // the tx_state is locked because if it doesn't the checkpoint
+        // can run and the checkpoint record write the stale version
+        // of tx_state. As a result, the log will seems backward.
+        // For example, you might see a wal record that rollback a txn
+        // followed by a checkpoint record saying the tx_state is Active(TxId).
         let lsn = self.wal.append_log(WalEntry {
             clr: None,
             kind: WalKind::Rollback { txid: self.id },
         })?;
-        let mut tx_state = self.tx_state.write();
+
         assert_eq!(*tx_state, TxState::Active(self.id));
         *tx_state = TxState::Aborting {
             txid: self.id,

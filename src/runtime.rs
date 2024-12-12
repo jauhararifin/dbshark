@@ -30,7 +30,7 @@ pub trait Runtime: 'static {
 
     // TODO: consider making this non-static. For testing, everything is scoped,
     // so we don't really need the static bound per se.
-    fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
+    fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
 
     fn park();
 

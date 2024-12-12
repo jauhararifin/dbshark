@@ -77,7 +77,7 @@ impl<R: Runtime> Wal<R> {
             let buffer = buffer.clone();
             let f1 = f1.clone();
             let f2 = f2.clone();
-            R::spawn(move || {
+            R::spawn("wal_flusher", move || {
                 while timer.wait() {
                     let mut internal = internal.write();
                     let mut buffer = buffer.write();
@@ -121,11 +121,22 @@ impl<R: Runtime> Wal<R> {
         let mut buff = [0u8; WAL_HEADER_SIZE];
         header.encode(&mut buff[..WAL_HEADER_SIZE]);
 
-        old_f.f.seek(SeekFrom::Start(0))?;
+        // WARNING: it is important that the second block of checkpoint header is written
+        // first before the first one because during recovery, we read the first block first.
+        // If the first block is already valid, we don't read the second one. But, if the
+        // first one is corrupted (or partially written), we should check the second one.
+        // In case the write is failed in the second block, we can assume the whole write
+        // is incompleted, thus the next recover mechanism will read the first block.
+        // In case the write is failed in the first block, we can recover it by reading
+        // the second block that guaranteed to be fully written.
+        // Of course, if this is the first write (the file was empty before), it might be
+        // that both the first and the second block is invalid. In that case, we assume that
+        // the wal file is empty.
+        old_f.f.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
         old_f.f.write_all(&buff)?;
         old_f.f.sync()?;
 
-        old_f.f.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        old_f.f.seek(SeekFrom::Start(0))?;
         old_f.f.write_all(&buff)?;
         old_f.f.sync()?;
 
@@ -315,8 +326,10 @@ impl<R: Runtime> Wal<R> {
     {
         let mut buffer = self.iter_backward_lock.lock();
 
-        let wal_buffer = self.buffer.read();
+        // Warning: it is important that `internal` is locked before `wal_buffer` because
+        // `sync` method might run in different thread that might lock `internal` and `wal_buffer` in the same order.
         let internal = self.internal.read();
+        let wal_buffer = self.buffer.read();
         let buffer_len = buffer.len();
 
         let filled = if upper_bound > internal.first_unflushed {

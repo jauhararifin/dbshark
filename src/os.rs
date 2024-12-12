@@ -27,7 +27,7 @@ impl runtime::Runtime for OsRuntime {
     type AtomicI32 = AtomicI32;
     type AtomicI64 = AtomicI64;
 
-    fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
+    fn spawn(_name: &'static str, f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
         let handle = std::thread::spawn(f);
         OsJoinHandle(handle)
     }

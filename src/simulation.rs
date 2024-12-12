@@ -101,6 +101,7 @@ pub struct SimulatedRuntime {
 struct Internal {
     thread_id: ThreadId,
     is_crashing: bool,
+    is_deadlock: bool,
     main_trigger: Option<std::sync::mpsc::SyncSender<()>>,
 
     ticks: usize,
@@ -161,11 +162,11 @@ impl Runtime for SimulatedRuntime {
     type AtomicI32 = AtomicI32;
     type AtomicI64 = AtomicI64;
 
-    fn spawn(f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
+    fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Self::JoinHandle {
         park();
         let result = RUNTIME.with_borrow(|r| {
             let r = r.as_ref().expect("runtime should be valid");
-            r.spawn_internal(f)
+            r.spawn_internal(name, f)
         });
         park();
         result
@@ -271,6 +272,7 @@ impl SimulatedRuntime {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
                 thread_id: ThreadId(0),
                 is_crashing: false,
+                is_deadlock: false,
                 main_trigger: None,
                 ticks: 0,
                 ready: vec![],
@@ -293,7 +295,7 @@ impl SimulatedRuntime {
         }
     }
 
-    pub fn run(&mut self, f: impl FnOnce() + Send + 'static) {
+    pub fn run(&mut self, f: impl FnOnce() + Send + 'static) -> RunResult {
         let original_panic_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
             let Some(s) = panic_info.payload().downcast_ref::<&str>() else {
@@ -321,7 +323,7 @@ impl SimulatedRuntime {
         }
 
         RUNTIME.set(Some(self.clone()));
-        self.spawn_internal(f);
+        self.spawn_internal("simulation_orchestrator", f);
         resume_any();
 
         waiter
@@ -337,11 +339,19 @@ impl SimulatedRuntime {
         log::trace!(active_threads,count=r.active_threads.len();"main_thread_start_cleanup");
 
         let is_crashing = r.is_crashing;
+        let is_deadlock = r.is_deadlock;
         let wakers = std::mem::take(&mut r.waker);
         let joiners = std::mem::take(&mut r.joiner);
         let active_threads = std::mem::take(&mut r.active_threads);
         let panicked_threads = std::mem::take(&mut r.panicked_threads);
         drop(r);
+
+        let result = RunResult {
+            is_simulated_crashing: is_crashing,
+            failing_threads: panicked_threads.clone(),
+            is_deadlock,
+            unfinished_threads: active_threads.iter().cloned().collect(),
+        };
 
         if is_crashing {
             for (_, waker) in wakers {
@@ -354,6 +364,10 @@ impl SimulatedRuntime {
                 let _ = joiner.join();
             }
         } else if !active_threads.is_empty() {
+            for t in &active_threads {
+                wakers.get(&t).unwrap().try_send(false).unwrap();
+            }
+            assert!(is_deadlock);
             panic!(
                 "some of the thread are not finished yet {:?}",
                 active_threads
@@ -368,8 +382,29 @@ impl SimulatedRuntime {
 
         log::trace!("simulation_finished");
 
+        let is_failing = result.is_failed();
+        if is_failing {
+            let mut unfinished_threads = String::default();
+            for s in result
+                .unfinished_threads
+                .iter()
+                .map(|x| format!("{},", x.0))
+            {
+                unfinished_threads.push_str(&s);
+            }
+
+            let mut failing_threads = String::default();
+            for s in result.failing_threads.iter().map(|x| format!("{},", x.0)) {
+                failing_threads.push_str(&s);
+            }
+            log::error!(failing_threads, unfinished_threads;"simulation_failed");
+        } else {
+            log::info!(is_crashed=result.is_simulated_crashing;"simulation_success");
+        }
+
         let mut r = self.internal.lock();
         r.is_crashing = false;
+        r.is_deadlock = false;
         r.main_trigger = None;
         r.ticks = 0;
         r.ready = vec![];
@@ -385,11 +420,17 @@ impl SimulatedRuntime {
         r.rwmutex_write_wait = HashMap::default();
         r.timer_wait = BTreeSet::default();
         r.thread_timer = HashMap::default();
+
+        result
     }
 
-    fn spawn_internal(&self, f: impl FnOnce() + Send + 'static) -> SimulatedJoinHandle {
+    fn spawn_internal(
+        &self,
+        name: &'static str,
+        f: impl FnOnce() + Send + 'static,
+    ) -> SimulatedJoinHandle {
         let thread_id = next_thread_id();
-        log::trace!(thread_id; "spawning_thread");
+        log::trace!(name,thread_id; "spawning_thread");
 
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
 
@@ -420,6 +461,23 @@ impl SimulatedRuntime {
         }
 
         SimulatedJoinHandle(thread_id)
+    }
+}
+
+#[derive(Debug)]
+pub struct RunResult {
+    is_simulated_crashing: bool,
+    failing_threads: Vec<ThreadId>,
+    is_deadlock: bool,
+    unfinished_threads: Vec<ThreadId>,
+}
+
+impl RunResult {
+    pub fn is_failed(&self) -> bool {
+        !self.is_simulated_crashing
+            && (self.is_deadlock
+                || !self.failing_threads.is_empty()
+                || !self.unfinished_threads.is_empty())
     }
 }
 
@@ -473,6 +531,7 @@ fn resume_any() {
         }
 
         log::trace!("no_more_thread_to_resume");
+        r.is_deadlock = true;
         let trigger = r
             .main_trigger
             .as_ref()
@@ -1048,6 +1107,7 @@ fn park() {
 }
 
 fn crash() {
+    log::trace!(thread_id=THREAD_ID.get(); "simulated_crash_triggered");
     RUNTIME.with_borrow(|r| {
         let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
         r.is_crashing = true;
@@ -1398,7 +1458,7 @@ mod tests {
         setup();
         let mut runtime = SimulatedRuntime::new(0);
         runtime.run(|| {
-            let handle = SimulatedRuntime::spawn(|| {});
+            let handle = SimulatedRuntime::spawn("t2", || {});
             handle.join();
         });
     }
@@ -1410,13 +1470,13 @@ mod tests {
         runtime.run(|| {
             let a = Arc::new(AtomicI32::new(0));
             let x = a.clone();
-            let handle1 = SimulatedRuntime::spawn(move || {
+            let handle1 = SimulatedRuntime::spawn("t2", move || {
                 for _ in 0..10000 {
                     x.fetch_add(20);
                 }
             });
             let x = a.clone();
-            let handle2 = SimulatedRuntime::spawn(move || {
+            let handle2 = SimulatedRuntime::spawn("t3", move || {
                 for _ in 0..10000 {
                     x.fetch_add(-10);
                 }
@@ -1435,7 +1495,7 @@ mod tests {
         runtime.run(|| {
             let a = Arc::new(SimulatedMutex::new(0));
             let x = a.clone();
-            let handle1 = SimulatedRuntime::spawn(move || {
+            let handle1 = SimulatedRuntime::spawn("t2", move || {
                 for _ in 0..10000 {
                     park();
                     let mut y = x.lock();
@@ -1448,7 +1508,7 @@ mod tests {
             });
 
             let x = a.clone();
-            let handle2 = SimulatedRuntime::spawn(move || {
+            let handle2 = SimulatedRuntime::spawn("t3", move || {
                 for _ in 0..10000 {
                     park();
                     let mut y = x.lock();
@@ -1461,7 +1521,7 @@ mod tests {
             });
 
             let x = a.clone();
-            let handle3 = SimulatedRuntime::spawn(move || {
+            let handle3 = SimulatedRuntime::spawn("t4", move || {
                 for _ in 0..10000 {
                     park();
                     let mut y = x.lock();
@@ -1491,7 +1551,7 @@ mod tests {
             let mut joins = vec![];
             for _ in 0..100 {
                 let x = a.clone();
-                let handle = SimulatedRuntime::spawn(move || {
+                let handle = SimulatedRuntime::spawn("t2", move || {
                     for _ in 0..100 {
                         park();
                         let g = x.read();
@@ -1510,7 +1570,7 @@ mod tests {
             for seed in 0..15 {
                 let x = a.clone();
                 let mut rng = StdRng::seed_from_u64(seed as u64);
-                let handle = SimulatedRuntime::spawn(move || {
+                let handle = SimulatedRuntime::spawn("t3", move || {
                     for _ in 0..100 {
                         park();
                         let mut g = x.write();
@@ -1540,7 +1600,7 @@ mod tests {
             let (mut timer, timer_handle) =
                 SimulatedRuntime::timer(std::time::Duration::from_millis(100));
 
-            let h1 = SimulatedRuntime::spawn(move || {
+            let h1 = SimulatedRuntime::spawn("t2", move || {
                 let timer_handle = timer_handle;
                 for i in 0..10000 {
                     if i == 1234 {
@@ -1551,7 +1611,7 @@ mod tests {
             });
 
             let c = timer_count.clone();
-            let h2 = SimulatedRuntime::spawn(move || {
+            let h2 = SimulatedRuntime::spawn("t3", move || {
                 while timer.wait() {
                     c.fetch_add(1);
                 }

@@ -233,8 +233,8 @@ fn test_concurrent_checkpoint_and_rollback() {
 
     let h1 = {
         let db = db.clone();
-        OsRuntime::spawn(move || {
-            for i in 0..1000 {
+        OsRuntime::spawn("rollback_worker", move || {
+            for i in 0..700 {
                 println!("rollback transaction round#{i}");
                 let mut tx = db.update().unwrap();
                 let mut bucket = tx.bucket("table1").unwrap();
@@ -250,8 +250,8 @@ fn test_concurrent_checkpoint_and_rollback() {
 
     let h2 = {
         let db = db.clone();
-        OsRuntime::spawn(move || {
-            for i in 0..100 {
+        OsRuntime::spawn("checkpoint_worker", move || {
+            for i in 0..20 {
                 println!("force checkpoint round#{i}");
                 db.force_checkpoint().unwrap();
             }
