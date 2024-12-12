@@ -304,7 +304,7 @@ impl SimulatedRuntime {
             if *s == "simulated_crash" {
                 return;
             }
-            return original_panic_hook(panic_info);
+            original_panic_hook(panic_info)
         }));
 
         {
@@ -365,7 +365,7 @@ impl SimulatedRuntime {
             }
         } else if !active_threads.is_empty() {
             for t in &active_threads {
-                wakers.get(&t).unwrap().try_send(false).unwrap();
+                wakers.get(t).unwrap().try_send(false).unwrap();
             }
             assert!(is_deadlock);
             panic!(
@@ -1228,7 +1228,7 @@ impl runtime::File for SimulatedFile {
 
     #[inline]
     fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<()> {
-        Ok(RUNTIME.with_borrow(|r| {
+        RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let file = r.files.get_mut(&self.path).expect("the file should exists");
             let mut current = file.cursor;
@@ -1238,7 +1238,8 @@ impl runtime::File for SimulatedFile {
                 std::io::SeekFrom::Current(v) => current = (current as i64 + v) as usize,
             }
             file.cursor = current;
-        }))
+        });
+        Ok(())
     }
 
     #[inline]
@@ -1248,7 +1249,7 @@ impl runtime::File for SimulatedFile {
             let file = r.files.get_mut(&self.path).expect("the file should exists");
 
             let mut size = buff.len();
-            if file.cursor + buff.len() as usize > file.buffered_content.len() {
+            if file.cursor + buff.len() > file.buffered_content.len() {
                 size = file.buffered_content.len() - file.cursor;
             }
 
@@ -1263,34 +1264,36 @@ impl runtime::File for SimulatedFile {
 
     #[inline]
     fn read_exact(&mut self, buff: &mut [u8]) -> std::io::Result<()> {
-        Ok(RUNTIME.with_borrow(|r| {
+        RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let file = r.files.get_mut(&self.path).expect("the file should exists");
 
-            if file.cursor + buff.len() as usize > file.buffered_content.len() {
+            if file.cursor + buff.len() > file.buffered_content.len() {
                 todo!("read beyond file length, should this error or panic?");
             }
             for i in 0..buff.len() {
                 buff[i] = file.buffered_content[file.cursor + i];
             }
-            file.cursor = file.cursor + buff.len();
-        }))
+            file.cursor += buff.len();
+        });
+        Ok(())
     }
 
     #[inline]
     fn write_all(&mut self, buff: &[u8]) -> std::io::Result<()> {
-        Ok(RUNTIME.with_borrow(|r| {
+        RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let file = r.files.get_mut(&self.path).expect("the file should exists");
-            while file.cursor + buff.len() as usize > file.buffered_content.len() {
+            while file.cursor + buff.len() > file.buffered_content.len() {
                 file.buffered_content.push(0);
             }
             for (i, b) in buff.iter().cloned().enumerate() {
                 file.buffered_content[file.cursor + i] = b;
             }
             file.changes.push((file.cursor, buff.len()));
-            file.cursor = file.cursor + buff.len();
-        }))
+            file.cursor += buff.len();
+        });
+        Ok(())
     }
 
     #[inline]
@@ -1331,7 +1334,7 @@ impl runtime::File for SimulatedFile {
         let changes_to_apply = RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let r = r.deref_mut();
-            r.rng.gen_range(0..=changes.len()) as usize
+            r.rng.gen_range(0..=changes.len())
         });
 
         for (i, b) in changes.drain(..changes_to_apply) {
@@ -1368,7 +1371,7 @@ impl runtime::File for SimulatedFile {
 
     #[inline]
     fn truncate(&mut self, size: u64) -> std::io::Result<()> {
-        Ok(RUNTIME.with_borrow(|r| {
+        RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let file = r.files.get_mut(&self.path).expect("the file should exists");
             if size as usize > file.buffered_content.len() {
@@ -1380,7 +1383,8 @@ impl runtime::File for SimulatedFile {
                 file.buffered_content.truncate(size as usize);
                 // TODO: should the file.changes recorded?
             }
-        }))
+        });
+        Ok(())
     }
 }
 
