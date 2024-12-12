@@ -1,3 +1,26 @@
+//! Deterministic simulation testing.
+//!
+//! # The need for simulation
+//!
+//! Finding bugs and debugging complex concurrent programs is difficult. There are a bunch of cases
+//! that hard to trigger in normal condition such as context switch and disk failures. On top of
+//! that, being able to trigger the bug alone is not enough to help us find the root cause. Often,
+//! we need to modify our code to help us debug the problem. The problem is, when you run the code
+//! again, even though the bug might be triggered, the program state is different from the last
+//! time you run, and you need to start debugging again from the beginning.
+//!
+//! To make it easier to debug, every possible source undeterminitism will be abstracted away with
+//! a trait. Things such as locks, thread spawn, context switch, atomic operation, timer, and file
+//! system should be accessed using a trait. In normal condition, we should just use the actual
+//! primitives provided by OS or library like parking_lot. But, during testing, we can use some
+//! kind of simulated runtime. The simulated runtime is used to simulate our program
+//! deterministically. Ideally, when you run the same simulation with the same seed, you should get
+//! the same result with exact same state. However, our implementation is not 100% deterministic,
+//! and not 100% reflects what can happen in the practice. There are some limitations. Checks the
+//! [`simulation`] module for more information.
+//!
+//! [`simulation`]: crate::simulation
+
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -28,8 +51,6 @@ pub trait Runtime: 'static {
     type AtomicI32: Atomic<i32>;
     type AtomicI64: Atomic<i64>;
 
-    // TODO: consider making this non-static. For testing, everything is scoped,
-    // so we don't really need the static bound per se.
     fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Self::JoinHandle;
 
     fn park();

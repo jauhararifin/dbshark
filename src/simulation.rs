@@ -111,8 +111,8 @@ struct Internal {
     active_threads: HashSet<ThreadId>,
     panicked_threads: Vec<ThreadId>,
 
-    waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<bool>>,
-    joiner: HashMap<ThreadId, std::thread::JoinHandle<()>>,
+    thread_waker: HashMap<ThreadId, std::sync::mpsc::SyncSender<bool>>,
+    thread_handle: HashMap<ThreadId, std::thread::JoinHandle<()>>,
 
     ready: Vec<ThreadId>,
     joining: HashMap<ThreadId, IndexSet<ThreadId>>,
@@ -215,14 +215,15 @@ struct SpawnCleanup {
 
 impl Drop for SpawnCleanup {
     fn drop(&mut self) {
+        log::trace!(thread_id=self.thread_id; "thread_cleaning_up");
         park();
 
         log::trace!(thread_id=self.thread_id; "thread_finished");
         RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             r.active_threads.remove(&self.thread_id);
-            r.waker.remove(&self.thread_id);
-            r.joiner.remove(&self.thread_id);
+            r.thread_waker.remove(&self.thread_id);
+            r.thread_handle.remove(&self.thread_id);
             if let Some(s) = r.joining.remove(&self.thread_id) {
                 for t in s {
                     r.ready.push(t);
@@ -278,8 +279,8 @@ impl SimulatedRuntime {
                 ready: vec![],
                 active_threads: HashSet::default(),
                 panicked_threads: Vec::default(),
-                waker: HashMap::default(),
-                joiner: HashMap::default(),
+                thread_waker: HashMap::default(),
+                thread_handle: HashMap::default(),
                 joining: HashMap::default(),
                 mutex_id: MutexId::default(),
                 mutex_wait: HashMap::default(),
@@ -307,19 +308,16 @@ impl SimulatedRuntime {
             original_panic_hook(panic_info)
         }));
 
+        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
         {
-            let r = self.internal.lock();
+            let mut r = self.internal.lock();
             log::trace!(
                 starting_thread_id=r.thread_id,
                 starting_mutex_id=r.mutex_id,
                 starting_twmutex_id=r.rwmutex_id;
                 "simulation_started"
             );
-        }
-
-        let (trigger, waiter) = std::sync::mpsc::sync_channel::<()>(1);
-        {
-            self.internal.lock().main_trigger = Some(trigger);
+            r.main_trigger = Some(trigger);
         }
 
         RUNTIME.set(Some(self.clone()));
@@ -340,8 +338,8 @@ impl SimulatedRuntime {
 
         let is_crashing = r.is_crashing;
         let is_deadlock = r.is_deadlock;
-        let wakers = std::mem::take(&mut r.waker);
-        let joiners = std::mem::take(&mut r.joiner);
+        let wakers = std::mem::take(&mut r.thread_waker);
+        let joiners = std::mem::take(&mut r.thread_handle);
         let active_threads = std::mem::take(&mut r.active_threads);
         let panicked_threads = std::mem::take(&mut r.panicked_threads);
         drop(r);
@@ -410,8 +408,8 @@ impl SimulatedRuntime {
         r.ready = vec![];
         r.active_threads = HashSet::default();
         r.panicked_threads = Vec::default();
-        r.waker = HashMap::default();
-        r.joiner = HashMap::default();
+        r.thread_waker = HashMap::default();
+        r.thread_handle = HashMap::default();
         r.joining = HashMap::default();
         //r.mutex_id = MutexId::default();
         r.mutex_wait = HashMap::default();
@@ -429,38 +427,34 @@ impl SimulatedRuntime {
         name: &'static str,
         f: impl FnOnce() + Send + 'static,
     ) -> SimulatedJoinHandle {
-        let thread_id = next_thread_id();
-        log::trace!(name,thread_id; "spawning_thread");
-
         let (trigger, waiter) = std::sync::mpsc::sync_channel::<bool>(1);
+        RUNTIME.with_borrow(|r| {
+            let r = r.as_ref().expect("runtime should be valid");
+            let cloned_runtime = r.clone();
+            let mut r = r.internal.lock();
 
-        let runtime = clone_runtime();
-        {
-            let mut r = runtime.internal.lock();
-            r.waker.insert(thread_id, trigger);
+            let thread_id = r.thread_id.next();
+            log::trace!(name,thread_id; "spawning_thread");
+
+            r.thread_waker.insert(thread_id, trigger);
             r.active_threads.insert(thread_id);
             r.ready.push(thread_id);
-        }
 
-        let handle = std::thread::spawn(move || {
-            RUNTIME.set(Some(runtime));
-            THREAD_ID.set(thread_id);
-            THREAD_WAITER.set(Some(waiter));
+            let handle = std::thread::spawn(move || {
+                RUNTIME.set(Some(cloned_runtime));
+                THREAD_ID.set(thread_id);
+                THREAD_WAITER.set(Some(waiter));
 
-            let cleanup = SpawnCleanup { thread_id };
-            sleep();
-            log::trace!(thread_id; "thread_started");
-            f();
-            drop(cleanup);
-        });
+                let cleanup = SpawnCleanup { thread_id };
+                sleep();
+                log::trace!(thread_id; "thread_started");
+                f();
+                drop(cleanup);
+            });
+            r.thread_handle.insert(thread_id, handle);
 
-        {
-            let runtime = clone_runtime();
-            let mut r = runtime.internal.lock();
-            r.joiner.insert(thread_id, handle);
-        }
-
-        SimulatedJoinHandle(thread_id)
+            SimulatedJoinHandle(thread_id)
+        })
     }
 }
 
@@ -502,7 +496,7 @@ fn resume_any() {
             log::trace!(thread_id=resuming_thread_id; "thread_resuming");
             r.ticks += 1;
             let waker = r
-                .waker
+                .thread_waker
                 .get(&resuming_thread_id)
                 .expect("waker should exists");
             waker
@@ -520,7 +514,7 @@ fn resume_any() {
             r.thread_timer.remove(&thread_id);
             r.ticks = target + 1;
             let waker = r
-                .waker
+                .thread_waker
                 .get(&thread_id)
                 .expect("waker should exists")
                 .clone();
@@ -687,7 +681,11 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
         }
     }
 
+    #[track_caller]
     fn lock(&self) -> Self::Guard<'_> {
+        let loc = format!("{}", std::panic::Location::caller());
+        let is_panic = std::thread::panicking();
+
         park();
 
         loop {
@@ -695,7 +693,7 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
             let mut locker = self.locker.lock();
             if let Some(blocker) = *locker {
                 drop(locker);
-                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,blocker; "mutex_acquiring_blocked");
+                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,blocker,is_panic,loc; "mutex_acquiring_blocked");
                 enqueue_mutex(self.id);
                 switch();
             } else {
@@ -703,39 +701,49 @@ impl<T: Send + Sync> runtime::Mutex<T> for SimulatedMutex<T> {
                 break;
             }
         }
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,is_panic,loc; "mutex_acquired");
 
-        park();
-
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_acquired");
-        SimulatedMutexGuard {
+        let guard = SimulatedMutexGuard {
             id: self.id,
             locker: &self.locker,
             guard: self.value.lock(),
-        }
+        };
+
+        // WARNING: it is imporant to put park after the guard is constructed to make sure that the
+        // guard will be dropped when the program crash while the thread is parked.
+        park();
+        guard
     }
 
+    #[track_caller]
     fn try_lock(&self) -> Option<Self::Guard<'_>> {
+        let loc = format!("{}", std::panic::Location::caller());
+
         park();
 
         {
             let current = THREAD_ID.get();
             let mut locker = self.locker.lock();
             if let Some(blocker) = *locker {
-                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,blocker; "mutex_try_acquiring_failed");
+                log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,blocker,loc; "mutex_try_acquiring_failed");
                 return None;
             } else {
                 *locker = Some(current);
             }
         }
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,loc; "mutex_try_acquired");
 
-        park();
-
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_acquired");
-        Some(SimulatedMutexGuard {
+        let result = Some(SimulatedMutexGuard {
             id: self.id,
             locker: &self.locker,
             guard: self.value.lock(),
-        })
+        });
+
+        // WARNING: it is imporant to put park after the guard is constructed to make sure that the
+        // guard will be dropped when the program crash while the thread is parked.
+        park();
+
+        result
     }
 }
 
@@ -761,9 +769,10 @@ impl<'a, T: Send + Sync> DerefMut for SimulatedMutexGuard<'a, T> {
 
 impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
     fn drop(&mut self) {
+        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released");
+
         park();
 
-        log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released");
         {
             *self.locker.lock() = None;
         }
@@ -852,12 +861,16 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
 
         log::trace!(thread_id=current,mutex_id=self.id,loc; "rwmutex_read_acquired");
 
-        park();
-        SimulatedRwMutexReadGuard {
+        let guard = SimulatedRwMutexReadGuard {
             id: self.id,
             locker: &self.locker,
             guard: self.value.read(),
-        }
+        };
+
+        // WARNING: it is imporant to put park after the guard is constructed to make sure that the
+        // guard will be dropped when the program crash while the thread is parked.
+        park();
+        guard
     }
 
     #[track_caller]
@@ -890,14 +903,18 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
             }
         }
 
-        park();
-
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,loc; "rwmutex_write_acquired");
-        SimulatedRwMutexWriteGuard {
+
+        let guard = SimulatedRwMutexWriteGuard {
             id: self.id,
             locker: &self.locker,
             guard: Some(self.value.write()),
-        }
+        };
+
+        // WARNING: it is imporant to put park after the guard is constructed to make sure that the
+        // guard will be dropped when the program crash while the thread is parked.
+        park();
+        guard
     }
 
     #[track_caller]
@@ -917,14 +934,17 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
             }
         }
 
-        park();
-
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,loc; "rwmutex_try_write_acquired");
-        Some(SimulatedRwMutexWriteGuard {
+        let result = Some(SimulatedRwMutexWriteGuard {
             id: self.id,
             locker: &self.locker,
             guard: Some(self.value.write()),
-        })
+        });
+
+        // WARNING: it is imporant to put park after the guard is constructed to make sure that the
+        // guard will be dropped when the program crash while the thread is parked.
+        park();
+        result
     }
 }
 
@@ -1068,17 +1088,6 @@ impl runtime::JoinHandle for SimulatedJoinHandle {
 fn switch() {
     resume_any();
     sleep();
-}
-
-fn clone_runtime() -> SimulatedRuntime {
-    RUNTIME.with_borrow(|r| r.as_ref().expect("runtime should be valid").clone())
-}
-
-fn next_thread_id() -> ThreadId {
-    RUNTIME.with_borrow(|r| {
-        let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-        r.thread_id.next()
-    })
 }
 
 fn get_tick() -> usize {
