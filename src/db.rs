@@ -38,6 +38,11 @@ pub struct Stat {
     pub main_bytes_written: u64,
     pub double_buff_bytes_written: u64,
     pub wal_bytes_written: u64,
+    wal_flushed_total: u64,
+    wal_flushed_because_buffer_almost_full: u64,
+    wal_flushed_because_buffer_full: u64,
+    wal_flushed_because_manual_trigger: u64,
+    wal_flushed_because_sync_request: u64,
 }
 
 impl std::default::Default for Setting {
@@ -78,7 +83,7 @@ impl<R: Runtime> Db<R> {
             return Err(anyhow!("unsupported database version"));
         }
         let page_size = header.page_size as usize;
-        let pager = Arc::new(Pager::new(path, page_size, 1000)?);
+        let pager = Arc::new(Pager::new(path, page_size, 100000)?);
 
         let result = recover(path, &pager)?;
         let wal = Arc::new(result.wal);
@@ -295,6 +300,12 @@ impl<R: Runtime> Db<R> {
             main_bytes_written: pager_stat.main_bytes_written,
             double_buff_bytes_written: pager_stat.double_buff_bytes_written,
             wal_bytes_written: wal_stat.bytes_written,
+
+            wal_flushed_total: wal_stat.flushed_total,
+            wal_flushed_because_buffer_almost_full: wal_stat.flushed_because_buffer_almost_full,
+            wal_flushed_because_buffer_full: wal_stat.flushed_because_buffer_full,
+            wal_flushed_because_manual_trigger: wal_stat.flushed_because_manual_trigger,
+            wal_flushed_because_sync_request: wal_stat.flushed_because_sync_request,
         }
     }
 

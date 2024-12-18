@@ -1,10 +1,11 @@
 use super::id::Lsn;
 use super::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
 use super::pager::MAXIMUM_PAGE_SIZE;
-use super::runtime::{Atomic, File, Mutex, Runtime, RwMutex, Timer, TimerHandle};
+use super::runtime::{File, Mutex, Runtime, RwMutex, Timer, TimerHandle};
 use anyhow::{anyhow, Context};
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const BUFFER_SIZE: usize = MAXIMUM_PAGE_SIZE * 20;
@@ -17,7 +18,7 @@ pub(crate) struct Wal<R: Runtime> {
     flush_trigger: R::TimerHandle,
     iter_backward_lock: R::Mutex<Vec<u8>>,
 
-    stat: Arc<StatInternal<R>>,
+    stat: Arc<StatInternal>,
 }
 
 struct WalFile<R: Runtime> {
@@ -33,13 +34,26 @@ struct Buffer {
     end_offset: usize,
 }
 
-struct StatInternal<R: Runtime> {
-    bytes_written: R::AtomicU64,
+struct StatInternal {
+    bytes_written: AtomicU64,
+
+    flushed_total: AtomicU64,
+    flushed_because_buffer_almost_full: AtomicU64,
+    flushed_because_buffer_full: AtomicU64,
+    flushed_because_manual_trigger: AtomicU64,
+    flushed_because_sync_request: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Stat {
     pub(crate) bytes_written: u64,
+
+    pub(crate) flushed_total: u64,
+    pub(crate) flushed_because_timeout: u64,
+    pub(crate) flushed_because_buffer_almost_full: u64,
+    pub(crate) flushed_because_buffer_full: u64,
+    pub(crate) flushed_because_manual_trigger: u64,
+    pub(crate) flushed_because_sync_request: u64,
 }
 
 impl Buffer {
@@ -82,7 +96,12 @@ impl<R: Runtime> Wal<R> {
             end_offset: 0,
         }));
         let stat = Arc::new(StatInternal {
-            bytes_written: R::AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            flushed_total: AtomicU64::new(0),
+            flushed_because_buffer_almost_full: AtomicU64::new(0),
+            flushed_because_buffer_full: AtomicU64::new(0),
+            flushed_because_manual_trigger: AtomicU64::new(0),
+            flushed_because_sync_request: AtomicU64::new(0),
         });
 
         let (mut timer, timer_handle) = R::timer(std::time::Duration::from_secs(3600));
@@ -156,7 +175,9 @@ impl<R: Runtime> Wal<R> {
         old_f.f.write_all(&buff)?;
         old_f.f.sync()?;
 
-        self.stat.bytes_written.fetch_add(buff.len() as u64 * 2);
+        self.stat
+            .bytes_written
+            .fetch_add(buff.len() as u64 * 2, Ordering::SeqCst);
 
         old_f.is_empty = false;
         old_f.checkpoint = true;
@@ -168,7 +189,7 @@ impl<R: Runtime> Wal<R> {
         internal: &mut WalInternal,
         f1: &R::Mutex<WalFile<R>>,
         f2: &R::Mutex<WalFile<R>>,
-        stat: &StatInternal<R>,
+        stat: &StatInternal,
         buffer: &mut Buffer,
         iter_backward_lock: &R::Mutex<Vec<u8>>,
     ) -> anyhow::Result<()> {
@@ -211,8 +232,13 @@ impl<R: Runtime> Wal<R> {
 
         let mut buffer = self.buffer.write();
         if buffer.len() + size > buffer.size() {
+            self.stat
+                .flushed_because_buffer_full
+                .fetch_add(1, Ordering::SeqCst);
             Self::flush(internal, &mut buffer, &self.f1, &self.f2, &self.stat)?;
         }
+
+        let buffer_was_big_enough = buffer.len() > buffer.size() / 2;
 
         let end_offset = buffer.end_offset;
         if end_offset + size > buffer.size() {
@@ -229,7 +255,13 @@ impl<R: Runtime> Wal<R> {
         let lsn = internal.next;
         internal.next.add_assign(size as u64);
 
-        if buffer.len() > buffer.size() / 4 {
+        let buffer_is_big_enough = buffer.len() > buffer.size() / 2;
+
+        if !buffer_was_big_enough && buffer_is_big_enough {
+            // TODO: ok, actually we shouldn't trigger this when there is an ongoing wal flushed
+            self.stat
+                .flushed_because_buffer_almost_full
+                .fetch_add(1, Ordering::SeqCst);
             self.flush_trigger.trigger();
         }
 
@@ -253,7 +285,7 @@ impl<R: Runtime> Wal<R> {
         buffer: &mut Buffer,
         f1: &R::Mutex<WalFile<R>>,
         f2: &R::Mutex<WalFile<R>>,
-        stat: &StatInternal<R>,
+        stat: &StatInternal,
     ) -> anyhow::Result<()> {
         let f = if internal.use_wal_1 { f1 } else { f2 };
         let mut f = f.lock();
@@ -264,7 +296,7 @@ impl<R: Runtime> Wal<R> {
         internal: &mut WalInternal,
         buffer: &mut Buffer,
         f: &mut WalFile<R>,
-        stat: &StatInternal<R>,
+        stat: &StatInternal,
     ) -> anyhow::Result<()> {
         log::debug!(
             "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={} first_unflushed={:?} next={:?}",
@@ -289,23 +321,28 @@ impl<R: Runtime> Wal<R> {
             f.f.truncate(0)?;
             f.f.seek(SeekFrom::Start(0))?;
             f.f.write_all(&buff)?;
-            stat.bytes_written.fetch_add(buff.len() as u64);
+            stat.bytes_written
+                .fetch_add(buff.len() as u64, Ordering::SeqCst);
             f.is_empty = false;
         }
 
         let offset = internal.first_unflushed.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2;
         f.f.seek(SeekFrom::Start(offset))?;
 
-        if buffer.end_offset < buffer.start_offset {
+        let written = if buffer.end_offset < buffer.start_offset {
             f.f.write_all(&buffer.buff[buffer.start_offset..])?;
             f.f.write_all(&buffer.buff[..buffer.end_offset])?;
             let written = buffer.buff.len() - buffer.start_offset + buffer.end_offset;
-            stat.bytes_written.fetch_add(written as u64);
+            written
         } else {
             f.f.write_all(&buffer.buff[buffer.start_offset..buffer.end_offset])?;
             let written = buffer.end_offset - buffer.start_offset;
-            stat.bytes_written.fetch_add(written as u64);
-        }
+            written
+        };
+        stat.bytes_written
+            .fetch_add(written as u64, Ordering::SeqCst);
+        stat.flushed_total.fetch_add(1, Ordering::SeqCst);
+
         f.f.sync()?;
 
         buffer.start_offset = 0;
@@ -317,6 +354,9 @@ impl<R: Runtime> Wal<R> {
 
     #[cfg(test)]
     pub(crate) fn trigger_flush(&self) -> anyhow::Result<()> {
+        self.stat
+            .flushed_because_manual_trigger
+            .fetch_add(1, Ordering::SeqCst);
         Self::flush(
             &mut self.internal.write(),
             &mut self.buffer.write(),
@@ -344,6 +384,9 @@ impl<R: Runtime> Wal<R> {
         }
 
         let mut buffer = self.buffer.write();
+        self.stat
+            .flushed_because_sync_request
+            .fetch_add(1, Ordering::SeqCst);
         Self::flush(&mut internal, &mut buffer, &self.f1, &self.f2, &self.stat)?;
         Ok(internal.first_unflushed)
     }
@@ -460,8 +503,33 @@ impl<R: Runtime> Wal<R> {
     }
 
     pub(crate) fn stat(&self) -> Stat {
+        let flushed_total = self.stat.flushed_total.load(Ordering::SeqCst);
+        let flushed_because_buffer_almost_full = self
+            .stat
+            .flushed_because_buffer_almost_full
+            .load(Ordering::SeqCst);
+        let flushed_because_buffer_full =
+            self.stat.flushed_because_buffer_full.load(Ordering::SeqCst);
+        let flushed_because_manual_trigger = self
+            .stat
+            .flushed_because_manual_trigger
+            .load(Ordering::SeqCst);
+        let flushed_because_sync_request = self
+            .stat
+            .flushed_because_sync_request
+            .load(Ordering::SeqCst);
+
         Stat {
-            bytes_written: self.stat.bytes_written.load(),
+            bytes_written: self.stat.bytes_written.load(Ordering::SeqCst),
+
+            flushed_total,
+            flushed_because_timeout: flushed_total
+                - flushed_because_buffer_almost_full
+                - flushed_because_manual_trigger,
+            flushed_because_buffer_almost_full,
+            flushed_because_buffer_full,
+            flushed_because_manual_trigger,
+            flushed_because_sync_request,
         }
     }
 }

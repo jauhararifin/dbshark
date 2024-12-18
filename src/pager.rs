@@ -39,7 +39,7 @@ struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Stat {
     pub(crate) main_bytes_read: u64,
     pub(crate) main_bytes_written: u64,

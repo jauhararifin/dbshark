@@ -4,11 +4,12 @@ use dbshark::{Db, OsRuntime, Setting};
 use pprof::ProfilerGuard;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use std::time::Duration;
 use std::{fs::File, os::raw::c_int, path::Path};
 
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100)).measurement_time(Duration::from_secs(15));
     targets = tx_single_operation
 );
 criterion_main!(benches);
@@ -50,6 +51,8 @@ pub fn tx_single_operation(c: &mut Criterion) {
     });
     group.finish();
     println!("single_tx/read stats: {:?}", db.stat());
+
+    tx.commit().unwrap();
 }
 
 pub struct FlamegraphProfiler<'a> {
