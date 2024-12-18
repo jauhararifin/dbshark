@@ -38,6 +38,7 @@ pub fn tx_single_operation(c: &mut Criterion) {
         })
     });
     group.finish();
+    println!("single_tx/insert stats: {:?}", db.stat());
 
     let mut group = c.benchmark_group("single_tx");
     group.throughput(criterion::Throughput::Elements(1));
@@ -48,6 +49,7 @@ pub fn tx_single_operation(c: &mut Criterion) {
         })
     });
     group.finish();
+    println!("single_tx/read stats: {:?}", db.stat());
 }
 
 pub struct FlamegraphProfiler<'a> {

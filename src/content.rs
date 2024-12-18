@@ -4,6 +4,7 @@ pub(crate) trait Content {
     fn remaining(&self) -> usize;
     fn put(&mut self, buff: &mut [u8]) -> anyhow::Result<()>;
 
+    #[inline]
     fn is_finished(&self) -> bool {
         self.remaining() == 0
     }
@@ -50,6 +51,7 @@ pub(crate) trait Content {
 pub(crate) struct Bytes<'a>(&'a [u8]);
 
 impl<'a> std::fmt::Debug for Bytes<'a> {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for x in self.0 {
             write!(f, "{:02x}", x)?;
@@ -59,24 +61,29 @@ impl<'a> std::fmt::Debug for Bytes<'a> {
 }
 
 impl Bytes<'_> {
+    #[inline]
     pub(crate) fn new(bytes: &[u8]) -> Bytes {
         Bytes(bytes)
     }
 
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
+    #[inline]
     pub(crate) fn slice(&self) -> &[u8] {
         self.0
     }
 }
 
 impl<'a> Content for Bytes<'a> {
+    #[inline]
     fn remaining(&self) -> usize {
         self.0.len()
     }
 
+    #[inline]
     fn put(&mut self, buff: &mut [u8]) -> anyhow::Result<()> {
         let s = std::cmp::min(buff.len(), self.0.len());
         buff[..s].copy_from_slice(&self.0[..s]);

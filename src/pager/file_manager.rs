@@ -1,7 +1,7 @@
 use crate::id::{Lsn, PageId};
 use crate::pager::log::WalSync;
 use crate::pager::page::PageMeta;
-use crate::runtime::{File, Runtime};
+use crate::runtime::{Atomic, File, Runtime};
 use anyhow::anyhow;
 use indexmap::IndexSet;
 use std::io::SeekFrom;
@@ -12,10 +12,18 @@ pub(crate) struct FileManager<R: Runtime> {
     double_buff: R::File,
     page_size: usize,
 
+    pub(super) stat: Stat<R>,
+
     n: usize,
     pages: Box<[u8]>,
     pgids: IndexSet<PageId>,
     lsns: Box<[Lsn]>,
+}
+
+pub(super) struct Stat<R: Runtime> {
+    pub(super) main_bytes_read: R::AtomicU64,
+    pub(super) main_bytes_written: R::AtomicU64,
+    pub(super) double_buff_bytes_written: R::AtomicU64,
 }
 
 impl<R: Runtime> FileManager<R> {
@@ -37,6 +45,12 @@ impl<R: Runtime> FileManager<R> {
             main,
             double_buff,
             page_size,
+
+            stat: Stat {
+                main_bytes_read: R::AtomicU64::new(0),
+                main_bytes_written: R::AtomicU64::new(0),
+                double_buff_bytes_written: R::AtomicU64::new(0),
+            },
 
             n,
             pages: vec![0u8; page_size * n].into_boxed_slice(),
@@ -116,6 +130,9 @@ impl<R: Runtime> FileManager<R> {
         self.double_buff.seek(SeekFrom::Start(0))?;
         self.double_buff.write_all(&self.pages)?;
         self.double_buff.sync()?;
+        self.stat
+            .double_buff_bytes_written
+            .fetch_add(self.pages.len() as u64);
 
         if let Some(max_lsn) = (0..self.pgids.len()).map(|i| self.lsns[i]).max() {
             wal.sync(max_lsn)?;
@@ -132,6 +149,7 @@ impl<R: Runtime> FileManager<R> {
             self.main.seek(SeekFrom::Start(pgid.get() * page_size))?;
             let buff = &self.pages[i * self.page_size..(i + 1) * self.page_size];
             self.main.write_all(buff)?;
+            self.stat.main_bytes_written.fetch_add(buff.len() as u64);
         }
         self.main.sync()?;
         self.pgids.clear();
@@ -152,6 +170,7 @@ impl<R: Runtime> FileManager<R> {
             }
             self.main.seek(SeekFrom::Start(pgid.get() * page_size))?;
             self.main.read_exact(buff)?;
+            self.stat.main_bytes_read.fetch_add(buff.len() as u64);
             Ok(true)
         }
     }

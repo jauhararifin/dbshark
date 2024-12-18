@@ -5,7 +5,7 @@ mod log;
 mod page;
 
 use crate::id::{Lsn, PageId, TxId};
-use crate::runtime::{Mutex, Runtime, RwMutex, RwMutexReadGuard};
+use crate::runtime::{Atomic, Mutex, Runtime, RwMutex, RwMutexReadGuard};
 use crate::wal::Wal;
 use anyhow::anyhow;
 use buffer::{BufferPool, ReadFrame, WriteFrame};
@@ -37,6 +37,13 @@ pub(crate) struct Pager<R: Runtime> {
 
 struct PagerInternal {
     page_to_frame: HashMap<PageId, usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Stat {
+    pub(crate) main_bytes_read: u64,
+    pub(crate) main_bytes_written: u64,
+    pub(crate) double_buff_bytes_written: u64,
 }
 
 impl<R: Runtime> Pager<R> {
@@ -203,11 +210,7 @@ impl<R: Runtime> Pager<R> {
         Ok(meta)
     }
 
-    pub(crate) fn alloc(
-        &self,
-        ctx: LogContext<'_, R>,
-        txid: TxId,
-    ) -> anyhow::Result<PageWrite<R>> {
+    pub(crate) fn alloc(&self, ctx: LogContext<'_, R>, txid: TxId) -> anyhow::Result<PageWrite<R>> {
         logging::trace!("alloc {txid:?}");
         let pgid = {
             let mut state = self.state.write();
@@ -304,6 +307,15 @@ impl<R: Runtime> Pager<R> {
 
     pub(crate) fn shutdown(self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    pub(crate) fn stat(&self) -> Stat {
+        let file_manager = self.file.read();
+        Stat {
+            main_bytes_read: file_manager.stat.main_bytes_read.load(),
+            main_bytes_written: file_manager.stat.main_bytes_written.load(),
+            double_buff_bytes_written: file_manager.stat.double_buff_bytes_written.load(),
+        }
     }
 }
 

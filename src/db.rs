@@ -32,6 +32,14 @@ pub struct Setting {
     pub checkpoint_period: Duration,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Stat {
+    pub main_bytes_read: u64,
+    pub main_bytes_written: u64,
+    pub double_buff_bytes_written: u64,
+    pub wal_bytes_written: u64,
+}
+
 impl std::default::Default for Setting {
     fn default() -> Self {
         Self {
@@ -277,6 +285,17 @@ impl<R: Runtime> Db<R> {
     pub fn force_checkpoint(&self) -> anyhow::Result<()> {
         Self::checkpoint(&self.pager, &self.wal, &self.tx_state)?;
         Ok(())
+    }
+
+    pub fn stat(&self) -> Stat {
+        let pager_stat = self.pager.stat();
+        let wal_stat = self.wal.stat();
+        Stat {
+            main_bytes_read: pager_stat.main_bytes_read,
+            main_bytes_written: pager_stat.main_bytes_written,
+            double_buff_bytes_written: pager_stat.double_buff_bytes_written,
+            wal_bytes_written: wal_stat.bytes_written,
+        }
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {

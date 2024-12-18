@@ -1,7 +1,7 @@
 use super::id::Lsn;
 use super::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
 use super::pager::MAXIMUM_PAGE_SIZE;
-use super::runtime::{File, Mutex, Runtime, RwMutex, Timer, TimerHandle};
+use super::runtime::{Atomic, File, Mutex, Runtime, RwMutex, Timer, TimerHandle};
 use anyhow::{anyhow, Context};
 use std::io::SeekFrom;
 use std::path::Path;
@@ -16,6 +16,8 @@ pub(crate) struct Wal<R: Runtime> {
     internal: Arc<R::RwMutex<WalInternal>>,
     flush_trigger: R::TimerHandle,
     iter_backward_lock: R::Mutex<Vec<u8>>,
+
+    stat: Arc<StatInternal<R>>,
 }
 
 struct WalFile<R: Runtime> {
@@ -29,6 +31,15 @@ struct Buffer {
     buff: Vec<u8>,
     start_offset: usize,
     end_offset: usize,
+}
+
+struct StatInternal<R: Runtime> {
+    bytes_written: R::AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stat {
+    pub(crate) bytes_written: u64,
 }
 
 impl Buffer {
@@ -70,6 +81,9 @@ impl<R: Runtime> Wal<R> {
             start_offset: 0,
             end_offset: 0,
         }));
+        let stat = Arc::new(StatInternal {
+            bytes_written: R::AtomicU64::new(0),
+        });
 
         let (mut timer, timer_handle) = R::timer(std::time::Duration::from_secs(3600));
         {
@@ -77,11 +91,12 @@ impl<R: Runtime> Wal<R> {
             let buffer = buffer.clone();
             let f1 = f1.clone();
             let f2 = f2.clone();
+            let stat = stat.clone();
             R::spawn("wal_flusher", move || {
                 while timer.wait() {
                     let mut internal = internal.write();
                     let mut buffer = buffer.write();
-                    if let Err(err) = Self::flush(&mut internal, &mut buffer, &f1, &f2) {
+                    if let Err(err) = Self::flush(&mut internal, &mut buffer, &f1, &f2, &stat) {
                         log::error!("wal_flush_error err={err}");
                     }
                 }
@@ -96,6 +111,7 @@ impl<R: Runtime> Wal<R> {
             internal,
             flush_trigger: timer_handle,
             iter_backward_lock: Mutex::new(backward_buffer),
+            stat,
         }
     }
 
@@ -140,6 +156,8 @@ impl<R: Runtime> Wal<R> {
         old_f.f.write_all(&buff)?;
         old_f.f.sync()?;
 
+        self.stat.bytes_written.fetch_add(buff.len() as u64 * 2);
+
         old_f.is_empty = false;
         old_f.checkpoint = true;
 
@@ -150,6 +168,7 @@ impl<R: Runtime> Wal<R> {
         internal: &mut WalInternal,
         f1: &R::Mutex<WalFile<R>>,
         f2: &R::Mutex<WalFile<R>>,
+        stat: &StatInternal<R>,
         buffer: &mut Buffer,
         iter_backward_lock: &R::Mutex<Vec<u8>>,
     ) -> anyhow::Result<()> {
@@ -171,7 +190,7 @@ impl<R: Runtime> Wal<R> {
             return Ok(());
         }
 
-        Self::flush_internal(internal, buffer, &mut old_f)?;
+        Self::flush_internal(internal, buffer, &mut old_f, stat)?;
 
         // the new wal file is marked empty so that the next time we flush to it,
         // everything is resetted.
@@ -192,7 +211,7 @@ impl<R: Runtime> Wal<R> {
 
         let mut buffer = self.buffer.write();
         if buffer.len() + size > buffer.size() {
-            Self::flush(internal, &mut buffer, &self.f1, &self.f2)?;
+            Self::flush(internal, &mut buffer, &self.f1, &self.f2, &self.stat)?;
         }
 
         let end_offset = buffer.end_offset;
@@ -219,6 +238,7 @@ impl<R: Runtime> Wal<R> {
                 internal,
                 &self.f1,
                 &self.f2,
+                &self.stat,
                 &mut buffer,
                 &self.iter_backward_lock,
             )?;
@@ -233,16 +253,18 @@ impl<R: Runtime> Wal<R> {
         buffer: &mut Buffer,
         f1: &R::Mutex<WalFile<R>>,
         f2: &R::Mutex<WalFile<R>>,
+        stat: &StatInternal<R>,
     ) -> anyhow::Result<()> {
         let f = if internal.use_wal_1 { f1 } else { f2 };
         let mut f = f.lock();
-        Self::flush_internal(internal, buffer, &mut f)
+        Self::flush_internal(internal, buffer, &mut f, &stat)
     }
 
     fn flush_internal(
         internal: &mut WalInternal,
         buffer: &mut Buffer,
         f: &mut WalFile<R>,
+        stat: &StatInternal<R>,
     ) -> anyhow::Result<()> {
         log::debug!(
             "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={} first_unflushed={:?} next={:?}",
@@ -267,6 +289,7 @@ impl<R: Runtime> Wal<R> {
             f.f.truncate(0)?;
             f.f.seek(SeekFrom::Start(0))?;
             f.f.write_all(&buff)?;
+            stat.bytes_written.fetch_add(buff.len() as u64);
             f.is_empty = false;
         }
 
@@ -276,8 +299,12 @@ impl<R: Runtime> Wal<R> {
         if buffer.end_offset < buffer.start_offset {
             f.f.write_all(&buffer.buff[buffer.start_offset..])?;
             f.f.write_all(&buffer.buff[..buffer.end_offset])?;
+            let written = buffer.buff.len() - buffer.start_offset + buffer.end_offset;
+            stat.bytes_written.fetch_add(written as u64);
         } else {
             f.f.write_all(&buffer.buff[buffer.start_offset..buffer.end_offset])?;
+            let written = buffer.end_offset - buffer.start_offset;
+            stat.bytes_written.fetch_add(written as u64);
         }
         f.f.sync()?;
 
@@ -295,6 +322,7 @@ impl<R: Runtime> Wal<R> {
             &mut self.buffer.write(),
             &self.f1,
             &self.f2,
+            &self.stat,
         )
     }
 
@@ -316,7 +344,7 @@ impl<R: Runtime> Wal<R> {
         }
 
         let mut buffer = self.buffer.write();
-        Self::flush(&mut internal, &mut buffer, &self.f1, &self.f2)?;
+        Self::flush(&mut internal, &mut buffer, &self.f1, &self.f2, &self.stat)?;
         Ok(internal.first_unflushed)
     }
 
@@ -429,6 +457,12 @@ impl<R: Runtime> Wal<R> {
 
     pub(crate) fn shutdown(self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    pub(crate) fn stat(&self) -> Stat {
+        Stat {
+            bytes_written: self.stat.bytes_written.load(),
+        }
     }
 }
 
