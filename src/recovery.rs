@@ -26,7 +26,11 @@ pub(crate) fn recover<R: Runtime>(
         redoer.redo(lsn, &entry)?;
         Ok(())
     })?;
-    log::debug!("aries_recover analyze and redo finish");
+    log::debug!(
+        tx_state:?=analyzer.tx_state,
+        last_txn:?=analyzer.last_txn;
+        "aries_recover_analyze_and_redo_finish",
+    );
 
     let analyze_result = analyzer.take_result();
 

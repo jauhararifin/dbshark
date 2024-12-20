@@ -211,14 +211,20 @@ impl<R: Runtime> Pager<R> {
     }
 
     pub(crate) fn alloc(&self, ctx: LogContext<'_, R>, txid: TxId) -> anyhow::Result<PageWrite<R>> {
-        logging::trace!("alloc {txid:?}");
-        let pgid = {
-            let mut state = self.state.write();
-            state.page_count += 1;
-            PageId::new(state.page_count - 1).unwrap()
-        };
+        let mut state = self.state.write();
+        state.page_count += 1;
+        let pgid = PageId::new(state.page_count - 1).unwrap();
 
+        // WARNING: It is important that `record_alloc` happens while `self.state` is locked
+        // because there is a chance a checkpoint might be running concurrently. If
+        // `self.state` is updated and a checkpoint is running, but the WAL record is not written
+        // yet, our log might look like it went backward. It would be possible to see a
+        // checkpoint record saying we have allocated 10 pages, but the log record that allocates
+        // the 10th page comes later.
         let lsn = ctx.record_alloc(txid, pgid)?;
+        drop(state);
+
+        logging::trace!(pgid:?; "alloc {txid:?}");
 
         let mut internal = self.internal.write();
         let mut evictor = self.evictor.lock();

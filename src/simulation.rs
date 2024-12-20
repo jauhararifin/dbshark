@@ -257,7 +257,7 @@ impl Drop for SpawnCleanup {
             RUNTIME.with_borrow(|r| {
                 let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
                 r.panicked_threads.push(self.thread_id);
-                log::trace!(thread_id=self.thread_id; "thread_panicked");
+                log::error!(thread_id=self.thread_id; "thread_panicked");
             });
         }
 

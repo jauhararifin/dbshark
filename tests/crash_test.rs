@@ -79,6 +79,7 @@ fn test_concurrent_checkpoint_and_rollback() {
     let mut runtime = SimulatedRuntime::new(seed);
 
     for iteration in 0..20 {
+        println!("start iteration {iteration}");
         let result = runtime.run(move || {
             let db = Db::<SimulatedRuntime>::open(Path::new("/"), Setting::default()).unwrap();
             let db = Arc::new(db);
