@@ -2,6 +2,7 @@ use crate::bins::SliceExt;
 use crate::btree::{BTree, Cursor};
 use crate::id::{PageId, PageIdExt, TxId};
 use crate::log::{TxState, WalEntry, WalKind};
+use crate::metric::HistogramPercentile;
 use crate::pager::{LogContext, PageOps, Pager};
 use crate::recovery::{recover, undo_txn};
 use crate::runtime::{
@@ -32,17 +33,20 @@ pub struct Setting {
     pub checkpoint_period: Duration,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Stat {
     pub main_bytes_read: u64,
     pub main_bytes_written: u64,
     pub double_buff_bytes_written: u64,
     pub wal_bytes_written: u64,
-    wal_flushed_total: u64,
-    wal_flushed_because_buffer_almost_full: u64,
-    wal_flushed_because_buffer_full: u64,
-    wal_flushed_because_manual_trigger: u64,
-    wal_flushed_because_sync_request: u64,
+
+    pub wal_flushed_total: u64,
+    pub wal_flushed_because_timeout: u64,
+    pub wal_flushed_because_buffer_almost_full: u64,
+    pub wal_flushed_because_buffer_full: u64,
+    pub wal_flushed_because_manual_trigger: u64,
+    pub wal_flushed_because_sync_request: u64,
+    pub wal_flush_latency: HistogramPercentile,
 }
 
 impl std::default::Default for Setting {
@@ -302,10 +306,12 @@ impl<R: Runtime> Db<R> {
             wal_bytes_written: wal_stat.bytes_written,
 
             wal_flushed_total: wal_stat.flushed_total,
+            wal_flushed_because_timeout: wal_stat.flushed_because_timeout,
             wal_flushed_because_buffer_almost_full: wal_stat.flushed_because_buffer_almost_full,
             wal_flushed_because_buffer_full: wal_stat.flushed_because_buffer_full,
             wal_flushed_because_manual_trigger: wal_stat.flushed_because_manual_trigger,
             wal_flushed_because_sync_request: wal_stat.flushed_because_sync_request,
+            wal_flush_latency: wal_stat.flush_latency,
         }
     }
 

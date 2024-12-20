@@ -4,6 +4,7 @@ mod content;
 mod db;
 mod id;
 mod log;
+mod metric;
 mod os;
 mod pager;
 mod recovery;
@@ -12,6 +13,7 @@ mod simulation;
 mod wal;
 
 pub use db::{Db, Setting};
+pub use metric::HistogramPercentile;
 pub use os::OsRuntime;
 pub use runtime::*;
 pub use simulation::SimulatedRuntime;

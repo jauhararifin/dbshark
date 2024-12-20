@@ -2,6 +2,7 @@ use super::id::Lsn;
 use super::log::{WalDecodeResult, WalEntry, WalHeader, WalKind, WAL_HEADER_SIZE};
 use super::pager::MAXIMUM_PAGE_SIZE;
 use super::runtime::{File, Mutex, Runtime, RwMutex, Timer, TimerHandle};
+use crate::metric::{Histogram, HistogramPercentile};
 use anyhow::{anyhow, Context};
 use std::io::SeekFrom;
 use std::path::Path;
@@ -42,9 +43,11 @@ struct StatInternal {
     flushed_because_buffer_full: AtomicU64,
     flushed_because_manual_trigger: AtomicU64,
     flushed_because_sync_request: AtomicU64,
+
+    flush_latency: Histogram,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct Stat {
     pub(crate) bytes_written: u64,
 
@@ -54,6 +57,8 @@ pub(crate) struct Stat {
     pub(crate) flushed_because_buffer_full: u64,
     pub(crate) flushed_because_manual_trigger: u64,
     pub(crate) flushed_because_sync_request: u64,
+
+    pub(crate) flush_latency: HistogramPercentile,
 }
 
 impl Buffer {
@@ -102,6 +107,7 @@ impl<R: Runtime> Wal<R> {
             flushed_because_buffer_full: AtomicU64::new(0),
             flushed_because_manual_trigger: AtomicU64::new(0),
             flushed_because_sync_request: AtomicU64::new(0),
+            flush_latency: Histogram::new_exponential(1.0, 1.3, 30),
         });
 
         let (mut timer, timer_handle) = R::timer(std::time::Duration::from_secs(3600));
@@ -309,6 +315,8 @@ impl<R: Runtime> Wal<R> {
             internal.next,
         );
 
+        let start = std::time::Instant::now();
+
         if f.is_empty {
             let mut buff = [0u8; WAL_HEADER_SIZE * 2];
             let header = WalHeader {
@@ -344,6 +352,9 @@ impl<R: Runtime> Wal<R> {
         stat.flushed_total.fetch_add(1, Ordering::SeqCst);
 
         f.f.sync()?;
+
+        let elapsed = start.elapsed();
+        stat.flush_latency.observe(elapsed.as_millis() as f64);
 
         buffer.start_offset = 0;
         buffer.end_offset = 0;
@@ -530,6 +541,8 @@ impl<R: Runtime> Wal<R> {
             flushed_because_buffer_full,
             flushed_because_manual_trigger,
             flushed_because_sync_request,
+
+            flush_latency: self.stat.flush_latency.percentile(),
         }
     }
 }
