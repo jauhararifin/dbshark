@@ -532,20 +532,38 @@ impl<'a, R: Runtime> BTree<'a, R> {
         node: &impl InteriorPage<'a>,
         key: &[u8],
     ) -> anyhow::Result<(usize, bool)> {
-        // TODO: use binary search instead
-        let mut i = 0;
+        let mut i = node.count();
         let mut found = false;
 
-        while i < node.count() {
-            let cell = node.get(i);
+        // TODO: implement more robust binary search.
+        // this binary search relies on signed integer
+        // and has possibility to overflow when the count is
+        // very large. Fortunately, the count will never be
+        // that large because one node can only have small number
+        // of elements.
+
+        let mut lo = 0isize;
+        let mut hi = node.count() as isize - 1;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+
+            let cell = node.get(mid as usize);
             let mut a = Bytes::new(key);
             let b = BTreeContent::from_cell(self.ctx, self.pager, self.txid, cell);
             let ord = a.compare(b)?;
-            found = ord.is_eq();
-            if ord.is_lt() {
-                break;
+            match ord {
+                Ordering::Less => {
+                    i = mid as usize;
+                    hi = mid - 1;
+                }
+                Ordering::Equal => {
+                    found = true;
+                    lo = mid + 1;
+                }
+                Ordering::Greater => {
+                    lo = mid + 1;
+                }
             }
-            i += 1;
         }
 
         Ok((i, found))
@@ -556,20 +574,39 @@ impl<'a, R: Runtime> BTree<'a, R> {
         node: &impl LeafPage<'a>,
         key: &[u8],
     ) -> anyhow::Result<(usize, bool)> {
-        // TODO: use binary search instead
-        let mut i = 0;
+        let mut i = node.count();
         let mut found = false;
 
-        while i < node.count() {
-            let cell = node.get(i);
+        // TODO: implement more robust binary search.
+        // this binary search relies on signed integer
+        // and has possibility to overflow when the count is
+        // very large. Fortunately, the count will never be
+        // that large because one node can only have small number
+        // of elements.
+
+        let mut lo = 0isize;
+        let mut hi = node.count() as isize - 1;
+        while lo <= hi {
+            let mid = (hi + lo) / 2;
+
+            let cell = node.get(mid as usize);
             let mut a = Bytes::new(key);
             let b = BTreeContent::from_cell(self.ctx, self.pager, self.txid, cell);
             let ord = a.compare(b)?;
-            found = ord.is_eq();
-            if ord.is_le() {
-                break;
+            match ord {
+                Ordering::Less => {
+                    i = mid as usize;
+                    hi = mid - 1;
+                }
+                Ordering::Equal => {
+                    i = mid as usize;
+                    found = true;
+                    break;
+                }
+                Ordering::Greater => {
+                    lo = mid + 1;
+                }
             }
-            i += 1;
         }
 
         Ok((i, found))

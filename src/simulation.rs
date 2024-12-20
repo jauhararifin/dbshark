@@ -397,7 +397,7 @@ impl SimulatedRuntime {
             for s in result.failing_threads.iter().map(|x| format!("{},", x.0)) {
                 failing_threads.push_str(&s);
             }
-            log::error!(failing_threads, unfinished_threads;"simulation_failed");
+            log::error!(failing_threads, unfinished_threads, deadlock=result.is_deadlock;"simulation_failed");
         } else {
             log::info!(is_crashed=result.is_simulated_crashing;"simulation_success");
         }
@@ -531,7 +531,7 @@ fn resume_any() {
         }
 
         log::trace!("no_more_thread_to_resume");
-        r.is_deadlock = true;
+        r.is_deadlock = !r.active_threads.is_empty();
         let trigger = r
             .main_trigger
             .as_ref()
