@@ -4,17 +4,11 @@ use rand::SeedableRng;
 use std::path::Path;
 use std::sync::Arc;
 
-use std::sync::Once;
-static INIT: Once = Once::new();
-fn setup() {
-    INIT.call_once(|| {
-        env_logger::init();
-    });
-}
+mod common_tests;
 
 #[test]
 fn test_db_happy_path() {
-    setup();
+    common_tests::setup();
 
     _ = std::fs::remove_dir_all("test1");
 
@@ -54,7 +48,7 @@ fn test_db_happy_path() {
 
 #[test]
 fn test_db_btree() {
-    setup();
+    common_tests::setup();
 
     _ = std::fs::remove_dir_all("test_btree");
 
@@ -129,7 +123,7 @@ fn test_db_btree() {
 
 #[test]
 fn test_db_rollback() {
-    setup();
+    common_tests::setup();
 
     _ = std::fs::remove_dir_all("test2");
 
@@ -179,7 +173,7 @@ fn test_db_rollback() {
 
 #[test]
 fn test_crash_after_commit() {
-    setup();
+    common_tests::setup();
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -199,7 +193,7 @@ fn test_crash_after_commit() {
 
 #[test]
 fn test_db_recovery1() {
-    setup();
+    common_tests::setup();
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -223,8 +217,8 @@ fn test_db_recovery1() {
 }
 
 #[test]
-fn test_concurrent_checkpoint_and_rollback() {
-    setup();
+fn test_os_concurrent_checkpoint_and_rollback() {
+    common_tests::setup();
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -235,7 +229,7 @@ fn test_concurrent_checkpoint_and_rollback() {
         let db = db.clone();
         OsRuntime::spawn("rollback_worker", move || {
             for i in 0..700 {
-                println!("rollback transaction round#{i}");
+                log::trace!("rollback transaction round#{i}");
                 let mut tx = db.update().unwrap();
                 let mut bucket = tx.bucket("table1").unwrap();
                 for i in 0..3 {
@@ -252,7 +246,7 @@ fn test_concurrent_checkpoint_and_rollback() {
         let db = db.clone();
         OsRuntime::spawn("checkpoint_worker", move || {
             for i in 0..20 {
-                println!("force checkpoint round#{i}");
+                log::trace!("force checkpoint round#{i}");
                 db.force_checkpoint().unwrap();
             }
         })
@@ -260,4 +254,14 @@ fn test_concurrent_checkpoint_and_rollback() {
 
     h1.join();
     h2.join();
+}
+
+#[test]
+fn test_db_crashing() {
+    common_tests::simulate_db_crashing(0);
+}
+
+#[test]
+fn test_concurrent_checkpoint_and_rollback() {
+    common_tests::simulate_concurrent_checkpoint_and_rollback(0);
 }

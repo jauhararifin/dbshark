@@ -26,7 +26,12 @@ pub fn tx_single_operation(c: &mut Criterion) {
     }
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
 
-    let db = Db::<OsRuntime>::open(path, Setting::default()).unwrap();
+    let setting = Setting {
+        checkpoint_period: Duration::from_secs(300),
+        buffer_size: 100000,
+    };
+
+    let db = Db::<OsRuntime>::open(path, setting).unwrap();
     let mut tx = db.update().unwrap();
     let mut bucket = tx.bucket("sample").unwrap();
 

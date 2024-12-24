@@ -2,26 +2,21 @@ use dbshark::{Db, JoinHandle, Runtime, Setting, SimulatedRuntime};
 use rand::{Rng, SeedableRng};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::Duration;
 
-use std::sync::Once;
 static INIT: Once = Once::new();
-fn setup() {
+pub fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_default_env()
-            .format_timestamp_nanos()
-            .init();
+        env_logger::init();
     });
 }
 
-#[test]
-fn test_db_crashing() {
+pub fn simulate_db_crashing(seed: u64) {
     setup();
 
     let n = 100_000_000usize;
     let p = 100usize;
-    // TODO: use random seed
-    let seed = 0;
     let mut runtime = SimulatedRuntime::new(seed);
 
     for i in 0..100 {
@@ -33,6 +28,7 @@ fn test_db_crashing() {
                 &path,
                 Setting {
                     checkpoint_period: Duration::from_secs(5),
+                    buffer_size: 15,
                 },
             )
             .unwrap();
@@ -71,15 +67,12 @@ fn test_db_crashing() {
     }
 }
 
-#[test]
-fn test_concurrent_checkpoint_and_rollback() {
+pub fn simulate_concurrent_checkpoint_and_rollback(seed: u64) {
     setup();
 
-    let seed = 0u64;
     let mut runtime = SimulatedRuntime::new(seed);
-
     for iteration in 0..100 {
-        println!("start iteration {iteration}");
+        log::trace!("start iteration {iteration}");
         let result = runtime.run(move || {
             let db = Db::<SimulatedRuntime>::open(Path::new("/"), Setting::default()).unwrap();
             let db = Arc::new(db);
@@ -88,7 +81,7 @@ fn test_concurrent_checkpoint_and_rollback() {
                 let db = db.clone();
                 SimulatedRuntime::spawn("rollback_worker", move || {
                     for i in 0..1000 {
-                        println!("rollback transaction round#{i}");
+                        log::trace!("rollback transaction round#{i}");
                         let mut tx = db.update().unwrap();
                         let mut bucket = tx.bucket("table1").unwrap();
                         for i in 0..3 {
@@ -105,7 +98,7 @@ fn test_concurrent_checkpoint_and_rollback() {
                 let db = db.clone();
                 SimulatedRuntime::spawn("checkpoint_worker", move || {
                     for i in 0..100 {
-                        println!("force checkpoint round#{i}");
+                        log::trace!("force checkpoint round#{i}");
                         db.force_checkpoint().unwrap();
                     }
                 })

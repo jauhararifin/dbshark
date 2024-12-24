@@ -31,6 +31,7 @@ pub struct Db<R: Runtime> {
 
 pub struct Setting {
     pub checkpoint_period: Duration,
+    pub buffer_size: usize,
 }
 
 #[derive(Debug)]
@@ -53,6 +54,7 @@ impl std::default::Default for Setting {
     fn default() -> Self {
         Self {
             checkpoint_period: Duration::from_secs(60 * 60),
+            buffer_size: 100000,
         }
     }
 }
@@ -87,7 +89,7 @@ impl<R: Runtime> Db<R> {
             return Err(anyhow!("unsupported database version"));
         }
         let page_size = header.page_size as usize;
-        let pager = Arc::new(Pager::new(path, page_size, 100000)?);
+        let pager = Arc::new(Pager::new(path, page_size, setting.buffer_size)?);
 
         let result = recover(path, &pager)?;
         let wal = Arc::new(result.wal);
