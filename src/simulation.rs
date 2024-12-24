@@ -1723,6 +1723,7 @@ mod tests {
                     if calculated_checksum == checksum {
                         f1.seek(std::io::SeekFrom::Start(0)).unwrap();
                         f1.write_all(&buff[..n as usize]).unwrap();
+                        f1.sync().unwrap();
                     }
                 }
 
