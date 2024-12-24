@@ -305,14 +305,14 @@ impl<R: Runtime> Wal<R> {
         stat: &StatInternal,
     ) -> anyhow::Result<()> {
         log::debug!(
-            "flushing_wal use_wal_1={} len={} is_empty={} checkpoint-{} relative_lsn={} first_unflushed={:?} next={:?}",
-            internal.use_wal_1,
-            buffer.len(),
-            f.is_empty,
-            f.checkpoint,
-            f.relative_lsn,
-            internal.first_unflushed,
-            internal.next,
+            use_wal_1=internal.use_wal_1,
+            len=buffer.len(),
+            is_empty=f.is_empty,
+            checkpoint=f.checkpoint,
+            relative_lsn=f.relative_lsn,
+            first_unflushed:?=internal.first_unflushed,
+            next:?=internal.next;
+            "flushing_wal",
         );
 
         let start = std::time::Instant::now();

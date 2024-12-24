@@ -21,10 +21,10 @@ fn test_db_crashing() {
     let n = 100_000_000usize;
     let p = 100usize;
     // TODO: use random seed
-    let seed = 0u64;
+    let seed = 0;
     let mut runtime = SimulatedRuntime::new(seed);
 
-    for i in 0..20 {
+    for i in 0..100 {
         log::info!(i; "running program");
 
         runtime.run(move || {
@@ -78,7 +78,7 @@ fn test_concurrent_checkpoint_and_rollback() {
     let seed = 0u64;
     let mut runtime = SimulatedRuntime::new(seed);
 
-    for iteration in 0..20 {
+    for iteration in 0..100 {
         println!("start iteration {iteration}");
         let result = runtime.run(move || {
             let db = Db::<SimulatedRuntime>::open(Path::new("/"), Setting::default()).unwrap();

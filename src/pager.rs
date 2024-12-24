@@ -228,7 +228,16 @@ impl<R: Runtime> Pager<R> {
 
         let mut internal = self.internal.write();
         let mut evictor = self.evictor.lock();
-        let frame = if let Some(frame) = self.pool.alloc(txid, PageMeta::init(pgid, lsn)) {
+
+        // It is important to note that calling `alloc` doesn't necessary mean the new allocated
+        // page is not in the buffer pool. When we deallocate a page, we don't actually remove it
+        // from buffer pool. Instead, we just set the page to empty page and decrement page count.
+        // Because of that, when there is a `dealloc` operation followed by `alloc` operation on
+        // the same page, the `alloc` operation might not need to allocate a new page in the pool.
+        let frame = if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            evictor.acquired(frame_id);
+            self.pool.write(txid, frame_id)
+        } else if let Some(frame) = self.pool.alloc(txid, PageMeta::init(pgid, lsn)) {
             evictor.acquired(frame.index);
             internal.page_to_frame.insert(pgid, frame.index);
             frame
@@ -254,12 +263,23 @@ impl<R: Runtime> Pager<R> {
         ctx: LogContext<'_, R>,
         txid: TxId,
         pgid: PageId,
-    ) -> anyhow::Result<PageWrite<R>> {
+    ) -> anyhow::Result<()> {
         let page = self.write(&ctx, txid, pgid)?;
         page.frame.meta.lsn = ctx.record_dealloc(txid, pgid)?;
         page.frame.meta.dirty = true;
         page.frame.meta.kind = PageKind::None;
-        Ok(page)
+        drop(page);
+
+        let mut state = self.state.write();
+        state.page_count -= 1;
+        assert_eq!(
+            state.page_count,
+            pgid.get(),
+            "it is only valid to deallocate the last page"
+        );
+        drop(state);
+
+        Ok(())
     }
 
     pub(crate) fn set_state<F>(&self, ctx: LogContext<'_, R>, f: F) -> anyhow::Result<()>

@@ -25,7 +25,7 @@ impl Evictor {
     }
 
     pub(crate) fn released(&mut self, frame_id: usize, dirty: bool) {
-        log::trace!("released frame_id={frame_id} dirty={dirty}");
+        log::trace!(frame_id,dirty;"released");
         assert!(frame_id < self.ref_count.len());
         self.ref_count[frame_id] -= 1;
         let free = self.ref_count[frame_id] == 0;
@@ -44,9 +44,9 @@ impl Evictor {
 
     pub(crate) fn evict_and_acquire(&mut self) -> anyhow::Result<(usize, bool)> {
         log::trace!(
-            "evict free_and_clean={} free_frames={}",
-            self.free_and_clean.len(),
-            self.free_frames.len()
+            free_and_clean=self.free_and_clean.len(),
+            free_frames=self.free_frames.len();
+            "evict",
         );
 
         if let Some(frame_id) = self.free_and_clean.iter().next().copied() {

@@ -215,8 +215,10 @@ struct SpawnCleanup {
 
 impl Drop for SpawnCleanup {
     fn drop(&mut self) {
-        log::trace!(thread_id=self.thread_id; "thread_cleaning_up");
-        park();
+        // TODO: try to simulate park here. Currently, we don't park here because parking
+        // might crash if other thread trigger crash simulation. Crashing inside drop can't be
+        // handled yet.
+        // park();
 
         log::trace!(thread_id=self.thread_id; "thread_finished");
         RUNTIME.with_borrow(|r| {
@@ -652,7 +654,11 @@ impl runtime::TimerHandle for SimulatedTimerHandle {
 
 impl Drop for SimulatedTimerHandleInternal {
     fn drop(&mut self) {
-        park();
+        // TODO: try to simulate park here. Currently, we don't park here because parking
+        // might crash if other thread trigger crash simulation. Crashing inside drop can't be
+        // handled yet.
+        // park();
+
         *self.state.lock() = TimerState::Closing;
     }
 }
@@ -771,7 +777,10 @@ impl<'a, T: Send + Sync> Drop for SimulatedMutexGuard<'a, T> {
     fn drop(&mut self) {
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "mutex_released");
 
-        park();
+        // TODO: try to simulate park here. Currently, we don't park here because parking
+        // might crash if other thread trigger crash simulation. Crashing inside drop can't be
+        // handled yet.
+        // park();
 
         {
             *self.locker.lock() = None;
@@ -956,7 +965,10 @@ pub struct SimulatedRwMutexReadGuard<'a, T> {
 
 impl<'a, T> Drop for SimulatedRwMutexReadGuard<'a, T> {
     fn drop(&mut self) {
-        park();
+        // TODO: try to simulate park here. Currently, we don't park here because parking
+        // might crash if other thread trigger crash simulation. Crashing inside drop can't be
+        // handled yet.
+        // park();
 
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id; "rwmutex_read_released");
         let mut state = self.locker.lock();
@@ -1024,7 +1036,10 @@ impl<'a, T> Drop for SimulatedRwMutexWriteGuard<'a, T> {
             return;
         }
 
-        park();
+        // TODO: try to simulate park here. Currently, we don't park here because parking
+        // might crash if other thread trigger crash simulation. Crashing inside drop can't be
+        // handled yet.
+        // park();
 
         log::trace!(thread_id=THREAD_ID.get(),rwmutex_id=self.id; "rwmutex_write_released");
         *self.locker.lock() = RwMutexState::Unlocked;
@@ -1171,7 +1186,10 @@ pub struct SimulatedFile {
 
 impl Drop for SimulatedFile {
     fn drop(&mut self) {
-        park();
+        // TODO: try to simulate park here. Currently, we don't park here because parking
+        // might crash if other thread trigger crash simulation. Crashing inside drop can't be
+        // handled yet.
+        // park();
 
         RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
