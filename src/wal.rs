@@ -295,7 +295,7 @@ impl<R: Runtime> Wal<R> {
     ) -> anyhow::Result<()> {
         let f = if internal.use_wal_1 { f1 } else { f2 };
         let mut f = f.lock();
-        Self::flush_internal(internal, buffer, &mut f, &stat)
+        Self::flush_internal(internal, buffer, &mut f, stat)
     }
 
     fn flush_internal(
@@ -340,12 +340,12 @@ impl<R: Runtime> Wal<R> {
         let written = if buffer.end_offset < buffer.start_offset {
             f.f.write_all(&buffer.buff[buffer.start_offset..])?;
             f.f.write_all(&buffer.buff[..buffer.end_offset])?;
-            let written = buffer.buff.len() - buffer.start_offset + buffer.end_offset;
-            written
+            
+            buffer.buff.len() - buffer.start_offset + buffer.end_offset
         } else {
             f.f.write_all(&buffer.buff[buffer.start_offset..buffer.end_offset])?;
-            let written = buffer.end_offset - buffer.start_offset;
-            written
+            
+            buffer.end_offset - buffer.start_offset
         };
         stat.bytes_written
             .fetch_add(written as u64, Ordering::SeqCst);

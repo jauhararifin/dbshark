@@ -52,7 +52,7 @@ impl Histogram {
     }
 
     pub(crate) fn quantile(&self, p: f64) -> f64 {
-        assert!(p >= 0.0 && p <= 1.0);
+        assert!((0.0..=1.0).contains(&p));
         let _guard = self.lock.write();
 
         let total = self.total.load(Ordering::SeqCst);
