@@ -258,10 +258,24 @@ fn test_os_concurrent_checkpoint_and_rollback() {
 
 #[test]
 fn test_db_crashing() {
+    println!("running with seed 8083966471238347500");
+    common_tests::simulate_db_crashing(8083966471238347500);
+
+    println!("running with seed 15861061922345593129");
+    common_tests::simulate_db_crashing(15861061922345593129);
+
+    println!("running with seed 1417552117827942665");
+    common_tests::simulate_db_crashing(1417552117827942665);
+
+    println!("running with seed 0");
     common_tests::simulate_db_crashing(0);
 }
 
 #[test]
 fn test_concurrent_checkpoint_and_rollback() {
+    println!("run simulate_concurrent_checkpoint_and_rollback with seed 10509492465236718138");
+    common_tests::simulate_concurrent_checkpoint_and_rollback(10509492465236718138);
+
+    println!("run simulate_concurrent_checkpoint_and_rollback with seed 0");
     common_tests::simulate_concurrent_checkpoint_and_rollback(0);
 }

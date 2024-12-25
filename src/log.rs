@@ -102,7 +102,7 @@ impl WalEntry<'_> {
 
         let total_length = Self::size_by_kind_size(kind_size);
         if total_length >= 1 << 16 {
-            return WalDecodeResult::Incomplete;
+            return WalDecodeResult::Invalid;
         }
         if buff.len() < total_length {
             return WalDecodeResult::NeedMoreBytes;
@@ -112,7 +112,7 @@ impl WalEntry<'_> {
         let calculated_checksum = crc64::crc64(0x1d0f, &buff[0..checksum_offset]);
         let stored_checksum = buff[checksum_offset..checksum_offset + 8].read_u64();
         if calculated_checksum != stored_checksum {
-            return WalDecodeResult::Incomplete;
+            return WalDecodeResult::Invalid;
         }
 
         let kind = match WalKind::decode(&buff[16..16 + kind_size], kind) {
@@ -150,7 +150,11 @@ impl WalEntry<'_> {
 pub(crate) enum WalDecodeResult<'a> {
     Ok(WalEntry<'a>),
     NeedMoreBytes,
-    Incomplete,
+    // Invalid indicates that the log entry is not fully written successfully
+    // or corrupted. Unfortunately, currently, it can't be differentiated whether
+    // the entry is invalid due to incomplete write or corrupted write. Now, let's
+    // just assume that this error indicates incomplete write.
+    Invalid,
     Err(anyhow::Error),
 }
 

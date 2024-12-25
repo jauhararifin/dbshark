@@ -499,7 +499,7 @@ impl<R: Runtime> Wal<R> {
                         break;
                     }
                 }
-                WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
+                WalDecodeResult::NeedMoreBytes | WalDecodeResult::Invalid => {
                     break;
                 }
                 WalDecodeResult::Err(err) => return Err(err),
@@ -633,7 +633,7 @@ pub(crate) fn recover<R: Runtime>(
                     next_lsn = current_lsn;
                     handler(lsn, entry)?;
                 }
-                WalDecodeResult::NeedMoreBytes | WalDecodeResult::Incomplete => {
+                WalDecodeResult::NeedMoreBytes => {
                     let next_f = if use_wal_1 { &f2 } else { &f1 };
                     if next_f.relative_lsn < current_lsn.get() {
                         break;
@@ -641,6 +641,9 @@ pub(crate) fn recover<R: Runtime>(
                     use_wal_1 = !use_wal_1;
                     start_offset = 0;
                     end_offset = 0;
+                }
+                WalDecodeResult::Invalid => {
+                    break;
                 }
                 WalDecodeResult::Err(err) => return Err(err),
             }
