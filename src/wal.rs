@@ -695,9 +695,22 @@ fn recover_wal_file<R: Runtime>(mut f: R::File) -> anyhow::Result<RecoveringWalF
     f.seek(SeekFrom::Start(0))?;
     f.read_exact(&mut buff)?;
 
-    let Some(header) = WalHeader::decode(&buff[..WAL_HEADER_SIZE])
-        .or_else(|| WalHeader::decode(&buff[WAL_HEADER_SIZE..]))
-    else {
+    let header = if let Some(header) = WalHeader::decode(&buff[..WAL_HEADER_SIZE]) {
+        header
+    } else if let Some(header) = WalHeader::decode(&buff[WAL_HEADER_SIZE..]) {
+        // When the first part of the wal header is corrupted, but the second part is valid, it
+        // means the process was crashed in the past when writing the wal header. In that case, we
+        // should repair the first part of the wal header. If we don't recover the first part, when
+        // we update the wal header again in the future, and crashed in the middle of writing the
+        // second part of the wal header, our wal header become fully corrupted, because the first
+        // part is corrupted due to previous sync, and the second part is corrupted due to the next
+        // sync.
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&buff[WAL_HEADER_SIZE..])?;
+        f.sync()?;
+
+        header
+    } else {
         // if the first and second part of the wal header is invalid, this means
         // that the wal file is not written successfully, and we can assume that
         // it never been written just like an empty wal.
