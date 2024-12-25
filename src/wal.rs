@@ -332,6 +332,15 @@ impl<R: Runtime> Wal<R> {
             stat.bytes_written
                 .fetch_add(buff.len() as u64, Ordering::SeqCst);
             f.is_empty = false;
+
+            // WARNING: it is important to perform fsync here to make sure that this file is
+            // successfully truncated to zero. Otherwise, we might end up with partially written
+            // content where the header is sucessfully persisted, but some of its content are not,
+            // and leaving us with combination of the new log entries and the old log entries. To
+            // make things worse, if it happen such that there is an old log entry that starts at
+            // the position which should be used for the new log entry, we can silently fall into
+            // bug and it's hard to find out the first root cause.
+            f.f.sync()?;
         }
 
         let offset = internal.first_unflushed.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2;
