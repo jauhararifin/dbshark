@@ -1,18 +1,19 @@
 use anyhow::anyhow;
-use std::collections::HashSet;
+use indexmap::IndexSet;
 
 pub(crate) struct Evictor {
     ref_count: Vec<usize>,
-    free_frames: HashSet<usize>,
-    free_and_clean: HashSet<usize>,
+    // It is important to use IndexSet and not HashSet to make it deterministic
+    free_frames: IndexSet<usize>,
+    free_and_clean: IndexSet<usize>,
 }
 
 impl Evictor {
     pub(crate) fn new(n: usize) -> Self {
         Self {
             ref_count: vec![0; n],
-            free_frames: HashSet::default(),
-            free_and_clean: HashSet::default(),
+            free_frames: IndexSet::default(),
+            free_and_clean: IndexSet::default(),
         }
     }
 
@@ -20,8 +21,8 @@ impl Evictor {
         log::trace!("acquired frame_id={frame_id}");
         assert!(frame_id < self.ref_count.len());
         self.ref_count[frame_id] += 1;
-        self.free_frames.remove(&frame_id);
-        self.free_and_clean.remove(&frame_id);
+        self.free_frames.swap_remove(&frame_id);
+        self.free_and_clean.swap_remove(&frame_id);
     }
 
     pub(crate) fn released(&mut self, frame_id: usize, dirty: bool) {
@@ -34,7 +35,7 @@ impl Evictor {
         }
 
         if dirty {
-            self.free_and_clean.remove(&frame_id);
+            self.free_and_clean.swap_remove(&frame_id);
         }
 
         if !dirty && free {
@@ -51,12 +52,12 @@ impl Evictor {
 
         if let Some(frame_id) = self.free_and_clean.iter().next().copied() {
             self.ref_count[frame_id] = 1;
-            self.free_and_clean.remove(&frame_id);
-            self.free_frames.remove(&frame_id);
+            self.free_and_clean.swap_remove(&frame_id);
+            self.free_frames.swap_remove(&frame_id);
             Ok((frame_id, false))
         } else if let Some(frame_id) = self.free_frames.iter().next().copied() {
             self.ref_count[frame_id] = 1;
-            self.free_frames.remove(&frame_id);
+            self.free_frames.swap_remove(&frame_id);
             Ok((frame_id, true))
         } else {
             return Err(anyhow!("all pages are pinned"));
