@@ -126,6 +126,12 @@ impl<R: Runtime> FileManager<R> {
     }
 
     pub(crate) fn sync(&mut self, wal: &impl WalSync) -> anyhow::Result<()> {
+        if let Some(max_lsn) = (0..self.pgids.len()).map(|i| self.lsns[i]).max() {
+            wal.sync(max_lsn)?;
+        }
+
+        // WARNING: it is important to write the double buffer after the wal is flushed to the
+        // point where all the page that will be flushed have their logs written to the wal.
         self.double_buff.truncate(0)?;
         self.double_buff.seek(SeekFrom::Start(0))?;
         self.double_buff.write_all(&self.pages)?;
@@ -133,10 +139,6 @@ impl<R: Runtime> FileManager<R> {
         self.stat
             .double_buff_bytes_written
             .fetch_add(self.pages.len() as u64);
-
-        if let Some(max_lsn) = (0..self.pgids.len()).map(|i| self.lsns[i]).max() {
-            wal.sync(max_lsn)?;
-        }
 
         for (i, pgid) in self.pgids.iter().enumerate() {
             // TODO: maybe we can use vectorized write to write them all in one single syscall

@@ -19,9 +19,14 @@ pub fn simulate_db_crashing(seed: u64) {
     let p = 100usize;
     let mut runtime = SimulatedRuntime::new(seed);
 
+    let rng = Arc::new(parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(
+        seed,
+    )));
+
     for i in 0..100 {
         log::info!(i; "running program");
 
+        let rng = rng.clone();
         runtime.run(move || {
             let path = PathBuf::from("/");
             let db = Db::<SimulatedRuntime>::open(
@@ -37,13 +42,12 @@ pub fn simulate_db_crashing(seed: u64) {
             let mut handles = vec![];
             for _ in 0..20 {
                 let db = db.clone();
+                let rng = rng.clone();
                 let handle = SimulatedRuntime::spawn("worker", move || loop {
-                    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-
                     let mut tx = db.update().expect("cannot create write tx");
                     let mut bucket = tx.bucket("table1").unwrap();
 
-                    let x = rng.gen_range(0..n);
+                    let x = rng.lock().gen_range(0..n);
                     for i in 0..p {
                         let x = x + i * n;
                         let key = format!("key{x:05}");
@@ -51,7 +55,7 @@ pub fn simulate_db_crashing(seed: u64) {
                         bucket.put(key.as_bytes(), val.as_bytes()).unwrap();
                     }
 
-                    if rng.gen_bool(0.5) {
+                    if rng.lock().gen_bool(0.5) {
                         tx.commit().unwrap()
                     } else {
                         tx.rollback().unwrap()
