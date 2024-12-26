@@ -942,6 +942,11 @@ impl<T: Send + Sync> runtime::RwMutex<T> for SimulatedRwMutex<T> {
                 *locker = RwMutexState::Write(current);
             }
         }
+        // It is important to drop the locker here so that the lock is not hold during park below.
+        // park can crash because triggered by the runtime simulation, and when it crash, we need
+        // to cleanup the lock. Cleaning up the lock locks the locker. If we hold the locker here,
+        // the cleanup process will deadlock.
+        drop(locker);
 
         log::trace!(thread_id=THREAD_ID.get(),mutex_id=self.id,loc; "rwmutex_try_write_acquired");
         let result = Some(SimulatedRwMutexWriteGuard {

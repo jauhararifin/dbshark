@@ -273,6 +273,9 @@ fn test_db_crashing() {
 
 #[test]
 fn test_concurrent_checkpoint_and_rollback() {
+    println!("run simulate_concurrent_checkpoint_and_rollback with seed 6412611287877951998");
+    common_tests::simulate_concurrent_checkpoint_and_rollback(6412611287877951998);
+
     println!("run simulate_concurrent_checkpoint_and_rollback with seed 14293644219467456508");
     common_tests::simulate_concurrent_checkpoint_and_rollback(14293644219467456508);
 
