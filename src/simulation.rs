@@ -128,6 +128,7 @@ struct Internal {
 
     rng: StdRng,
     ticks_per_milli: usize,
+    sync_crash_probability: f64,
 }
 
 struct FileInternal {
@@ -220,19 +221,6 @@ impl Drop for SpawnCleanup {
         // handled yet.
         // park();
 
-        log::trace!(thread_id=self.thread_id; "thread_finished");
-        RUNTIME.with_borrow(|r| {
-            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
-            r.active_threads.remove(&self.thread_id);
-            r.thread_waker.remove(&self.thread_id);
-            r.thread_handle.remove(&self.thread_id);
-            if let Some(s) = r.joining.remove(&self.thread_id) {
-                for t in s {
-                    r.ready.push(t);
-                }
-            }
-        });
-
         let is_crash = RUNTIME.with_borrow(|r| {
             r.as_ref()
                 .expect("runtime should be valid")
@@ -240,6 +228,41 @@ impl Drop for SpawnCleanup {
                 .lock()
                 .is_crashing
         });
+
+        assert_eq!(self.thread_id, THREAD_ID.get());
+
+        log::trace!(thread_id=self.thread_id, is_crash; "thread_finished");
+        RUNTIME.with_borrow(|r| {
+            let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
+            let thread_is_not_ready = !r.ready.iter().any(|tid| *tid == self.thread_id);
+            assert!(
+                thread_is_not_ready,
+                "thread {} should not be ready",
+                self.thread_id,
+            );
+            r.active_threads.remove(&self.thread_id);
+            r.thread_waker.remove(&self.thread_id);
+            r.thread_handle.remove(&self.thread_id);
+            for joining in r.joining.values_mut() {
+                joining.swap_remove(&self.thread_id);
+            }
+            for waiting in r.mutex_wait.values_mut() {
+                waiting.swap_remove(&self.thread_id);
+            }
+            for waiting in r.rwmutex_write_wait.values_mut() {
+                waiting.swap_remove(&self.thread_id);
+            }
+            for waiting in r.rwmutex_read_wait.values_mut() {
+                waiting.swap_remove(&self.thread_id);
+            }
+
+            if let Some(s) = r.joining.remove(&self.thread_id) {
+                for t in s {
+                    r.ready.push(t);
+                }
+            }
+        });
+
         if is_crash {
             RUNTIME.with_borrow(|r| {
                 let r = r.as_ref().expect("runtime should be valid").internal.lock();
@@ -264,13 +287,17 @@ impl Drop for SpawnCleanup {
             });
         }
 
-        resume_any();
+        if !is_crash {
+            // if this is a crash, then don't wake up other thread, the main thread will do that
+            // for you.
+            resume_any();
+        }
     }
 }
 
 impl SimulatedRuntime {
     #[allow(unused)]
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: u64, sync_crash_probability: f64) -> Self {
         Self {
             internal: Arc::new(parking_lot::Mutex::<Internal>::new(Internal {
                 thread_id: ThreadId(0),
@@ -294,6 +321,7 @@ impl SimulatedRuntime {
                 files: HashMap::default(),
                 rng: rand::rngs::StdRng::seed_from_u64(seed),
                 ticks_per_milli: 10,
+                sync_crash_probability,
             })),
         }
     }
@@ -340,10 +368,16 @@ impl SimulatedRuntime {
 
         let is_crashing = r.is_crashing;
         let is_deadlock = r.is_deadlock;
+        r.ready.clear();
         let wakers = std::mem::take(&mut r.thread_waker);
-        let joiners = std::mem::take(&mut r.thread_handle);
+        let mut joiners = std::mem::take(&mut r.thread_handle);
         let active_threads = std::mem::take(&mut r.active_threads);
         let panicked_threads = std::mem::take(&mut r.panicked_threads);
+        r.rwmutex_read_wait.clear();
+        r.rwmutex_write_wait.clear();
+        r.timer_wait.clear();
+        r.mutex_wait.clear();
+        r.joining.clear();
         drop(r);
 
         let result = RunResult {
@@ -354,15 +388,14 @@ impl SimulatedRuntime {
         };
 
         if is_crashing {
-            for (_, waker) in wakers {
+            for (thread_id, waker) in wakers {
+                let joiner = joiners.remove(&thread_id).expect("thread should exists");
                 waker
                     .send(true)
                     .expect("canceling thread should always successfull");
-            }
-
-            for (_, joiner) in joiners {
                 let _ = joiner.join();
             }
+            assert!(joiners.is_empty());
         } else if !active_threads.is_empty() {
             for t in &active_threads {
                 wakers.get(t).unwrap().try_send(false).unwrap();
@@ -1333,7 +1366,7 @@ impl runtime::File for SimulatedFile {
         let will_crash = RUNTIME.with_borrow(|r| {
             let mut r = r.as_ref().expect("runtime should be valid").internal.lock();
             let r = r.deref_mut();
-            r.rng.gen_bool(0.1)
+            r.rng.gen_bool(r.sync_crash_probability)
         });
 
         log::trace!(will_crash; "sync_file");
@@ -1492,7 +1525,7 @@ mod tests {
     #[test]
     fn test_simple_join() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         runtime.run(|| {
             let handle = SimulatedRuntime::spawn("t2", || {});
             handle.join();
@@ -1502,7 +1535,7 @@ mod tests {
     #[test]
     fn test_simple_atomic() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         runtime.run(|| {
             let a = Arc::new(AtomicI32::new(0));
             let x = a.clone();
@@ -1527,7 +1560,7 @@ mod tests {
     #[test]
     fn test_simple_mutex() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         runtime.run(|| {
             let a = Arc::new(SimulatedMutex::new(0));
             let x = a.clone();
@@ -1580,7 +1613,7 @@ mod tests {
     #[test]
     fn test_simple_rwmutex() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         runtime.run(|| {
             let a = Arc::new(SimulatedRwMutex::new((0, 0)));
 
@@ -1629,7 +1662,7 @@ mod tests {
     #[test]
     fn test_simple_timer() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         runtime.run(|| {
             let counter = AtomicUsize::new(0);
             let timer_count = Arc::new(AtomicUsize::new(0));
@@ -1663,7 +1696,7 @@ mod tests {
     #[test]
     fn test_writing_file() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         let rng: Arc<parking_lot::Mutex<StdRng>> = Arc::new(parking_lot::Mutex::new(
             rand::rngs::StdRng::seed_from_u64(0),
         ));
@@ -1708,7 +1741,7 @@ mod tests {
     #[test]
     fn test_atomically_writing_file() {
         setup();
-        let mut runtime = SimulatedRuntime::new(0);
+        let mut runtime = SimulatedRuntime::new(0, 0.1);
         let rng: Arc<parking_lot::Mutex<StdRng>> = Arc::new(parking_lot::Mutex::new(
             rand::rngs::StdRng::seed_from_u64(0),
         ));

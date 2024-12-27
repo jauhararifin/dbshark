@@ -257,6 +257,12 @@ fn test_os_concurrent_checkpoint_and_rollback() {
 }
 
 #[test]
+fn test_db_overflow_crashing() {
+    println!("running simulate_db_overflow_crashing with seed 0");
+    common_tests::simulate_db_overflow_crashing(0);
+}
+
+#[test]
 fn test_db_crashing() {
     println!("running with seed 0");
     common_tests::simulate_db_crashing(0);
