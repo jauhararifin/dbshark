@@ -9,6 +9,10 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// TODO: this implementation is really bad, rewrite!!!
+// Use simpler architecture. Spawn an orchestrator thread that controls which thread to run and
+// each time a thread context switch, they should context switch to the orchestrator.
+
 // TODO: make a better crash simulation.
 // Currently, we simulate crash scenario by panicking. When a crash is triggered, all threads
 // throw panics, and the simulator will just exit and report the the program is crash. However,

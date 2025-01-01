@@ -12,7 +12,7 @@ mod runtime;
 mod simulation;
 mod wal;
 
-pub use db::{Db, Setting};
+pub use db::{Bucket, Db, KeyValue, Range, ReadBucket, ReadTx, Setting, WriteBucket, WriteTx};
 pub use metric::HistogramPercentile;
 pub use os::OsRuntime;
 pub use runtime::*;

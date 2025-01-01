@@ -205,7 +205,7 @@ impl<R: Runtime> Db<R> {
         Ok(header)
     }
 
-    pub fn update(&self) -> anyhow::Result<Tx<R>> {
+    pub fn update(&self) -> anyhow::Result<WriteTx<R>> {
         let tx_guard = self.tx_lock.write();
 
         let mut tx_state = self.tx_state.write();
@@ -215,7 +215,7 @@ impl<R: Runtime> Db<R> {
         let txid = TxId::new(txid).unwrap();
         *tx_state = TxState::Active(txid);
 
-        Tx::new(txid, self, tx_guard)
+        WriteTx::new(txid, self, tx_guard)
     }
 
     fn finish_dangling_tx(&self, tx_state: &mut TxState) -> anyhow::Result<()> {
@@ -381,7 +381,7 @@ impl Header {
     }
 }
 
-pub struct Tx<'db, R: Runtime> {
+pub struct WriteTx<'db, R: Runtime> {
     id: TxId,
     wal: Arc<Wal<R>>,
     pager: Arc<Pager<R>>,
@@ -391,7 +391,7 @@ pub struct Tx<'db, R: Runtime> {
     tx_state: &'db R::RwMutex<TxState>,
 }
 
-impl<'db, R: Runtime> Tx<'db, R> {
+impl<'db, R: Runtime> WriteTx<'db, R> {
     fn new(
         id: TxId,
         db: &'db Db<R>,
@@ -411,7 +411,7 @@ impl<'db, R: Runtime> Tx<'db, R> {
         Ok(tx)
     }
 
-    pub fn bucket(&mut self, name: &str) -> anyhow::Result<Bucket<R>> {
+    pub fn bucket(&mut self, name: &str) -> anyhow::Result<WriteBucket<R>> {
         let root_pgid = self.init_root()?;
 
         let mut btree = crate::btree::new(self.id, &self.pager, &self.wal, root_pgid);
@@ -439,7 +439,7 @@ impl<'db, R: Runtime> Tx<'db, R> {
             bucket_root_id
         };
 
-        Ok(Bucket {
+        Ok(WriteBucket {
             btree: crate::btree::new(self.id, &self.pager, &self.wal, bucket_pgid),
         })
     }
@@ -517,17 +517,19 @@ impl<'db, R: Runtime> Tx<'db, R> {
     }
 }
 
-pub struct Bucket<'a, R: Runtime> {
+pub struct WriteBucket<'a, R: Runtime> {
     btree: BTree<'a, R>,
 }
 
-impl<'a, R: Runtime> Bucket<'a, R> {
+impl<'a, R: Runtime> WriteBucket<'a, R> {
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.btree.put(key, value)?;
         Ok(())
     }
+}
 
-    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+impl<'a, R: Runtime> Bucket<'a, R> for WriteBucket<'a, R> {
+    fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         let result = self.btree.get(key)?;
         let Some(result) = result else {
             return Ok(None);
@@ -536,9 +538,10 @@ impl<'a, R: Runtime> Bucket<'a, R> {
         Ok(Some(value))
     }
 
-    pub fn range<Rg>(&'a self, range: Rg) -> anyhow::Result<Range<'a, R>>
+    fn range<'b, Rg>(&self, range: Rg) -> anyhow::Result<Range<'a, R>>
     where
-        Rg: RangeBounds<[u8]> + 'static,
+        'a: 'b,
+        Rg: RangeBounds<&'b [u8]>,
     {
         let cursor = self.btree.range(range)?;
         Ok(Range {
@@ -546,6 +549,15 @@ impl<'a, R: Runtime> Bucket<'a, R> {
             cursor,
         })
     }
+}
+
+pub trait Bucket<'a, R: Runtime> {
+    fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
+
+    fn range<'b, Rg>(&self, range: Rg) -> anyhow::Result<Range<'a, R>>
+    where
+        'a: 'b,
+        Rg: RangeBounds<&'b [u8]>;
 }
 
 pub struct Range<'a, R: Runtime> {
@@ -630,8 +642,8 @@ pub struct ReadBucket<'a, R: Runtime> {
     btree: BTree<'a, R>,
 }
 
-impl<'a, R: Runtime> ReadBucket<'a, R> {
-    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+impl<'a, R: Runtime> Bucket<'a, R> for ReadBucket<'a, R> {
+    fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         let result = self.btree.get(key)?;
         let Some(result) = result else {
             return Ok(None);
@@ -640,9 +652,10 @@ impl<'a, R: Runtime> ReadBucket<'a, R> {
         Ok(Some(value))
     }
 
-    pub fn range<Rg>(&'a self, range: Rg) -> anyhow::Result<Range<'a, R>>
+    fn range<'b, Rg>(&self, range: Rg) -> anyhow::Result<Range<'a, R>>
     where
-        Rg: RangeBounds<[u8]> + 'static,
+        'a: 'b,
+        Rg: RangeBounds<&'b [u8]>,
     {
         let cursor = self.btree.range(range)?;
         Ok(Range {

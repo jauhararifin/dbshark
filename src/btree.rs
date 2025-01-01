@@ -612,7 +612,13 @@ impl<'a, R: Runtime> BTree<'a, R> {
         Ok((i, found))
     }
 
-    pub(crate) fn range(&self, range: impl RangeBounds<[u8]>) -> anyhow::Result<Cursor<R>> {
+    pub(crate) fn range<'b>(
+        &self,
+        range: impl RangeBounds<&'b [u8]>,
+    ) -> anyhow::Result<Cursor<'a, R>>
+    where
+        'a: 'b,
+    {
         let (start, skip_first) = match range.start_bound() {
             Bound::Included(key) => (self.find_position(key)?, false),
             Bound::Excluded(key) => (self.find_position(key)?, true),

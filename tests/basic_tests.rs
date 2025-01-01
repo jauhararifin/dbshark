@@ -1,4 +1,4 @@
-use dbshark::{Db, JoinHandle, OsRuntime, Runtime, Setting};
+use dbshark::{Db, JoinHandle, OsRuntime, Runtime, Setting, Bucket};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::path::Path;
