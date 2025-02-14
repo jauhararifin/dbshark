@@ -1,0 +1,59 @@
+what do we need:
+
+- content
+  - about comparing bytes
+
+- btree
+
+- log
+  - codec for WalHeader, WalEntry, and the payload
+
+- pager
+  - read
+  - write
+  - alloc
+  - dealloc
+  - set state (root, freelist, page_count)
+  - read state
+  - checkpoint
+  - shutdown
+  - buffer
+    - contains page content
+    - read
+    - write
+    - alloc
+    - walk through all frames
+  - evictor
+    - acquired
+    - released
+    - evict and acquire
+  - file manager
+    - recover
+    - spill -> move to spill buffer
+    - sync -> write to file
+    - get
+  - log -> calling append_log
+  - page -> handle operation inside a page
+
+- recovery
+  - load wal
+  - iterate back for rollback (wal.rs)
+  - outputs: Wal (wal.rs)
+  - analyze
+  - redo (recovery.rs)
+  - undo (recovery.rs)
+  - outputs: RecoveryResult (Wal + next txid)
+
+- wal
+  - append new
+    - if it's an end transaction entry, we may be able to delete the old wal
+  - flush
+  - complete checkpoint
+  - sync -> make sure a specific Lsn is flushed
+    - used by buffer pool when they want to evict a page
+
+- iterate wal back
+  - for rollback
+  - and for recovery
+
+- stats, metrics, and logging

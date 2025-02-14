@@ -1,0 +1,24 @@
+[package]
+name = "dbshark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+crc64 = "2.0.0"
+indexmap = "2.3.0"
+log = { version = "0.4.22", features = ["kv", "kv_std"] }
+parking_lot = "0.12.3"
+syscalls = "0.6.18"
+rand = "0.8.5"
+env_logger = { version = "0.11.3", features = ["unstable-kv"] }
+
+[dev-dependencies]
+criterion = "0.5.1"
+env_logger = "0.11.3"
+pprof = { version = "0.13.0", features = ["flamegraph"] }
+tempfile = "3.10.1"
+
+[[bench]]
+name = "db_benchmark"
+harness = false

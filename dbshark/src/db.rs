@@ -411,6 +411,14 @@ impl<'db, R: Runtime> WriteTx<'db, R> {
         Ok(tx)
     }
 
+    // TODO: figure out a way to acquire multiple bucket without requerying like:
+    // a = bucket("xxx")
+    // b = bucket("yyy")
+    // c = buckey("zzz")
+    // a.put(...)
+    // b.put(...)
+    // a.put(...) // this fails because a is already dropped after b is used
+    // c.put(...)
     pub fn bucket(&mut self, name: &str) -> anyhow::Result<WriteBucket<R>> {
         let root_pgid = self.init_root()?;
 

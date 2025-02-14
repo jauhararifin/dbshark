@@ -1,8 +1,10 @@
-/target
 tarpaulin-report.html
 
-test1
-test2
-test_btree
+target
+*/target
+
+dbshark/test1
+dbshark/test2
+dbshark/test_btree
 
 *.log
