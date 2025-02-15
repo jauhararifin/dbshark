@@ -1,8 +1,12 @@
+use std::future::Future;
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 pub trait Runtime: 'static {
+    type Timer: Timer;
+    type TimerHandle: TimerHandle;
+
     type Mutex<T: Send + Sync>: Mutex<T>;
     type RwMutex<T: Send + Sync>: RwMutex<T>;
 
@@ -20,6 +24,22 @@ pub trait Runtime: 'static {
     type AtomicI16: Atomic<i16>;
     type AtomicI32: Atomic<i32>;
     type AtomicI64: Atomic<i64>;
+
+    async fn spawn<F>(name: &'static str, f: F) -> Self::JoinHandle
+    where
+        F: Future<Output = ()> + Send + 'static;
+
+    fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle);
+
+    async fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()>;
+}
+
+pub trait Timer: Send {
+    async fn wait(&mut self) -> bool;
+}
+
+pub trait TimerHandle: Send + Sync {
+    async fn trigger(&self);
 }
 
 pub trait Mutex<T: Send + Sync>: Send + Sync {

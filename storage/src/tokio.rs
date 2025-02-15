@@ -1,11 +1,17 @@
-use crate::runtime::{File, JoinHandle, Mutex, MutexGuard, Runtime, RwMutex, RwMutexReadGuard};
+use crate::runtime::{
+    File, JoinHandle, Mutex, MutexGuard, Runtime, RwMutex, RwMutexReadGuard, Timer, TimerHandle,
+};
 use parking_lot;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use tokio;
 
 pub struct TokioRuntime;
 
 impl Runtime for TokioRuntime {
+    type Timer = TokioTimer;
+    type TimerHandle = TokioTimerHandle;
+
     type Mutex<T: Send + Sync> = TokioMutex<T>;
     type RwMutex<T: Send + Sync> = TokioRwMutex<T>;
 
@@ -23,6 +29,54 @@ impl Runtime for TokioRuntime {
     type AtomicI16 = AtomicI16;
     type AtomicI32 = AtomicI32;
     type AtomicI64 = AtomicI64;
+
+    async fn spawn<F>(_name: &'static str, f: F) -> Self::JoinHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::task::spawn(f);
+        TokioJoinHandle(handle)
+    }
+
+    fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(5);
+        let timer = TokioTimer { duration, receiver };
+        let handle = TokioTimerHandle { sender };
+        (timer, handle)
+    }
+
+    async fn create_dir_all<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
+        tokio::fs::create_dir_all(path.as_ref()).await
+    }
+}
+
+pub struct TokioTimer {
+    duration: std::time::Duration,
+    receiver: tokio::sync::mpsc::Receiver<()>,
+}
+
+impl Timer for TokioTimer {
+    async fn wait(&mut self) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(self.duration) => {
+                true
+            }
+            res = self.receiver.recv() => {
+                res.is_some()
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TokioTimerHandle {
+    sender: tokio::sync::mpsc::Sender<()>,
+}
+
+impl TimerHandle for TokioTimerHandle {
+    async fn trigger(&self) {
+        let _ = self.sender.send(()).await;
+    }
 }
 
 pub struct TokioMutex<T> {
