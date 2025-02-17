@@ -35,7 +35,7 @@ pub trait Runtime: 'static {
 }
 
 pub trait Timer: Send {
-    async fn wait(&mut self) -> bool;
+    fn wait(&mut self) -> impl Future<Output = bool> + Send;
 }
 
 pub trait TimerHandle: Send + Sync {
@@ -43,13 +43,17 @@ pub trait TimerHandle: Send + Sync {
 }
 
 pub trait Mutex<T: Send + Sync>: Send + Sync {
-    type Guard<'a>: DerefMut<Target = T>
+    type Guard<'a>: DerefMut<Target = T> + Send
     where
         Self: 'a;
 
     fn new(data: T) -> Self;
-    async fn lock(&self) -> Self::Guard<'_>;
+
+    fn lock(&self) -> impl Future<Output = Self::Guard<'_>> + Send;
+
     async fn try_lock(&self) -> Option<Self::Guard<'_>>;
+
+    fn into_inner(self) -> impl Future<Output=T> + Send;
 }
 
 pub trait MutexGuard<T: Send + Sync>: DerefMut<Target = T> {
@@ -57,18 +61,18 @@ pub trait MutexGuard<T: Send + Sync>: DerefMut<Target = T> {
 }
 
 pub trait RwMutex<T: Send + Sync>: Send + Sync {
-    type ReadGuard<'a>: Deref<Target = T> + From<Self::WriteGuard<'a>>
+    type ReadGuard<'a>: Deref<Target = T> + From<Self::WriteGuard<'a>> + Send
     where
         Self: 'a;
-    type WriteGuard<'a>: DerefMut<Target = T>
+    type WriteGuard<'a>: DerefMut<Target = T> + Send
     where
         Self: 'a;
 
     fn new(data: T) -> Self;
 
-    async fn read(&self) -> Self::ReadGuard<'_>;
+    fn read(&self) -> impl Future<Output = Self::ReadGuard<'_>> + Send;
 
-    async fn write(&self) -> Self::WriteGuard<'_>;
+    fn write(&self) -> impl Future<Output = Self::WriteGuard<'_>> + Send;
 
     async fn try_write(&self) -> Option<Self::WriteGuard<'_>>;
 }
@@ -82,23 +86,25 @@ pub trait JoinHandle {
 }
 
 pub trait File: Sized + Send + Sync {
-    async fn open(path: impl AsRef<Path>) -> io::Result<Self>;
+    fn open(path: &Path) -> impl Future<Output = io::Result<Self>> + Send;
 
-    async fn is_file(&self) -> io::Result<bool>;
+    fn is_file(&self) -> impl Future<Output = io::Result<bool>> + Send;
 
-    async fn len(&self) -> io::Result<u64>;
+    fn len(&self) -> impl Future<Output = io::Result<u64>> + Send;
 
-    async fn seek(&mut self, position: io::SeekFrom) -> io::Result<()>;
+    fn seek(&mut self, position: io::SeekFrom) -> impl Future<Output = io::Result<()>> + Send;
 
-    async fn read(&mut self, buff: &mut [u8]) -> io::Result<usize>;
+    fn read(&mut self, buff: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
-    async fn read_exact(&mut self, buff: &mut [u8]) -> io::Result<()>;
+    fn read_exact(&mut self, buff: &mut [u8]) -> impl Future<Output = io::Result<()>> + Send;
 
-    async fn write_all(&mut self, buff: &[u8]) -> io::Result<()>;
+    fn write_all(&mut self, buff: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 
-    async fn sync(&mut self) -> io::Result<()>;
+    fn sync(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 
-    async fn truncate(&mut self, size: u64) -> io::Result<()>;
+    fn truncate(&mut self, size: u64) -> impl Future<Output = io::Result<()>> + Send;
+
+    fn close(self) -> impl Future<Output = std::io::Result<()>> + Send;
 }
 
 pub trait Atomic<T>: Send + Sync {

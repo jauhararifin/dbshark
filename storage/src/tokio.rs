@@ -1,7 +1,6 @@
 use crate::runtime::{
     File, JoinHandle, Mutex, MutexGuard, Runtime, RwMutex, RwMutexReadGuard, Timer, TimerHandle,
 };
-use parking_lot;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use tokio;
@@ -80,7 +79,7 @@ impl TimerHandle for TokioTimerHandle {
 }
 
 pub struct TokioMutex<T> {
-    inner: parking_lot::Mutex<T>,
+    inner: tokio::sync::Mutex<T>,
 }
 
 impl<T: Send + Sync> Mutex<T> for TokioMutex<T> {
@@ -91,14 +90,14 @@ impl<T: Send + Sync> Mutex<T> for TokioMutex<T> {
     #[inline]
     fn new(data: T) -> Self {
         Self {
-            inner: parking_lot::Mutex::new(data),
+            inner: tokio::sync::Mutex::new(data),
         }
     }
 
     #[inline]
     async fn lock(&self) -> Self::Guard<'_> {
         TokioGuard {
-            inner: Some(self.inner.lock()),
+            inner: Some(self.inner.lock().await),
         }
     }
 
@@ -106,12 +105,17 @@ impl<T: Send + Sync> Mutex<T> for TokioMutex<T> {
     async fn try_lock(&self) -> Option<Self::Guard<'_>> {
         self.inner
             .try_lock()
+            .ok()
             .map(|guard| TokioGuard { inner: Some(guard) })
+    }
+
+    async fn into_inner(self) -> T {
+        self.inner.into_inner()
     }
 }
 
 pub struct TokioGuard<'a, T> {
-    inner: Option<parking_lot::MutexGuard<'a, T>>,
+    inner: Option<tokio::sync::MutexGuard<'a, T>>,
 }
 
 impl<'a, T> Deref for TokioGuard<'a, T> {
@@ -147,7 +151,7 @@ impl<'a, T> Drop for TokioGuard<'a, T> {
 }
 
 pub struct TokioRwMutex<T> {
-    inner: Option<parking_lot::RwLock<T>>,
+    inner: Option<tokio::sync::RwLock<T>>,
 }
 
 impl<T: Send + Sync> RwMutex<T> for TokioRwMutex<T> {
@@ -161,47 +165,47 @@ impl<T: Send + Sync> RwMutex<T> for TokioRwMutex<T> {
     #[inline]
     fn new(data: T) -> Self {
         Self {
-            inner: Some(parking_lot::RwLock::new(data)),
+            inner: Some(tokio::sync::RwLock::new(data)),
         }
     }
 
     #[inline]
     async fn read(&self) -> Self::ReadGuard<'_> {
         TokioReadGuard {
-            inner: Some(self.inner.as_ref().unwrap().read()),
+            inner: Some(self.inner.as_ref().unwrap().read().await),
         }
     }
 
     #[inline]
     async fn write(&self) -> Self::WriteGuard<'_> {
         TokioWriteGuard {
-            inner: Some(self.inner.as_ref().unwrap().write()),
+            inner: Some(self.inner.as_ref().unwrap().write().await),
         }
     }
 
     #[inline]
     async fn try_write(&self) -> Option<Self::WriteGuard<'_>> {
-        let guard = self.inner.as_ref().unwrap().try_write()?;
+        let guard = self.inner.as_ref().unwrap().try_write().ok()?;
         Some(TokioWriteGuard { inner: Some(guard) })
     }
 }
 
-pub struct TokioReadGuard<'a, T> {
-    inner: Option<parking_lot::RwLockReadGuard<'a, T>>,
+pub struct TokioReadGuard<'a, T: Send> {
+    inner: Option<tokio::sync::RwLockReadGuard<'a, T>>,
 }
 
-impl<'a, T> From<TokioWriteGuard<'a, T>> for TokioReadGuard<'a, T> {
+impl<'a, T: Send> From<TokioWriteGuard<'a, T>> for TokioReadGuard<'a, T> {
     #[inline]
     fn from(mut value: TokioWriteGuard<'a, T>) -> Self {
         Self {
-            inner: Some(parking_lot::RwLockWriteGuard::downgrade(
+            inner: Some(tokio::sync::RwLockWriteGuard::downgrade(
                 value.inner.take().unwrap(),
             )),
         }
     }
 }
 
-impl<'a, T> Deref for TokioReadGuard<'a, T> {
+impl<'a, T: Send> Deref for TokioReadGuard<'a, T> {
     type Target = T;
 
     #[inline]
@@ -217,7 +221,7 @@ impl<'a, T: Send + Sync> RwMutexReadGuard<'a, T> for TokioReadGuard<'a, T> {
     }
 }
 
-impl<'a, T> Drop for TokioReadGuard<'a, T> {
+impl<'a, T: Send> Drop for TokioReadGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
         if self.inner.is_none() {
@@ -226,11 +230,11 @@ impl<'a, T> Drop for TokioReadGuard<'a, T> {
     }
 }
 
-pub struct TokioWriteGuard<'a, T> {
-    inner: Option<parking_lot::RwLockWriteGuard<'a, T>>,
+pub struct TokioWriteGuard<'a, T: Send> {
+    inner: Option<tokio::sync::RwLockWriteGuard<'a, T>>,
 }
 
-impl<'a, T> Deref for TokioWriteGuard<'a, T> {
+impl<'a, T: Send> Deref for TokioWriteGuard<'a, T> {
     type Target = T;
 
     #[inline]
@@ -239,7 +243,7 @@ impl<'a, T> Deref for TokioWriteGuard<'a, T> {
     }
 }
 
-impl<'a, T> DerefMut for TokioWriteGuard<'a, T> {
+impl<'a, T: Send> DerefMut for TokioWriteGuard<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.as_mut().unwrap().deref_mut()
@@ -255,67 +259,87 @@ impl JoinHandle for TokioJoinHandle {
     }
 }
 
-pub struct TokioFile(tokio::fs::File);
+pub struct TokioFile(Option<tokio::fs::File>);
 
 impl File for TokioFile {
     #[inline]
-    async fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let f = tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.as_ref())
-            .await?;
-        lock(&f)?;
-        Ok(Self(f))
+    fn open(path: &std::path::Path) -> impl Future<Output = std::io::Result<Self>> + Send {
+        async move {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            let f = tokio::fs::File::from_std(f);
+            lock(&f)?;
+            Ok(Self(Some(f)))
+        }
     }
 
     #[inline]
     async fn is_file(&self) -> std::io::Result<bool> {
-        Ok(self.0.metadata().await?.is_file())
+        Ok(self.0.as_ref().unwrap().metadata().await?.is_file())
     }
 
     #[inline]
     async fn len(&self) -> std::io::Result<u64> {
-        Ok(self.0.metadata().await?.len())
+        Ok(self.0.as_ref().unwrap().metadata().await?.len())
     }
 
     #[inline]
     async fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<()> {
         use tokio::io::AsyncSeekExt;
-        self.0.seek(position).await?;
+        self.0.as_mut().unwrap().seek(position).await?;
         Ok(())
     }
 
     #[inline]
     async fn read(&mut self, buff: &mut [u8]) -> std::io::Result<usize> {
         use tokio::io::AsyncReadExt;
-        self.0.read(buff).await
+        self.0.as_mut().unwrap().read(buff).await
     }
 
     #[inline]
     async fn read_exact(&mut self, buff: &mut [u8]) -> std::io::Result<()> {
         use tokio::io::AsyncReadExt;
-        self.0.read_exact(buff).await?;
+        self.0.as_mut().unwrap().read_exact(buff).await?;
         Ok(())
     }
 
     #[inline]
     async fn write_all(&mut self, buff: &[u8]) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
-        self.0.write_all(buff).await?;
+        self.0.as_mut().unwrap().write_all(buff).await?;
         Ok(())
     }
 
     #[inline]
     async fn sync(&mut self) -> std::io::Result<()> {
-        self.0.sync_all().await
+        self.0.as_mut().unwrap().sync_all().await
     }
 
     #[inline]
     async fn truncate(&mut self, size: u64) -> std::io::Result<()> {
-        self.0.set_len(size).await
+        self.0.as_mut().unwrap().set_len(size).await
+    }
+
+    #[inline]
+    async fn close(mut self) -> std::io::Result<()> {
+        let f = self.0.take().expect("file can't be closed twice");
+        f.sync_all().await?;
+        // to close the file, we just need to convert it to std file
+        // and drop it
+        drop(f.into_std().await);
+        Ok(())
+    }
+}
+
+impl Drop for TokioFile {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            panic!("file handle is dropped without properly closed")
+        }
     }
 }
 
