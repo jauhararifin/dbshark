@@ -25,13 +25,13 @@ pub trait Runtime: Send + Sync + 'static {
     type AtomicI32: Atomic<i32>;
     type AtomicI64: Atomic<i64>;
 
-    async fn spawn<F>(name: &'static str, f: F) -> Self::JoinHandle
+    fn spawn<F>(name: &'static str, f: F) -> impl Future<Output = Self::JoinHandle>
     where
         F: Future<Output = ()> + Send + 'static;
 
     fn timer(duration: std::time::Duration) -> (Self::Timer, Self::TimerHandle);
 
-    async fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()>;
+    fn create_dir_all<P: AsRef<Path>>(path: P) -> impl Future<Output = io::Result<()>>;
 }
 
 pub trait Timer: Send {
@@ -57,7 +57,7 @@ pub trait Mutex<T: Send + Sync>: Send + Sync {
 }
 
 pub trait MutexGuard<T: Send + Sync>: DerefMut<Target = T> {
-    async fn unlock(self);
+    fn unlock(self) -> impl Future<Output = ()>;
 }
 
 pub trait RwMutex<T: Send + Sync>: Send + Sync {
@@ -74,19 +74,23 @@ pub trait RwMutex<T: Send + Sync>: Send + Sync {
 
     fn write(&self) -> impl Future<Output = Self::WriteGuard<'_>> + Send;
 
-    async fn try_write(&self) -> Option<Self::WriteGuard<'_>>;
+    fn try_write(&self) -> impl Future<Output = Option<Self::WriteGuard<'_>>>;
 }
 
 pub trait RwMutexReadGuard<'a, T>: Deref<Target = T> + Send {
-    async fn unlock(self);
+    // TODO: maybe we don't have to go this far?
+    // or here is another idea
+    // in tokio, just do the same logic for drop and unlock
+    // but in simulation, dropping without unlocking should fail
+    fn unlock(self) -> impl Future<Output = ()>;
 }
 
 pub trait RwMutexWriteGuard<'a, T>: DerefMut<Target = T> + Send {
-    async fn unlock(self);
+    fn unlock(self) -> impl Future<Output = ()>;
 }
 
 pub trait JoinHandle: Send + Sync {
-    async fn join(self);
+    fn join(self) -> impl Future<Output = ()>;
 }
 
 pub trait File: Sized + Send + Sync {

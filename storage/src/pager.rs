@@ -111,12 +111,20 @@ impl<R: Runtime> Pager<R> {
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
             self.evictor.lock().await.acquired(frame_id);
             let frame = self.pool.read(frame_id).await;
-            return Ok(PageRead { pager: self, frame });
+            return Ok(PageRead {
+                pager: self,
+                frame,
+                released: false,
+            });
         }
         drop(internal);
 
         let frame = self.acquire::<ReadFrame<R>>(wal, txid, pgid).await?;
-        Ok(PageRead { pager: self, frame })
+        Ok(PageRead {
+            pager: self,
+            frame,
+            released: false,
+        })
     }
 
     pub(crate) async fn write(
@@ -137,12 +145,20 @@ impl<R: Runtime> Pager<R> {
         if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
             self.evictor.lock().await.acquired(frame_id);
             let frame = self.pool.write(txid, frame_id).await;
-            return Ok(PageWrite { pager: self, frame });
+            return Ok(PageWrite {
+                pager: self,
+                frame,
+                released: false,
+            });
         }
         drop(internal);
 
         let frame = self.acquire::<WriteFrame<R>>(wal, txid, pgid).await?;
-        Ok(PageWrite { pager: self, frame })
+        Ok(PageWrite {
+            pager: self,
+            frame,
+            released: false,
+        })
     }
 
     async fn acquire<'a, T>(
@@ -264,7 +280,11 @@ impl<R: Runtime> Pager<R> {
             frame
         };
 
-        Ok(PageWrite { pager: self, frame })
+        Ok(PageWrite {
+            pager: self,
+            frame,
+            released: false,
+        })
     }
 
     pub(crate) async fn dealloc(
@@ -384,11 +404,17 @@ impl<'a, R: Runtime> BufferPoolFrame<'a, R> for WriteFrame<'a, R> {
 pub(crate) struct PageRead<'a, R: Runtime> {
     pub(super) pager: &'a Pager<R>,
     pub(super) frame: ReadFrame<'a, R>,
+    released: bool,
 }
 
 impl<'a, R: Runtime> Drop for PageRead<'a, R> {
     fn drop(&mut self) {
-        self.pager.release(self.frame.index, self.frame.meta.dirty);
+        if !self.released {
+            panic!(
+                "PageRead {:?} is dropped without released",
+                self.frame.meta.id
+            )
+        }
     }
 }
 
@@ -400,11 +426,20 @@ impl<'a, R: Runtime> PageOps<'a> for PageRead<'a, R> {
             buffer: self.frame.buffer,
         }
     }
+
+    #[inline]
+    async fn release(mut self) {
+        self.released = true;
+        self.pager
+            .release(self.frame.index, self.frame.meta.dirty)
+            .await;
+    }
 }
 
 pub(crate) struct PageWrite<'a, R: Runtime> {
     pub(super) pager: &'a Pager<R>,
     pub(super) frame: WriteFrame<'a, R>,
+    released: bool,
 }
 
 impl<'a, R: Runtime> std::fmt::Debug for PageWrite<'a, R> {
@@ -421,6 +456,14 @@ impl<'a, R: Runtime> PageOps<'a> for PageWrite<'a, R> {
             buffer: self.frame.buffer,
         }
     }
+
+    #[inline]
+    async fn release(mut self) {
+        self.released = true;
+        self.pager
+            .release(self.frame.index, self.frame.meta.dirty)
+            .await;
+    }
 }
 
 impl<'a, R: Runtime> PageWriteOps<'a> for PageWrite<'a, R> {
@@ -436,7 +479,12 @@ impl<'a, R: Runtime> PageWriteOps<'a> for PageWrite<'a, R> {
 
 impl<'a, R: Runtime> Drop for PageWrite<'a, R> {
     fn drop(&mut self) {
-        self.pager.release(self.frame.index, self.frame.meta.dirty);
+        if !self.released {
+            panic!(
+                "PageWrite {:?} is dropped without released",
+                self.frame.meta.id
+            )
+        }
     }
 }
 

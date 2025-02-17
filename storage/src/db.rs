@@ -5,10 +5,7 @@ use crate::log::{TxState, WalEntry, WalKind};
 use crate::metric::HistogramPercentile;
 use crate::pager::{LogContext, PageOps, Pager};
 use crate::recovery::{recover, undo_txn};
-use crate::runtime::{
-    Atomic, File, JoinHandle, Runtime, RwMutex, RwMutexReadGuard, RwMutexWriteGuard, Timer,
-    TimerHandle,
-};
+use crate::runtime::{Atomic, File, JoinHandle, Runtime, RwMutex, Timer, TimerHandle};
 use crate::wal::Wal;
 use anyhow::anyhow;
 use std::future::Future;
@@ -337,8 +334,8 @@ impl<R: Runtime> Db<R> {
         let shutdowned = self.shutting_down.compare_and_exchange(0, 1).await;
         assert!(shutdowned);
 
-        self.timer_handle.trigger();
-        self.background_handle.join();
+        self.timer_handle.trigger().await;
+        self.background_handle.join().await;
 
         // Since we own self, it means there are no active transaction since active transaction
         // borrows the db. And there are no ongoing flush and checkpoint since they also borrow
@@ -609,7 +606,7 @@ pub struct Range<'a, R: Runtime> {
 }
 
 impl<'a, R: Runtime> Range<'a, R> {
-    async fn next(&mut self) -> Option<anyhow::Result<KeyValue>> {
+    pub async fn next(&mut self) -> Option<anyhow::Result<KeyValue>> {
         if self.error {
             return None;
         }

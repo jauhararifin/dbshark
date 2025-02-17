@@ -1,6 +1,6 @@
 use super::page::PageMeta;
 use crate::id::TxId;
-use crate::runtime::{Atomic, JoinHandle, Runtime, RwMutex};
+use crate::runtime::{Atomic, Runtime, RwMutex};
 use std::mem::MaybeUninit;
 
 pub(crate) struct BufferPool<R: Runtime> {
@@ -243,6 +243,7 @@ mod tests {
     use super::*;
     use crate::id::{Lsn, PageId};
     use crate::pager::page::PageKind;
+    use crate::runtime::JoinHandle;
     use crate::runtime::{Atomic, Runtime};
     use crate::tokio::TokioRuntime;
     use rand::Rng;

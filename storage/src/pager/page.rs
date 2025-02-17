@@ -461,6 +461,8 @@ pub(crate) struct PageInternal<'a> {
 pub(crate) trait PageOps<'a>: Sized {
     fn internal(&self) -> PageInternal;
 
+    async fn release(self);
+
     #[inline]
     fn is_none(&self) -> bool {
         matches!(self.internal().meta.kind, PageKind::None)
@@ -750,6 +752,11 @@ where
     fn internal(&self) -> PageInternal {
         self.0.internal()
     }
+
+    #[inline]
+    async fn release(self) {
+        self.0.release().await
+    }
 }
 
 impl<'a, T> InteriorPage<'a> for InteriorPageRead<T> where T: PageOps<'a> {}
@@ -807,6 +814,11 @@ where
     #[inline]
     fn internal(&self) -> PageInternal {
         self.0.internal()
+    }
+
+    #[inline]
+    async fn release(self) {
+        self.0.release().await
     }
 }
 
@@ -1288,6 +1300,11 @@ where
     fn internal(&self) -> PageInternal {
         self.0.internal()
     }
+
+    #[inline]
+    async fn release(self) {
+        self.0.release().await
+    }
 }
 
 impl<'a, T> LeafPage<'a> for LeafPageRead<T> where T: PageOps<'a> {}
@@ -1339,6 +1356,11 @@ where
     #[inline]
     fn internal(&self) -> PageInternal {
         self.0.internal()
+    }
+
+    #[inline]
+    async fn release(self) {
+        self.0.release().await
     }
 }
 
@@ -1720,11 +1742,14 @@ where
             internal.meta.lsn,
         );
 
-        Ok((n_cells_to_keep, SplittedLeaf{
-            inner: self,
-            original_count,
-            i: n_cells_to_keep
-        }))
+        Ok((
+            n_cells_to_keep,
+            SplittedLeaf {
+                inner: self,
+                original_count,
+                i: n_cells_to_keep,
+            },
+        ))
     }
 }
 
@@ -1774,6 +1799,11 @@ where
     fn internal(&self) -> PageInternal {
         self.0.internal()
     }
+
+    #[inline]
+    async fn release(self) {
+        self.0.release().await
+    }
 }
 
 impl<'a, T> OverflowPage<'a> for OverflowPageRead<T> where T: PageOps<'a> {}
@@ -1787,6 +1817,11 @@ where
     #[inline]
     fn internal(&self) -> PageInternal {
         self.0.internal()
+    }
+
+    #[inline]
+    async fn release(self) {
+        self.0.release().await
     }
 }
 

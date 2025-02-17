@@ -167,7 +167,7 @@ impl<'a, R: Runtime> BTree<'a, R> {
                 return Err(anyhow!("expected an overflow page"));
             };
             overflow_pgid = overflow.next();
-            drop(overflow);
+            overflow.release().await;
             self.delete_page(pgid)?;
         }
 
@@ -528,6 +528,7 @@ impl<'a, R: Runtime> BTree<'a, R> {
             };
             let next = self.pager.read(&self.ctx, self.txid, next_pgid).await?;
 
+            node.release().await;
             current = next;
         };
 
@@ -697,6 +698,7 @@ impl<'a, R: Runtime> BTree<'a, R> {
             };
             let next = self.pager.read(&self.ctx, self.txid, next_pgid).await?;
 
+            node.release().await;
             current = next;
         };
 
@@ -767,10 +769,13 @@ impl<'a, R: Runtime> Cursor<'a, R> {
         if let Self::Leaf { skip_current, .. } = self {
             if *skip_current {
                 *skip_current = false;
-                self.next().await?;
+                self.advance().await?;
             }
         };
+        Ok(self.advance().await?)
+    }
 
+    async fn advance(&mut self) -> anyhow::Result<Option<KVItem>> {
         let Self::Leaf {
             txid,
             ref ctx,
@@ -823,6 +828,9 @@ impl<'a, R: Runtime> Cursor<'a, R> {
                 let Some(page) = pager.read(ctx, *txid, next_pgid).await?.into_leaf() else {
                     return Err(anyhow!("expected a leaf page"));
                 };
+
+                current_page.take().unwrap().release().await;
+
                 *current_page = Some(page);
                 *current_index = 0;
             } else {
@@ -1059,7 +1067,7 @@ impl<'a, R: Runtime> Content for BTreeContent<'a, R> {
                     }
 
                     if let Some(pgid) = overflow.next() {
-                        let Some(page) = self
+                        let Some(mut page) = self
                             .pager
                             .read(&self.ctx, self.txid, pgid)
                             .await?
@@ -1067,7 +1075,10 @@ impl<'a, R: Runtime> Content for BTreeContent<'a, R> {
                         else {
                             return Err(anyhow!("expected overflow page"));
                         };
-                        *overflow = page;
+
+                        std::mem::swap(overflow, &mut page);
+                        page.release().await;
+
                         *offset = 0;
                     } else {
                         assert!(self.is_finished());
