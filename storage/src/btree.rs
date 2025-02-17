@@ -99,16 +99,18 @@ impl<'a, R: Runtime> BTree<'a, R> {
             let new_left_leaf = self.new_page().await?.init_leaf(self.ctx).await?;
             self.split_root_leaf(result.leaf.node, new_left_leaf, new_right_pgid, &mut pivot)
                 .await?;
+            drop(pivot);
         } else {
             self.propagate_interior_splitting(result.interiors, new_right_pgid, pivot)
                 .await?;
         }
 
+        new_right_leaf.release().await;
         Ok(())
     }
 
     async fn lookup_for_insert(&self, key: &[u8]) -> anyhow::Result<LookupForUpdateResult<'a, R>> {
-        let mut hops = Vec::default();
+        let mut hops = Vec::<LookupHop<InteriorPageWrite<PageWrite<R>>>>::default();
 
         let mut current = self.pager.write(&self.ctx, self.txid, self.root).await?;
         let page = loop {
@@ -126,7 +128,9 @@ impl<'a, R: Runtime> BTree<'a, R> {
             let next = self.pager.write(&self.ctx, self.txid, next_pgid).await?;
 
             if !node.might_split() {
-                hops.clear();
+                while let Some(hop) = hops.pop() {
+                    hop.node.release().await;
+                }
             }
 
             hops.push(LookupHop {
@@ -207,9 +211,12 @@ impl<'a, R: Runtime> BTree<'a, R> {
             let next_pgid_2 = overflow_2.id();
             overflow.set_next(self.ctx, Some(next_pgid_2)).await?;
             overflow_2.set_content(self.ctx, &mut content, None).await?;
-            overflow = overflow_2;
+
+            std::mem::swap(&mut overflow, &mut overflow_2);
+            overflow_2.release().await;
         }
 
+        overflow.release().await;
         Ok(true)
     }
 
@@ -246,9 +253,12 @@ impl<'a, R: Runtime> BTree<'a, R> {
             let next_pgid_2 = overflow_2.id();
             overflow.set_next(self.ctx, Some(next_pgid_2)).await?;
             overflow_2.set_content(self.ctx, content, None).await?;
-            overflow = overflow_2;
+
+            std::mem::swap(&mut overflow, &mut overflow_2);
+            overflow_2.release().await;
         }
 
+        overflow.release().await;
         Ok(true)
     }
 
@@ -323,6 +333,8 @@ impl<'a, R: Runtime> BTree<'a, R> {
         self.insert_content_to_interior(&mut a, 0, pivot, b.id(), key_size)
             .await?;
 
+        a.release().await;
+        b.release().await;
         Ok(())
     }
 
@@ -370,11 +382,14 @@ impl<'a, R: Runtime> BTree<'a, R> {
             let new_left = self.new_page().await?;
             self.split_interior_root(page, new_left, right_pgid, &mut pivot)
                 .await?;
+            drop(pivot);
         } else {
             self.propagate_interior_splitting(interiors, right_pgid, pivot)
                 .await?;
+            page.release().await;
         }
 
+        new_right_interior.release().await;
         Ok(())
     }
 
@@ -491,6 +506,8 @@ impl<'a, R: Runtime> BTree<'a, R> {
             .await?;
         assert!(ok);
 
+        a.release().await;
+        b.release().await;
         Ok(())
     }
 

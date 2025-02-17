@@ -297,7 +297,7 @@ impl<R: Runtime> Pager<R> {
         page.frame.meta.lsn = ctx.record_dealloc(txid, pgid).await?;
         page.frame.meta.dirty = true;
         page.frame.meta.kind = PageKind::None;
-        drop(page);
+        page.release().await;
 
         let mut state = self.state.write().await;
         state.page_count -= 1;
@@ -519,6 +519,7 @@ mod tests {
                     .unwrap();
             }
             leaf.set_next(ctx, PageId::new(5)).await.unwrap();
+            leaf.release().await;
         }
 
         for i in (0..20).rev() {
@@ -532,7 +533,8 @@ mod tests {
             for j in (0..5).rev() {
                 leaf.delete(ctx, j).await.unwrap();
             }
-            leaf.reset(ctx).await.unwrap();
+            let page = leaf.reset(ctx).await.unwrap();
+            page.release().await;
         }
     }
 }

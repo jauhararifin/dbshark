@@ -457,7 +457,7 @@ impl<'db, R: Runtime> WriteTx<'db, R> {
                 .alloc(LogContext::Runtime(&self.wal), self.id)
                 .await?;
             let bucket_root_id = bucket_root.id();
-            drop(bucket_root);
+            bucket_root.release().await;
 
             let b = bucket_root_id.to_be_bytes();
 
@@ -485,6 +485,7 @@ impl<'db, R: Runtime> WriteTx<'db, R> {
                     state.root = Some(pgid);
                 })
                 .await?;
+            page.release().await;
             Ok(pgid)
         }
     }

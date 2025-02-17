@@ -224,6 +224,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
             WalKind::AllocPage { txid, pgid } => {
                 let page = self.pager.alloc(LogContext::Redo(lsn), txid).await?;
                 assert_eq!(page.id(), pgid);
+                page.release().await;
             }
             WalKind::DeallocPage { txid, pgid } => {
                 self.pager
@@ -300,15 +301,19 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                         "redo failed on interior reset because page {pgid:?} is not an interior"
                     ));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::InteriorSet { payload, .. } => {
-                page.set_interior(ctx, payload.slice()).await?;
+                let page = page.set_interior(ctx, payload.slice()).await?;
+                page.release().await;
             }
             WalKind::InteriorInit { last, .. } => {
-                if page.init_interior(ctx, last).await?.is_none() {
+                let page = page.init_interior(ctx, last).await?;
+                if page.is_none() {
                     return Err(anyhow!("redo failed on interior init on page {pgid:?}"));
                 }
+                page.release().await;
             }
             WalKind::InteriorInsert {
                 index,
@@ -326,10 +331,11 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                 let ok = page
                     .insert_content(ctx, index, &mut raw, key_size, ptr, overflow)
                     .await?;
+                page.release().await;
                 if !ok {
                     return Err(anyhow!(
-                    "redo failed on interior insert because the content can't be inserted into page {pgid:?}"
-                ));
+                        "redo failed on interior insert because the content can't be inserted into page {pgid:?}"
+                    ));
                 }
             }
             WalKind::InteriorDelete { index, .. }
@@ -340,6 +346,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.delete(ctx, index).await?;
+                page.release().await;
             }
             WalKind::InteriorSetCellOverflow {
                 index, overflow, ..
@@ -350,6 +357,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                 ));
                 };
                 page.set_cell_overflow(ctx, index, overflow).await?;
+                page.release().await;
             }
             WalKind::InteriorSetCellPtr { index, ptr, .. } => {
                 let Some(mut page) = page.into_write_interior() else {
@@ -358,6 +366,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.set_cell_ptr(ctx, index, ptr).await?;
+                page.release().await;
             }
             WalKind::InteriorSetLast { last, .. } => {
                 let Some(mut page) = page.into_write_interior() else {
@@ -366,6 +375,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.set_last(ctx, last).await?;
+                page.release().await;
             }
 
             WalKind::LeafReset { .. } | WalKind::LeafResetForUndo { .. } => {
@@ -374,13 +384,16 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                         "redo failed on leaf reset because page {pgid:?} is not a leaf"
                     ));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::LeafSet { payload, .. } => {
-                page.set_leaf(ctx, payload.slice()).await?;
+                let page = page.set_leaf(ctx, payload.slice()).await?;
+                page.release().await;
             }
             WalKind::LeafInit { .. } => {
-                page.init_leaf(ctx).await?;
+                let page = page.init_leaf(ctx).await?;
+                page.release().await;
             }
             WalKind::LeafInsert {
                 index,
@@ -398,10 +411,11 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                 let ok = page
                     .insert_content(ctx, index, &mut raw, key_size, value_size, overflow)
                     .await?;
+                page.release().await;
                 if !ok {
                     return Err(anyhow!(
-                    "redo failed on leaf insert because the content can't be inserted into page {pgid:?}"
-                ));
+                        "redo failed on leaf insert because the content can't be inserted into page {pgid:?}"
+                    ));
                 }
             }
             WalKind::LeafDelete { index, .. } | WalKind::LeafDeleteForUndo { index, .. } => {
@@ -411,6 +425,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.delete(ctx, index).await?;
+                page.release().await;
             }
             WalKind::LeafSetOverflow {
                 index, overflow, ..
@@ -421,6 +436,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.set_cell_overflow(ctx, index, overflow).await?;
+                page.release().await;
             }
             WalKind::LeafSetNext { next, .. } => {
                 let Some(mut page) = page.into_write_leaf() else {
@@ -429,6 +445,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.set_next(ctx, next).await?;
+                page.release().await;
             }
 
             WalKind::OverflowReset { .. } | WalKind::OverflowResetForUndo { .. } => {
@@ -437,12 +454,15 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                         "redo failed on overflow reset because page {pgid:?} is not an overflow"
                     ));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::OverflowInit { .. } => {
-                if page.init_overflow(ctx).await?.is_none() {
+                let page = page.init_overflow(ctx).await?;
+                if page.is_none() {
                     return Err(anyhow!("redo failed on overflow init"));
                 };
+                page.release().await;
             }
             WalKind::OverflowSetContent { next, mut raw, .. } => {
                 let Some(mut page) = page.into_write_overflow() else {
@@ -451,6 +471,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.set_content(ctx, &mut raw, next).await?;
+                page.release().await;
             }
             WalKind::OverflowSetContentForUndo { .. } => {
                 let Some(mut page) = page.into_write_overflow() else {
@@ -459,6 +480,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.unset_content(ctx).await?;
+                page.release().await;
             }
             WalKind::OverflowSetNext { next, .. } => {
                 let Some(mut page) = page.into_write_overflow() else {
@@ -467,6 +489,7 @@ impl<'a, R: Runtime> Redoer<'a, R> {
                     ));
                 };
                 page.set_next(ctx, next).await?;
+                page.release().await;
             }
         }
 
@@ -609,7 +632,8 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
                 let page = pager.write(wal, txid, pgid).await?;
-                page.set_interior(ctx, payload.slice()).await?;
+                let page = page.set_interior(ctx, payload.slice()).await?;
+                page.release().await;
             }
             WalKind::InteriorResetForUndo { .. } => {
                 unreachable!("InteriorUndoReset only used for CLR which shouldn't be undone");
@@ -624,14 +648,16 @@ pub(crate) async fn undo_txn<R: Runtime>(
                 let Some(page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::InteriorInit { pgid, .. } => {
                 let page = pager.write(wal, txid, pgid).await?;
                 let Some(page) = page.into_write_interior() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::InteriorInsert { pgid, index, .. } => {
                 let page = pager.write(wal, txid, pgid).await?;
@@ -639,6 +665,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.delete(ctx, index).await?;
+                page.release().await;
             }
             WalKind::InteriorDelete {
                 txid,
@@ -663,6 +690,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                         old_overflow,
                     )
                     .await?;
+                page.release().await;
                 assert!(ok, "if it can be deleted, then it must be ok to insert, pgid={pgid:?} index={index} old_raw_len={}", old_raw.len());
             }
             WalKind::InteriorDeleteForUndo { .. } => {
@@ -679,6 +707,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.set_cell_overflow(ctx, index, old_overflow).await?;
+                page.release().await;
             }
             WalKind::InteriorSetCellPtr {
                 pgid,
@@ -691,6 +720,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.set_cell_ptr(ctx, index, old_ptr).await?;
+                page.release().await;
             }
             WalKind::InteriorSetLast { pgid, old_last, .. } => {
                 let page = pager.write(wal, txid, pgid).await?;
@@ -698,6 +728,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected an interior page for undo"));
                 };
                 page.set_last(ctx, old_last).await?;
+                page.release().await;
             }
 
             WalKind::LeafReset {
@@ -710,7 +741,8 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
                 let page = pager.write(wal, txid, pgid).await?;
-                page.set_leaf(ctx, payload.slice()).await?;
+                let page = page.set_leaf(ctx, payload.slice()).await?;
+                page.release().await;
             }
             WalKind::LeafResetForUndo { .. } => {
                 unreachable!("LeafUndoReset only used for CLR which shouldn't be undone");
@@ -725,14 +757,16 @@ pub(crate) async fn undo_txn<R: Runtime>(
                 let Some(page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected an interior page for undo"));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::LeafInit { txid, pgid } => {
                 let page = pager.write(wal, txid, pgid).await?;
                 let Some(page) = page.into_write_leaf() else {
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::LeafInsert { pgid, index, .. } => {
                 let page = pager.write(wal, txid, pgid).await?;
@@ -740,6 +774,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.delete(ctx, index).await?;
+                page.release().await;
             }
             WalKind::LeafDelete {
                 txid,
@@ -764,6 +799,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                         old_overflow,
                     )
                     .await?;
+                page.release().await;
                 assert!(ok, "if it can be deleted, then it must be ok to insert, pgid={pgid:?} index={index} old_raw_len={}", old_raw.len());
             }
             WalKind::LeafDeleteForUndo { .. } => {
@@ -780,6 +816,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.set_cell_overflow(ctx, index, old_overflow).await?;
+                page.release().await;
             }
             WalKind::LeafSetNext { pgid, old_next, .. } => {
                 let page = pager.write(wal, txid, pgid).await?;
@@ -787,6 +824,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected a leaf page for undo {pgid:?}"));
                 };
                 page.set_next(ctx, old_next).await?;
+                page.release().await;
             }
 
             WalKind::OverflowReset {
@@ -799,7 +837,8 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("page version {page_version} is not supported"));
                 }
                 let page = pager.write(wal, txid, pgid).await?;
-                page.set_overflow(ctx, payload.slice())?;
+                let page = page.set_overflow(ctx, payload.slice())?;
+                page.release().await;
             }
             WalKind::OverflowResetForUndo { .. } => {
                 unreachable!("OverflowUndoReset only used for CLR which shouldn't be undone");
@@ -809,7 +848,8 @@ pub(crate) async fn undo_txn<R: Runtime>(
                 let Some(page) = page.into_write_overflow() else {
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
-                page.reset(ctx).await?;
+                let page = page.reset(ctx).await?;
+                page.release().await;
             }
             WalKind::OverflowSetContent { pgid, .. } => {
                 let page = pager.write(wal, txid, pgid).await?;
@@ -817,6 +857,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
                 page.unset_content(ctx).await?;
+                page.release().await;
             }
             WalKind::OverflowSetContentForUndo { .. } => {
                 unreachable!("OverflowUndoSetContent only used for CLR which shouldn't be undone");
@@ -827,6 +868,7 @@ pub(crate) async fn undo_txn<R: Runtime>(
                     return Err(anyhow!("expected a overflow page for undo"));
                 };
                 page.set_next(ctx, old_next).await?;
+                page.release().await;
             }
 
             WalKind::Checkpoint { .. } => (),
