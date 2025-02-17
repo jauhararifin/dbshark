@@ -53,7 +53,7 @@ pub trait Mutex<T: Send + Sync>: Send + Sync {
 
     async fn try_lock(&self) -> Option<Self::Guard<'_>>;
 
-    fn into_inner(self) -> impl Future<Output=T> + Send;
+    fn into_inner(self) -> impl Future<Output = T> + Send;
 }
 
 pub trait MutexGuard<T: Send + Sync>: DerefMut<Target = T> {
@@ -61,10 +61,10 @@ pub trait MutexGuard<T: Send + Sync>: DerefMut<Target = T> {
 }
 
 pub trait RwMutex<T: Send + Sync>: Send + Sync {
-    type ReadGuard<'a>: Deref<Target = T> + From<Self::WriteGuard<'a>> + Send
+    type ReadGuard<'a>: RwMutexReadGuard<'a, T> + From<Self::WriteGuard<'a>>
     where
         Self: 'a;
-    type WriteGuard<'a>: DerefMut<Target = T> + Send
+    type WriteGuard<'a>: RwMutexWriteGuard<'a, T>
     where
         Self: 'a;
 
@@ -77,7 +77,11 @@ pub trait RwMutex<T: Send + Sync>: Send + Sync {
     async fn try_write(&self) -> Option<Self::WriteGuard<'_>>;
 }
 
-pub trait RwMutexReadGuard<'a, T> {
+pub trait RwMutexReadGuard<'a, T>: Deref<Target = T> + Send {
+    async fn unlock(self);
+}
+
+pub trait RwMutexWriteGuard<'a, T>: DerefMut<Target = T> + Send {
     async fn unlock(self);
 }
 

@@ -1,5 +1,6 @@
 use crate::runtime::{
-    File, JoinHandle, Mutex, MutexGuard, Runtime, RwMutex, RwMutexReadGuard, Timer, TimerHandle,
+    File, JoinHandle, Mutex, MutexGuard, Runtime, RwMutex, RwMutexReadGuard, RwMutexWriteGuard,
+    Timer, TimerHandle,
 };
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
@@ -247,6 +248,22 @@ impl<'a, T: Send> DerefMut for TokioWriteGuard<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.as_mut().unwrap().deref_mut()
+    }
+}
+
+impl<'a, T: Send + Sync> RwMutexWriteGuard<'a, T> for TokioWriteGuard<'a, T> {
+    #[inline]
+    async fn unlock(mut self) {
+        self.inner.take();
+    }
+}
+
+impl<'a, T: Send> Drop for TokioWriteGuard<'a, T> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.inner.is_none() {
+            panic!("rwmutex write guard is dropped without unlock")
+        }
     }
 }
 
