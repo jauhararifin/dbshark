@@ -3,7 +3,7 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
-pub trait Runtime: 'static {
+pub trait Runtime: Send + Sync + 'static {
     type Timer: Timer;
     type TimerHandle: TimerHandle;
 
@@ -39,7 +39,7 @@ pub trait Timer: Send {
 }
 
 pub trait TimerHandle: Send + Sync {
-    async fn trigger(&self);
+    fn trigger(&self) -> impl Future<Output = ()> + Send;
 }
 
 pub trait Mutex<T: Send + Sync>: Send + Sync {
@@ -51,7 +51,7 @@ pub trait Mutex<T: Send + Sync>: Send + Sync {
 
     fn lock(&self) -> impl Future<Output = Self::Guard<'_>> + Send;
 
-    async fn try_lock(&self) -> Option<Self::Guard<'_>>;
+    fn try_lock(&self) -> impl Future<Output = Option<Self::Guard<'_>>> + Send;
 
     fn into_inner(self) -> impl Future<Output = T> + Send;
 }
@@ -85,7 +85,7 @@ pub trait RwMutexWriteGuard<'a, T>: DerefMut<Target = T> + Send {
     async fn unlock(self);
 }
 
-pub trait JoinHandle {
+pub trait JoinHandle: Send + Sync {
     async fn join(self);
 }
 
@@ -113,7 +113,7 @@ pub trait File: Sized + Send + Sync {
 
 pub trait Atomic<T>: Send + Sync {
     fn new(value: T) -> Self;
-    async fn load(&self) -> T;
-    async fn compare_and_exchange(&self, old: T, new: T) -> bool;
-    async fn fetch_add(&self, delta: T) -> T;
+    fn load(&self) -> impl Future<Output = T> + Send;
+    fn compare_and_exchange(&self, old: T, new: T) -> impl Future<Output = bool> + Send;
+    fn fetch_add(&self, delta: T) -> impl Future<Output = T> + Send;
 }
