@@ -227,7 +227,7 @@ pub(crate) struct BufferPoolItem<'a, R: Runtime> {
 }
 
 impl<'a, R: Runtime> BufferPoolWalk<'a, R> {
-    async fn next(&mut self) -> anyhow::Result<Option<BufferPoolItem<'a, R>>> {
+    pub(crate) async fn next(&mut self) -> anyhow::Result<Option<BufferPoolItem<'a, R>>> {
         if self.i >= self.count {
             return Ok(None);
         }

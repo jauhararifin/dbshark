@@ -1,8 +1,490 @@
+mod buffer;
 mod evictor;
+mod file_manager;
 mod log;
 mod page;
-mod file_manager;
-mod buffer;
+
+use crate::id::{Lsn, PageId, TxId};
+use crate::runtime::{Atomic, Mutex, Runtime, RwMutex};
+use crate::wal::Wal;
+use anyhow::anyhow;
+use buffer::{BufferPool, ReadFrame, WriteFrame};
+use evictor::Evictor;
+use file_manager::FileManager;
+use log::WalSync;
+use page::{PageInternal, PageInternalWrite, PageKind, PageMeta};
+use std::collections::HashMap;
+use std::path::Path;
+
+pub(crate) use crate::pager::log::LogContext;
+pub(crate) use page::{
+    BTreeCell, InteriorPage, InteriorPageWrite, LeafCell, LeafPage, LeafPageRead, LeafPageWrite,
+    OverflowPage, OverflowPageRead, PageOps, PageWriteOps,
+};
+
+extern crate log as logging;
 
 pub(crate) const MINIMUM_PAGE_SIZE: usize = 256;
 pub(crate) const MAXIMUM_PAGE_SIZE: usize = 0x4000;
+
+pub(crate) struct Pager<R: Runtime> {
+    state: R::RwMutex<DbState>,
+    pool: BufferPool<R>,
+    internal: R::RwMutex<PagerInternal>,
+    evictor: R::Mutex<Evictor>,
+    file: R::RwMutex<FileManager<R>>,
+}
+
+struct PagerInternal {
+    page_to_frame: HashMap<PageId, usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stat {
+    pub(crate) main_bytes_read: u64,
+    pub(crate) main_bytes_written: u64,
+    pub(crate) double_buff_bytes_written: u64,
+}
+
+impl<R: Runtime> Pager<R> {
+    pub(crate) async fn new(path: &Path, page_size: usize, n: usize) -> anyhow::Result<Self> {
+        Self::check_page_size(page_size)?;
+        if n < 10 {
+            return Err(anyhow!(
+                "the size of buffer poll must be at least 10, but got {n}",
+            ));
+        }
+
+        Ok(Self {
+            state: R::RwMutex::new(DbState::default()),
+            pool: BufferPool::new(page_size, n),
+            internal: R::RwMutex::new(PagerInternal {
+                page_to_frame: HashMap::with_capacity(n),
+            }),
+            evictor: R::Mutex::new(Evictor::new(n)),
+            file: RwMutex::new(FileManager::new(path, page_size, 10).await?),
+        })
+    }
+
+    fn check_page_size(page_size: usize) -> anyhow::Result<()> {
+        if page_size.count_ones() != 1 {
+            return Err(anyhow!(
+                "page size must be a power of 2, but got {}",
+                page_size
+            ));
+        }
+
+        if page_size < MINIMUM_PAGE_SIZE {
+            return Err(anyhow!(
+                "page size must be at least {} bytes, but got {}",
+                MINIMUM_PAGE_SIZE,
+                page_size
+            ));
+        }
+        if page_size > MAXIMUM_PAGE_SIZE {
+            return Err(anyhow!(
+                "page size must be at most 16KB, but got {}",
+                page_size
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn read(
+        &self,
+        wal: &impl WalSync,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<PageRead<R>> {
+        logging::trace!("read {txid:?} {pgid:?}");
+
+        let page_count = self.state.read().await.page_count;
+        assert!(
+            pgid.get() < page_count,
+            "page {:?} is out of bound for reading since page_count={}",
+            pgid,
+            page_count,
+        );
+
+        let internal = self.internal.read().await;
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            self.evictor.lock().await.acquired(frame_id);
+            let frame = self.pool.read(frame_id).await;
+            return Ok(PageRead { pager: self, frame });
+        }
+        drop(internal);
+
+        let frame = self.acquire::<ReadFrame<R>>(wal, txid, pgid).await?;
+        Ok(PageRead { pager: self, frame })
+    }
+
+    pub(crate) async fn write(
+        &self,
+        wal: &impl WalSync,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<PageWrite<R>> {
+        let page_count = self.state.read().await.page_count;
+        assert!(
+            pgid.get() < page_count,
+            "page {:?} is out of bound for writing since page_count={}",
+            pgid,
+            page_count,
+        );
+
+        let internal = self.internal.read().await;
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            self.evictor.lock().await.acquired(frame_id);
+            let frame = self.pool.write(txid, frame_id).await;
+            return Ok(PageWrite { pager: self, frame });
+        }
+        drop(internal);
+
+        let frame = self.acquire::<WriteFrame<R>>(wal, txid, pgid).await?;
+        Ok(PageWrite { pager: self, frame })
+    }
+
+    async fn acquire<'a, T>(
+        &'a self,
+        wal: &impl WalSync,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<T>
+    where
+        T: BufferPoolFrame<'a, R> + From<WriteFrame<'a, R>>,
+    {
+        logging::trace!("acquire {txid:?} {pgid:?}");
+        let mut internal = self.internal.write().await;
+        let page_count = self.state.read().await.page_count;
+        assert!(
+            pgid.get() <= page_count,
+            "page {pgid:?} is out of bound when acquiring page since page_count={page_count}",
+        );
+
+        let mut evictor = self.evictor.lock().await;
+        if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            evictor.acquired(frame_id);
+            Ok(T::get(&self.pool, txid, frame_id).await)
+        } else if let Some(frame) = self.pool.alloc(txid, PageMeta::empty(pgid)).await {
+            let mut file = self.file.write().await;
+            *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer).await?;
+            evictor.acquired(frame.index);
+            internal.page_to_frame.insert(pgid, frame.index);
+            return Ok(frame.into());
+        } else {
+            let (frame_id, dirty) = evictor.evict_and_acquire()?;
+            let frame = self.pool.write(txid, frame_id).await;
+            let old_pgid = frame.meta.id;
+            let mut file = self.file.write().await;
+            if dirty {
+                file.spill(wal, frame.meta, frame.buffer).await?;
+            }
+            *frame.meta = Self::fetch_page(&mut file, pgid, frame.buffer).await?;
+            internal.page_to_frame.remove(&old_pgid);
+            internal.page_to_frame.insert(pgid, frame_id);
+            Ok(frame.into())
+        }
+    }
+
+    async fn fetch_page(
+        file: &mut FileManager<R>,
+        pgid: PageId,
+        buff: &mut [u8],
+    ) -> anyhow::Result<PageMeta> {
+        let found = file.get(pgid, buff).await?;
+        let default_page = PageMeta {
+            id: pgid,
+            kind: PageKind::None,
+            lsn: Lsn::new(0),
+            dirty: false,
+        };
+        let meta = if found {
+            PageMeta::decode(buff)?.unwrap_or(default_page)
+        } else {
+            default_page
+        };
+
+        if meta.id != pgid {
+            return Err(anyhow!(
+                "page {pgid:?} was written with invalid pgid information {:?}",
+                meta.id,
+            ));
+        }
+
+        Ok(meta)
+    }
+
+    pub(crate) async fn alloc(
+        &self,
+        ctx: LogContext<'_, R>,
+        txid: TxId,
+    ) -> anyhow::Result<PageWrite<R>> {
+        let mut state = self.state.write().await;
+        state.page_count += 1;
+        let pgid = PageId::new(state.page_count - 1).unwrap();
+
+        // WARNING: It is important that `record_alloc` happens while `self.state` is locked
+        // because there is a chance a checkpoint might be running concurrently. If
+        // `self.state` is updated and a checkpoint is running, but the WAL record is not written
+        // yet, our log might look like it went backward. It would be possible to see a
+        // checkpoint record saying we have allocated 10 pages, but the log record that allocates
+        // the 10th page comes later.
+        let lsn = ctx.record_alloc(txid, pgid).await?;
+        drop(state);
+
+        logging::trace!(pgid:?; "alloc {txid:?}");
+
+        let mut internal = self.internal.write().await;
+        let mut evictor = self.evictor.lock().await;
+
+        // It is important to note that calling `alloc` doesn't necessary mean the new allocated
+        // page is not in the buffer pool. When we deallocate a page, we don't actually remove it
+        // from buffer pool. Instead, we just set the page to empty page and decrement page count.
+        // Because of that, when there is a `dealloc` operation followed by `alloc` operation on
+        // the same page, the `alloc` operation might not need to allocate a new page in the pool.
+        let frame = if let Some(frame_id) = internal.page_to_frame.get(&pgid).copied() {
+            evictor.acquired(frame_id);
+            self.pool.write(txid, frame_id).await
+        } else if let Some(frame) = self.pool.alloc(txid, PageMeta::init(pgid, lsn)).await {
+            evictor.acquired(frame.index);
+            internal.page_to_frame.insert(pgid, frame.index);
+            frame
+        } else {
+            let (frame_id, dirty) = evictor.evict_and_acquire()?;
+            let frame = self.pool.write(txid, frame_id).await;
+            let old_pgid = frame.meta.id;
+            if dirty {
+                let mut file = self.file.write().await;
+                file.spill(&ctx, frame.meta, frame.buffer).await?;
+            }
+            *frame.meta = PageMeta::init(pgid, lsn);
+            internal.page_to_frame.remove(&old_pgid);
+            internal.page_to_frame.insert(pgid, frame_id);
+            frame
+        };
+
+        Ok(PageWrite { pager: self, frame })
+    }
+
+    pub(crate) async fn dealloc(
+        &self,
+        ctx: LogContext<'_, R>,
+        txid: TxId,
+        pgid: PageId,
+    ) -> anyhow::Result<()> {
+        let page = self.write(&ctx, txid, pgid).await?;
+        page.frame.meta.lsn = ctx.record_dealloc(txid, pgid).await?;
+        page.frame.meta.dirty = true;
+        page.frame.meta.kind = PageKind::None;
+        drop(page);
+
+        let mut state = self.state.write().await;
+        state.page_count -= 1;
+        assert_eq!(
+            state.page_count,
+            pgid.get(),
+            "it is only valid to deallocate the last page"
+        );
+        drop(state);
+
+        Ok(())
+    }
+
+    pub(crate) async fn set_state<F>(&self, ctx: LogContext<'_, R>, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut DbState),
+    {
+        let mut state = self.state.write().await;
+        let current_state = *state;
+        f(&mut state);
+        ctx.record_set_state(
+            state.root,
+            current_state.root,
+            state.freelist,
+            current_state.freelist,
+            state.page_count,
+            current_state.page_count,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn read_state(
+        &self,
+    ) -> <R::RwMutex<DbState> as RwMutex<DbState>>::ReadGuard<'_> {
+        self.state.read().await
+    }
+
+    // Note: unlike the original aries design where the flushing process and checkpoint are
+    // considered different component, this DB combines them together. During checkpoint, all
+    // dirty pages are flushed. This makes the checkpoint process longer, but simpler. We also
+    // don't need checkpoint-end log record.
+    pub(crate) async fn checkpoint(&self, wal: &Wal<R>) -> anyhow::Result<()> {
+        let mut first_unflushed = wal.first_unflushed().await;
+        let mut walk = self.pool.walk().await;
+        while let Some(item) = walk.next().await? {
+            let should_flush = item.meta.lsn >= first_unflushed;
+            if should_flush {
+                let new_first_unflushed = wal.sync(item.meta.lsn).await?;
+                first_unflushed = new_first_unflushed;
+            }
+
+            let mut file = self.file.write().await;
+            file.spill(wal, item.meta, item.buffer).await?;
+        }
+
+        let mut file = self.file.write().await;
+        file.sync(wal).await?;
+        Ok(())
+    }
+
+    async fn release(&self, frame_id: usize, is_dirty: bool) {
+        logging::trace!("release frame_id={frame_id} is_dirty={is_dirty}");
+        self.evictor.lock().await.released(frame_id, is_dirty);
+    }
+
+    pub(crate) async fn shutdown(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) async fn stat(&self) -> Stat {
+        let file_manager = self.file.read().await;
+        Stat {
+            main_bytes_read: file_manager.stat.main_bytes_read.load().await,
+            main_bytes_written: file_manager.stat.main_bytes_written.load().await,
+            double_buff_bytes_written: file_manager.stat.double_buff_bytes_written.load().await,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct DbState {
+    pub(crate) root: Option<PageId>,
+    pub(crate) freelist: Option<PageId>,
+    pub(crate) page_count: u64,
+}
+
+pub(crate) trait BufferPoolFrame<'a, R: Runtime> {
+    async fn get(pool: &'a BufferPool<R>, txid: TxId, index: usize) -> Self;
+}
+
+impl<'a, R: Runtime> BufferPoolFrame<'a, R> for ReadFrame<'a, R> {
+    async fn get(pool: &'a BufferPool<R>, _txid: TxId, index: usize) -> Self {
+        pool.read(index).await
+    }
+}
+
+impl<'a, R: Runtime> BufferPoolFrame<'a, R> for WriteFrame<'a, R> {
+    async fn get(pool: &'a BufferPool<R>, txid: TxId, index: usize) -> Self {
+        pool.write(txid, index).await
+    }
+}
+
+pub(crate) struct PageRead<'a, R: Runtime> {
+    pub(super) pager: &'a Pager<R>,
+    pub(super) frame: ReadFrame<'a, R>,
+}
+
+impl<'a, R: Runtime> Drop for PageRead<'a, R> {
+    fn drop(&mut self) {
+        self.pager.release(self.frame.index, self.frame.meta.dirty);
+    }
+}
+
+impl<'a, R: Runtime> PageOps<'a> for PageRead<'a, R> {
+    #[inline]
+    fn internal(&self) -> PageInternal {
+        PageInternal {
+            meta: self.frame.meta,
+            buffer: self.frame.buffer,
+        }
+    }
+}
+
+pub(crate) struct PageWrite<'a, R: Runtime> {
+    pub(super) pager: &'a Pager<R>,
+    pub(super) frame: WriteFrame<'a, R>,
+}
+
+impl<'a, R: Runtime> std::fmt::Debug for PageWrite<'a, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.frame.fmt(f)
+    }
+}
+
+impl<'a, R: Runtime> PageOps<'a> for PageWrite<'a, R> {
+    #[inline]
+    fn internal(&self) -> PageInternal {
+        PageInternal {
+            meta: self.frame.meta,
+            buffer: self.frame.buffer,
+        }
+    }
+}
+
+impl<'a, R: Runtime> PageWriteOps<'a> for PageWrite<'a, R> {
+    #[inline]
+    fn internal_mut(&mut self) -> PageInternalWrite {
+        PageInternalWrite {
+            txid: self.frame.txid,
+            meta: self.frame.meta,
+            buffer: self.frame.buffer,
+        }
+    }
+}
+
+impl<'a, R: Runtime> Drop for PageWrite<'a, R> {
+    fn drop(&mut self) {
+        self.pager.release(self.frame.index, self.frame.meta.dirty);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::Bytes;
+    use crate::tokio::TokioRuntime;
+
+    struct NoopWalSync;
+
+    impl WalSync for NoopWalSync {
+        async fn sync(&self, _lsn: Lsn) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let pager = Pager::new(dir.path(), 512, 10).await.unwrap();
+        let txid = TxId::new(1).unwrap();
+
+        for i in 0..20 {
+            let ctx = LogContext::<TokioRuntime>::Redo(Lsn::new(1));
+            let page = pager.alloc(ctx, txid).await.unwrap();
+            assert_eq!(i, page.id().get());
+            let mut leaf = page.init_leaf(ctx).await.unwrap();
+            for j in 0..5 {
+                leaf.insert_content::<TokioRuntime>(ctx, j, &mut Bytes::new(b"abc"), 3, 0, None)
+                    .await
+                    .unwrap();
+            }
+            leaf.set_next(ctx, PageId::new(5)).await.unwrap();
+        }
+
+        for i in (0..20).rev() {
+            let page = pager
+                .write(&NoopWalSync, txid, PageId::new(i).unwrap())
+                .await
+                .unwrap();
+            let ctx = LogContext::<TokioRuntime>::Redo(Lsn::new(1));
+            let mut leaf = page.into_write_leaf().unwrap();
+            leaf.set_next(ctx, None).await.unwrap();
+            for j in (0..5).rev() {
+                leaf.delete(ctx, j).await.unwrap();
+            }
+            leaf.reset(ctx).await.unwrap();
+        }
+    }
+}
