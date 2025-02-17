@@ -1,15 +1,16 @@
 use std::cmp::Ordering;
+use std::future::Future;
 
 pub(crate) trait Content {
     fn remaining(&self) -> usize;
-    fn put(&mut self, buff: &mut [u8]) -> anyhow::Result<()>;
+    fn put(&mut self, buff: &mut [u8]) -> impl Future<Output = anyhow::Result<()>>;
 
     #[inline]
     fn is_finished(&self) -> bool {
         self.remaining() == 0
     }
 
-    fn compare<T: Content>(&mut self, mut other: T) -> anyhow::Result<Ordering> {
+    async fn compare<T: Content>(&mut self, mut other: T) -> anyhow::Result<Ordering> {
         let mut buff_0 = [0u8; 1024];
         let mut buff_1 = [0u8; 1024];
 
@@ -18,13 +19,13 @@ pub(crate) trait Content {
         while (!sb.is_empty() || !self.is_finished()) && (!tb.is_empty() || !other.is_finished()) {
             if sb.is_empty() && !self.is_finished() {
                 let s = std::cmp::min(self.remaining(), buff_0.len());
-                self.put(&mut buff_0)?;
+                self.put(&mut buff_0).await?;
                 sb = &buff_0[..s];
             }
 
             if tb.is_empty() && !other.is_finished() {
                 let s = std::cmp::min(other.remaining(), buff_1.len());
-                other.put(&mut buff_1)?;
+                other.put(&mut buff_1).await?;
                 tb = &buff_1[..s];
             }
 
@@ -84,7 +85,7 @@ impl<'a> Content for Bytes<'a> {
     }
 
     #[inline]
-    fn put(&mut self, buff: &mut [u8]) -> anyhow::Result<()> {
+    async fn put(&mut self, buff: &mut [u8]) -> anyhow::Result<()> {
         let s = std::cmp::min(buff.len(), self.0.len());
         buff[..s].copy_from_slice(&self.0[..s]);
         self.0 = &self.0[s..];
@@ -96,22 +97,22 @@ impl<'a> Content for Bytes<'a> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_bytes() {
+    #[tokio::test]
+    async fn test_bytes() {
         let mut a = Bytes::new(b"abc");
         let b = Bytes::new(b"abc");
-        assert_eq!(a.compare(b).unwrap(), Ordering::Equal);
+        assert_eq!(a.compare(b).await.unwrap(), Ordering::Equal);
 
         let mut a = Bytes::new(b"abc");
         let b = Bytes::new(b"abd");
-        assert_eq!(a.compare(b).unwrap(), Ordering::Less);
+        assert_eq!(a.compare(b).await.unwrap(), Ordering::Less);
 
         let mut a = Bytes::new(b"abc");
         let b = Bytes::new(b"ab");
-        assert_eq!(a.compare(b).unwrap(), Ordering::Greater);
+        assert_eq!(a.compare(b).await.unwrap(), Ordering::Greater);
 
         let mut a = Bytes::new(b"ab");
         let b = Bytes::new(b"abc");
-        assert_eq!(a.compare(b).unwrap(), Ordering::Less);
+        assert_eq!(a.compare(b).await.unwrap(), Ordering::Less);
     }
 }

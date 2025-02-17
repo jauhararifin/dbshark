@@ -1,9 +1,11 @@
 mod bins;
+mod btree;
 mod content;
 mod id;
 mod log;
 mod metric;
+mod pager;
+mod recovery;
 mod runtime;
 mod tokio;
 mod wal;
-mod pager;

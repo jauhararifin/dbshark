@@ -754,7 +754,7 @@ where
 
 impl<'a, T> InteriorPage<'a> for InteriorPageRead<T> where T: PageOps<'a> {}
 
-fn get_interior_cell(payload: &[u8], index: usize) -> InteriorCell<'_> {
+fn get_interior_cell<'a>(payload: &'a [u8], index: usize) -> InteriorCell<'a> {
     let cell = &payload[get_interior_cell_range(index)];
     let offset = cell[INTERIOR_CELL_OFFSET_RANGE].read_u16() as usize;
     let size = cell[INTERIOR_CELL_SIZE_RANGE].read_u16() as usize;
@@ -851,8 +851,9 @@ where
             unreachable!();
         };
         let old_last = kind.last;
-        internal.meta.lsn =
-            ctx.record_interior_set_last(internal.txid, pgid, new_last, old_last).await?;
+        internal.meta.lsn = ctx
+            .record_interior_set_last(internal.txid, pgid, new_last, old_last)
+            .await?;
         internal.meta.dirty = true;
         kind.last = new_last;
         Ok(())
@@ -873,8 +874,9 @@ where
         if old_ptr == ptr {
             return Ok(());
         }
-        internal.meta.lsn =
-            ctx.record_interior_set_cell_ptr(internal.txid, pgid, index, ptr, old_ptr).await?;
+        internal.meta.lsn = ctx
+            .record_interior_set_cell_ptr(internal.txid, pgid, index, ptr, old_ptr)
+            .await?;
         internal.meta.dirty = true;
         cell[INTERIOR_CELL_PTR_RANGE].copy_from_slice(&ptr.to_be_bytes());
         Ok(())
@@ -895,13 +897,15 @@ where
         if old_overflow == overflow_pgid {
             return Ok(());
         }
-        internal.meta.lsn = ctx.record_interior_set_cell_overflow(
-            internal.txid,
-            pgid,
-            index,
-            overflow_pgid,
-            old_overflow,
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_interior_set_cell_overflow(
+                internal.txid,
+                pgid,
+                index,
+                overflow_pgid,
+                old_overflow,
+            )
+            .await?;
         internal.meta.dirty = true;
         cell[INTERIOR_CELL_OVERFLOW_RANGE].copy_from_slice(&overflow_pgid.to_be_bytes());
         Ok(())
@@ -938,17 +942,20 @@ where
             cell.raw().len(),
         );
         Bytes::new(cell.raw())
-            .put(&mut internal.buffer[reserved_offset..reserved_offset + raw.len()])?;
+            .put(&mut internal.buffer[reserved_offset..reserved_offset + raw.len()])
+            .await?;
 
-        internal.meta.lsn = ctx.record_interior_insert(
-            internal.txid,
-            pgid,
-            i,
-            Bytes::new(&internal.buffer[reserved_offset..reserved_offset + raw.len()]),
-            cell.ptr(),
-            cell.key_size(),
-            cell.overflow(),
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_interior_insert(
+                internal.txid,
+                pgid,
+                i,
+                Bytes::new(&internal.buffer[reserved_offset..reserved_offset + raw.len()]),
+                cell.ptr(),
+                cell.key_size(),
+                cell.overflow(),
+            )
+            .await?;
         internal.meta.dirty = true;
 
         let internal = self.internal();
@@ -998,17 +1005,21 @@ where
 
         let content_offset =
             Self::insert_cell_meta(&mut internal, i, ptr, overflow, key_size, raw_size);
-        content.put(&mut internal.buffer[content_offset..content_offset + raw_size])?;
+        content
+            .put(&mut internal.buffer[content_offset..content_offset + raw_size])
+            .await?;
 
-        internal.meta.lsn = ctx.record_interior_insert(
-            internal.txid,
-            pgid,
-            i,
-            Bytes::new(&internal.buffer[content_offset..content_offset + raw_size]),
-            ptr,
-            key_size,
-            overflow,
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_interior_insert(
+                internal.txid,
+                pgid,
+                i,
+                Bytes::new(&internal.buffer[content_offset..content_offset + raw_size]),
+                ptr,
+                key_size,
+                overflow,
+            )
+            .await?;
         internal.meta.dirty = true;
 
         log::debug!(
@@ -1094,14 +1105,10 @@ where
         })
     }
 
-    pub(crate) async fn split<F, R: Runtime>(
+    pub(crate) async fn split<R: Runtime>(
         &mut self,
         ctx: LogContext<'_, R>,
-        mut f: F,
-    ) -> anyhow::Result<usize>
-    where
-        for<'c> F: FnMut(InteriorCell<'c>) -> anyhow::Result<()>,
-    {
+    ) -> anyhow::Result<(usize, SplittedInterior<T>)> {
         let pgid = self.id();
         let internal = self.internal();
         log::debug!(
@@ -1138,15 +1145,17 @@ where
         let txid = internal.txid;
         for i in (n_cells_to_keep..kind.count).rev() {
             let cell = get_interior_cell(internal.buffer.payload(), i);
-            internal.meta.lsn = ctx.record_interior_delete(
-                txid,
-                pgid,
-                i,
-                Bytes::new(cell.raw()),
-                cell.ptr(),
-                cell.overflow(),
-                cell.key_size(),
-            ).await?;
+            internal.meta.lsn = ctx
+                .record_interior_delete(
+                    txid,
+                    pgid,
+                    i,
+                    Bytes::new(cell.raw()),
+                    cell.ptr(),
+                    cell.overflow(),
+                    cell.key_size(),
+                )
+                .await?;
         }
         internal.meta.dirty = true;
 
@@ -1160,11 +1169,14 @@ where
             internal.meta.lsn,
         );
 
-        for i in n_cells_to_keep..original_count {
-            let cell = self.get(i);
-            f(cell)?;
-        }
-        Ok(n_cells_to_keep)
+        Ok((
+            n_cells_to_keep,
+            SplittedInterior {
+                inner: self,
+                original_count,
+                i: n_cells_to_keep,
+            },
+        ))
     }
 
     pub(crate) async fn delete<R: Runtime>(
@@ -1188,15 +1200,17 @@ where
         let key_size = cell.key_size();
 
         let internal = self.internal_mut();
-        internal.meta.lsn = ctx.record_interior_delete(
-            internal.txid,
-            pgid,
-            index,
-            Bytes::new(&internal.buffer[content_offset..content_offset + content_size]),
-            ptr,
-            overflow,
-            key_size,
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_interior_delete(
+                internal.txid,
+                pgid,
+                index,
+                Bytes::new(&internal.buffer[content_offset..content_offset + content_size]),
+                ptr,
+                overflow,
+                key_size,
+            )
+            .await?;
         internal.meta.dirty = true;
 
         let PageKind::Interior(ref mut kind) = internal.meta.kind else {
@@ -1222,6 +1236,27 @@ where
             internal.meta.lsn,
         );
         Ok(())
+    }
+}
+
+pub(crate) struct SplittedInterior<'a, T> {
+    inner: &'a mut InteriorPageWrite<T>,
+
+    original_count: usize,
+    i: usize,
+}
+
+impl<'a, T> SplittedInterior<'_, T>
+where
+    T: PageWriteOps<'a>,
+{
+    pub(crate) fn next(&mut self) -> Option<InteriorCell<'_>> {
+        if self.i < self.original_count {
+            self.i += 1;
+            Some(self.inner.get(self.i - 1))
+        } else {
+            None
+        }
     }
 }
 
@@ -1356,15 +1391,17 @@ where
         let val_size = cell.val_size();
 
         let internal = self.internal_mut();
-        internal.meta.lsn = ctx.record_leaf_delete(
-            internal.txid,
-            pgid,
-            index,
-            Bytes::new(&internal.buffer[content_offset..content_offset + content_size]),
-            overflow,
-            key_size,
-            val_size,
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_leaf_delete(
+                internal.txid,
+                pgid,
+                index,
+                Bytes::new(&internal.buffer[content_offset..content_offset + content_size]),
+                overflow,
+                key_size,
+                val_size,
+            )
+            .await?;
         internal.meta.dirty = true;
 
         let kind = internal.meta.kind.leaf_mut();
@@ -1400,7 +1437,9 @@ where
         if old_next == new_next {
             return Ok(());
         }
-        internal.meta.lsn = ctx.record_leaf_set_next(internal.txid, pgid, new_next, old_next).await?;
+        internal.meta.lsn = ctx
+            .record_leaf_set_next(internal.txid, pgid, new_next, old_next)
+            .await?;
         internal.meta.dirty = true;
         kind.next = new_next;
         Ok(())
@@ -1421,13 +1460,9 @@ where
         if old_overflow == overflow_pgid {
             return Ok(());
         }
-        internal.meta.lsn = ctx.record_leaf_set_cell_overflow(
-            internal.txid,
-            pgid,
-            index,
-            overflow_pgid,
-            old_overflow,
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_leaf_set_cell_overflow(internal.txid, pgid, index, overflow_pgid, old_overflow)
+            .await?;
         internal.meta.dirty = true;
         cell[LEAF_CELL_OVERFLOW_RANGE].copy_from_slice(&overflow_pgid.to_be_bytes());
         Ok(())
@@ -1460,15 +1495,17 @@ where
         let reserved_offset = Self::reserve_cell(&mut internal, raw.len());
         internal.buffer[reserved_offset..reserved_offset + raw.len()].copy_from_slice(raw);
 
-        internal.meta.lsn = ctx.record_leaf_insert(
-            internal.txid,
-            pgid,
-            i,
-            Bytes::new(cell.raw()),
-            cell.overflow(),
-            cell.key_size(),
-            cell.val_size(),
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_leaf_insert(
+                internal.txid,
+                pgid,
+                i,
+                Bytes::new(cell.raw()),
+                cell.overflow(),
+                cell.key_size(),
+                cell.val_size(),
+            )
+            .await?;
         internal.meta.dirty = true;
 
         Self::insert_cell_meta(
@@ -1530,17 +1567,21 @@ where
         let raw_size = std::cmp::min(raw_size, remaining);
 
         let reserved_offset = Self::reserve_cell(&mut internal, raw_size);
-        content.put(&mut internal.buffer[reserved_offset..reserved_offset + raw_size])?;
+        content
+            .put(&mut internal.buffer[reserved_offset..reserved_offset + raw_size])
+            .await?;
 
-        internal.meta.lsn = ctx.record_leaf_insert(
-            internal.txid,
-            pgid,
-            i,
-            Bytes::new(&internal.buffer[reserved_offset..reserved_offset + raw_size]),
-            overflow,
-            key_size,
-            value_size,
-        ).await?;
+        internal.meta.lsn = ctx
+            .record_leaf_insert(
+                internal.txid,
+                pgid,
+                i,
+                Bytes::new(&internal.buffer[reserved_offset..reserved_offset + raw_size]),
+                overflow,
+                key_size,
+                value_size,
+            )
+            .await?;
         internal.meta.dirty = true;
 
         Self::insert_cell_meta(&mut internal, i, overflow, key_size, value_size, raw_size);
@@ -1616,14 +1657,10 @@ where
         })
     }
 
-    pub(crate) async fn split<F, R: Runtime>(
+    pub(crate) async fn split<R: Runtime>(
         &mut self,
         ctx: LogContext<'_, R>,
-        mut f: F,
-    ) -> anyhow::Result<usize>
-    where
-        for<'c> F: FnMut(LeafCell<'c>) -> anyhow::Result<()>,
-    {
+    ) -> anyhow::Result<(usize, SplittedLeaf<T>)> {
         let pgid = self.id();
         let internal = self.internal();
         log::debug!(
@@ -1659,15 +1696,17 @@ where
         let txid = internal.txid;
         for i in (n_cells_to_keep..kind.count).rev() {
             let cell = get_leaf_cell(internal.buffer.payload(), i);
-            internal.meta.lsn = ctx.record_leaf_delete(
-                txid,
-                pgid,
-                i,
-                Bytes::new(cell.raw()),
-                cell.overflow(),
-                cell.key_size(),
-                cell.val_size(),
-            ).await?;
+            internal.meta.lsn = ctx
+                .record_leaf_delete(
+                    txid,
+                    pgid,
+                    i,
+                    Bytes::new(cell.raw()),
+                    cell.overflow(),
+                    cell.key_size(),
+                    cell.val_size(),
+                )
+                .await?;
         }
         internal.meta.dirty = true;
 
@@ -1681,11 +1720,32 @@ where
             internal.meta.lsn,
         );
 
-        for i in n_cells_to_keep..original_count {
-            let cell = self.get(i);
-            f(cell)?;
+        Ok((n_cells_to_keep, SplittedLeaf{
+            inner: self,
+            original_count,
+            i: n_cells_to_keep
+        }))
+    }
+}
+
+pub(crate) struct SplittedLeaf<'a, T> {
+    inner: &'a mut LeafPageWrite<T>,
+
+    original_count: usize,
+    i: usize,
+}
+
+impl<'a, T> SplittedLeaf<'_, T>
+where
+    T: PageWriteOps<'a>,
+{
+    pub(crate) fn next(&mut self) -> Option<LeafCell<'_>> {
+        if self.i < self.original_count {
+            self.i += 1;
+            Some(self.inner.get(self.i - 1))
+        } else {
+            None
         }
-        Ok(n_cells_to_keep)
     }
 }
 
@@ -1758,8 +1818,9 @@ where
         if old_next == new_next {
             return Ok(());
         }
-        internal.meta.lsn =
-            ctx.record_overflow_set_next(internal.txid, pgid, new_next, old_next).await?;
+        internal.meta.lsn = ctx
+            .record_overflow_set_next(internal.txid, pgid, new_next, old_next)
+            .await?;
         internal.meta.dirty = true;
         kind.next = new_next;
         Ok(())
@@ -1784,9 +1845,10 @@ where
 
         let offset = PAGE_HEADER_SIZE + OVERFLOW_PAGE_HEADER_SIZE;
         let raw = &mut internal.buffer[offset..offset + inserted_size];
-        content.put(raw)?;
-        internal.meta.lsn =
-            ctx.record_overflow_set_content(internal.txid, pgid, Bytes::new(raw), next).await?;
+        content.put(raw).await?;
+        internal.meta.lsn = ctx
+            .record_overflow_set_content(internal.txid, pgid, Bytes::new(raw), next)
+            .await?;
         internal.meta.dirty = true;
 
         kind.size = inserted_size;
@@ -1805,8 +1867,9 @@ where
             return Ok(());
         }
 
-        internal.meta.lsn =
-            ctx.record_overflow_set_content(internal.txid, pgid, Bytes::new(&[]), None).await?;
+        internal.meta.lsn = ctx
+            .record_overflow_set_content(internal.txid, pgid, Bytes::new(&[]), None)
+            .await?;
         internal.meta.dirty = true;
 
         kind.size = 0;
@@ -1819,7 +1882,9 @@ where
         internal.meta.encode(internal.buffer)?;
 
         let payload = Bytes::new(internal.buffer.payload());
-        internal.meta.lsn = ctx.record_overflow_reset(internal.txid, pgid, payload).await?;
+        internal.meta.lsn = ctx
+            .record_overflow_reset(internal.txid, pgid, payload)
+            .await?;
         internal.meta.dirty = true;
         internal.meta.kind = PageKind::None;
         Ok(self.0)

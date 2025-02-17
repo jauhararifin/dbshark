@@ -658,16 +658,13 @@ impl<'a, R: Runtime> IterBack<'a, R> {
     }
 }
 
-pub(crate) async fn recover<R: Runtime>(
-    path: &Path,
-    mut handler: impl FnMut(Lsn, WalEntry) -> anyhow::Result<()>,
-) -> anyhow::Result<Wal<R>> {
+pub(crate) async fn recover<R: Runtime>(path: &Path) -> anyhow::Result<Recovering<R>> {
     let wal_path_1 = path.join("wal_1");
     let wal_file_1 = R::File::open(&wal_path_1).await?;
     if !wal_file_1.is_file().await? {
         return Err(anyhow!("{wal_path_1:?} is not a regular file"));
     }
-    let mut f1 = recover_wal_file::<R>(wal_file_1)
+    let f1 = recover_wal_file::<R>(wal_file_1)
         .await
         .with_context(|| format!("cannot init wal file {wal_path_1:?}"))?;
 
@@ -676,11 +673,11 @@ pub(crate) async fn recover<R: Runtime>(
     if !wal_file_2.is_file().await? {
         return Err(anyhow!("{wal_path_2:?} is not a regular file"));
     }
-    let mut f2 = recover_wal_file::<R>(wal_file_2)
+    let f2 = recover_wal_file::<R>(wal_file_2)
         .await
         .with_context(|| format!("cannot init wal file {wal_path_2:?}"))?;
 
-    let (mut use_wal_1, checkpoint) = match (f1.checkpoint, f2.checkpoint) {
+    let (use_wal_1, checkpoint) = match (f1.checkpoint, f2.checkpoint) {
         (Some(f1_lsn), Some(f2_lsn)) => {
             if f1_lsn >= f2_lsn {
                 (true, f1_lsn)
@@ -695,76 +692,116 @@ pub(crate) async fn recover<R: Runtime>(
 
     log::debug!(f1:?,f2:?,use_wal_1,checkpoint:?; "recovering");
 
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut next_lsn = checkpoint;
-    {
-        let mut start_offset = 0;
-        let mut end_offset = 0;
-        let mut current_lsn = checkpoint;
-        loop {
-            let buff = &buffer[start_offset..end_offset];
-            let mut entry = WalEntry::decode(buff);
+    let buffer = vec![0u8; BUFFER_SIZE];
+    let next_lsn = checkpoint;
+    let start_offset = 0;
+    let end_offset = 0;
+    let current_lsn = checkpoint;
 
-            let f = if use_wal_1 { &mut f1 } else { &mut f2 };
+    Ok(Recovering {
+        buffer,
+        start_offset,
+        end_offset,
+        use_wal_1,
+        f1,
+        f2,
+        current_lsn,
+        next_lsn,
+    })
+}
 
-            if let WalDecodeResult::NeedMoreBytes = entry {
-                let len = end_offset - start_offset;
-                for i in 0..len {
-                    buffer[i] = buffer[start_offset + i];
-                }
-                start_offset = 0;
-                end_offset = len;
+pub(crate) struct Recovering<R: Runtime> {
+    buffer: Vec<u8>,
+    start_offset: usize,
+    end_offset: usize,
+    use_wal_1: bool,
+    f1: RecoveringWalFile<R>,
+    f2: RecoveringWalFile<R>,
+    current_lsn: Lsn,
+    next_lsn: Lsn,
+}
 
-                if f.is_empty {
-                    break;
-                }
-                f.f.seek(SeekFrom::Start(
-                    current_lsn.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2 + len as u64,
-                ))
-                .await?;
-                let n = f.f.read(&mut buffer[end_offset..]).await?;
-                if n == 0 {
-                    let next_f = if use_wal_1 { &f2 } else { &f1 };
-                    if next_f.relative_lsn < current_lsn.get() {
-                        break;
-                    }
-                    use_wal_1 = !use_wal_1;
-                    start_offset = 0;
-                    end_offset = 0;
-                    continue;
-                }
+impl<R: Runtime> Recovering<R> {
+    pub(crate) async fn next(&mut self) -> anyhow::Result<Option<(Lsn, WalEntry)>> {
+        let buffer: &'static mut [u8] = unsafe { std::mem::transmute(&mut *self.buffer) };
 
-                end_offset += n;
-                entry = WalEntry::decode(&buffer[start_offset..end_offset]);
+        let buff = &buffer[self.start_offset..self.end_offset];
+        let entry = WalEntry::decode(buff);
+
+        if let WalDecodeResult::NeedMoreBytes = entry {
+            let f = if self.use_wal_1 {
+                &mut self.f1
+            } else {
+                &mut self.f2
             };
 
-            match entry {
-                WalDecodeResult::Ok(entry) => {
-                    let lsn = current_lsn;
-                    let entry_size = entry.size();
-                    start_offset += entry_size;
-                    current_lsn.add_assign(entry_size as u64);
-                    next_lsn = current_lsn;
-                    handler(lsn, entry)?;
-                }
-                WalDecodeResult::NeedMoreBytes => {
-                    let next_f = if use_wal_1 { &f2 } else { &f1 };
-                    if next_f.relative_lsn < current_lsn.get() {
-                        break;
-                    }
-                    use_wal_1 = !use_wal_1;
-                    start_offset = 0;
-                    end_offset = 0;
-                }
-                WalDecodeResult::Invalid => {
-                    break;
-                }
-                WalDecodeResult::Err(err) => return Err(err),
+            let len = self.end_offset - self.start_offset;
+            for i in 0..len {
+                buffer[i] = buffer[self.start_offset + i];
             }
+            self.start_offset = 0;
+            self.end_offset = len;
+
+            if f.is_empty {
+                return Ok(None);
+            }
+            f.f.seek(SeekFrom::Start(
+                self.current_lsn.get() - f.relative_lsn + WAL_HEADER_SIZE as u64 * 2 + len as u64,
+            ))
+            .await?;
+            let n = f.f.read(&mut buffer[self.end_offset..]).await?;
+            if n == 0 {
+                let next_f = if self.use_wal_1 { &self.f2 } else { &self.f1 };
+                if next_f.relative_lsn < self.current_lsn.get() {
+                    return Ok(None);
+                }
+                self.use_wal_1 = !self.use_wal_1;
+                self.start_offset = 0;
+                self.end_offset = 0;
+                return self.next().await;
+            }
+
+            self.end_offset += n;
         }
+
+        let entry = WalEntry::decode(&buffer[self.start_offset..self.end_offset]);
+
+        match entry {
+            WalDecodeResult::Ok(entry) => {
+                let lsn = self.current_lsn;
+                let entry_size = entry.size();
+                self.start_offset += entry_size;
+                self.current_lsn.add_assign(entry_size as u64);
+                self.next_lsn = self.current_lsn;
+                return Ok(Some((lsn, entry)));
+            }
+            WalDecodeResult::NeedMoreBytes => (),
+            WalDecodeResult::Invalid => {
+                return Ok(None);
+            }
+            WalDecodeResult::Err(err) => return Err(err),
+        }
+
+        let next_f = if self.use_wal_1 { &self.f2 } else { &self.f1 };
+        if next_f.relative_lsn < self.current_lsn.get() {
+            return Ok(None);
+        }
+        self.use_wal_1 = !self.use_wal_1;
+        self.start_offset = 0;
+        self.end_offset = 0;
+        drop(entry);
+        return self.next().await;
     }
 
-    Wal::new(f1.into(), f2.into(), use_wal_1, next_lsn).await
+    pub(crate) async fn finish(self) -> anyhow::Result<Wal<R>> {
+        Wal::new(
+            self.f1.into(),
+            self.f2.into(),
+            self.use_wal_1,
+            self.next_lsn,
+        )
+        .await
+    }
 }
 
 async fn recover_wal_file<R: Runtime>(mut f: R::File) -> anyhow::Result<RecoveringWalFile<R>> {
@@ -863,7 +900,10 @@ mod tests {
     async fn test_flushing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {}
+        let wal = wal.finish().await?;
+
         let mut last_seen_lsn = None;
         for i in 1..=10 {
             let lsn = wal
@@ -885,10 +925,11 @@ mod tests {
         }
         wal.shutdown().await?;
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| {
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {
             panic!("since the wal is not flushed yet, there should be no entry")
-        })
-        .await?;
+        }
+        let wal = wal.finish().await?;
 
         let mut last_seen_lsn = None;
         for i in 1..=10 {
@@ -914,7 +955,9 @@ mod tests {
 
         let mut i = 1;
         let mut last_seen_lsn = None;
-        let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some((lsn, entry)) = wal.next().await? {
             if let Some(last_seen_lsn) = last_seen_lsn {
                 assert!(
                     lsn > last_seen_lsn,
@@ -929,9 +972,9 @@ mod tests {
             assert_eq!(TxId::new(i).unwrap(), txid);
             assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
             i += 1;
-            Ok(())
-        })
-        .await?;
+        }
+        let wal = wal.finish().await?;
+
         assert_eq!(11, i);
         wal.shutdown().await?;
 
@@ -942,7 +985,10 @@ mod tests {
     async fn test_checkpoint() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {}
+        let wal = wal.finish().await?;
+
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -996,7 +1042,9 @@ mod tests {
 
         let mut i = 11;
         let mut checkpoint_consumed = false;
-        let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some((lsn, entry)) = wal.next().await? {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
@@ -1027,10 +1075,9 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+        }
+        let wal = wal.finish().await?;
 
-            Ok(())
-        })
-        .await?;
         assert_eq!(16, i);
         wal.shutdown().await?;
 
@@ -1041,7 +1088,10 @@ mod tests {
     async fn test_recovering_from_wal_1_and_2() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {}
+        let wal = wal.finish().await?;
+
         for i in 1..=10 {
             wal.append_log(WalEntry {
                 clr: None,
@@ -1117,11 +1167,13 @@ mod tests {
 
         let mut i = 11;
         let mut checkpoint_consumed = false;
-        let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some((lsn, entry)) = wal.next().await? {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
-                return Ok(());
+                continue;
             }
 
             if !checkpoint_consumed {
@@ -1148,10 +1200,9 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+        }
+        let wal = wal.finish().await?;
 
-            Ok(())
-        })
-        .await?;
         assert_eq!(26, i);
 
         for i in 26..=30 {
@@ -1218,11 +1269,13 @@ mod tests {
 
         let mut i = 31;
         let mut checkpoint_consumed = false;
-        let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some((lsn, entry)) = wal.next().await? {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
-                return Ok(());
+                continue;
             }
 
             if !checkpoint_consumed {
@@ -1249,10 +1302,9 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+        }
+        let wal = wal.finish().await?;
 
-            Ok(())
-        })
-        .await?;
         assert_eq!(41, i);
         wal.shutdown().await?;
 
@@ -1280,7 +1332,10 @@ mod tests {
             },
         };
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {}
+        let wal = wal.finish().await?;
+
         for i in 1..=5 {
             wal.append_log(dummy_entry(i)).await?;
         }
@@ -1316,11 +1371,12 @@ mod tests {
 
         let mut i = 16;
         let mut checkpoint_consumed = false;
-        let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some((lsn, entry)) = wal.next().await? {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
-                return Ok(());
+                continue;
             }
 
             if !checkpoint_consumed {
@@ -1347,10 +1403,9 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+        }
+        let wal = wal.finish().await?;
 
-            Ok(())
-        })
-        .await?;
         assert_eq!(21, i);
 
         for i in 21..=25 {
@@ -1389,11 +1444,13 @@ mod tests {
 
         let mut i = 36;
         let mut checkpoint_consumed = false;
-        let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some((lsn, entry)) = wal.next().await? {
             assert!(entry.clr.is_none());
 
             if matches!(entry.kind, WalKind::End { .. }) {
-                return Ok(());
+                continue;
             }
 
             if !checkpoint_consumed {
@@ -1420,10 +1477,9 @@ mod tests {
                 assert_eq!(PageId::new(1000 + i).unwrap(), pgid);
                 i += 1;
             }
+        }
+        let wal = wal.finish().await?;
 
-            Ok(())
-        })
-        .await?;
         assert_eq!(41, i);
         wal.shutdown().await?;
 
@@ -1443,7 +1499,9 @@ mod tests {
         let n = BUFFER_SIZE as u64 / entry.size() as u64;
 
         {
-            let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+            let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+            while let Some(_) = wal.next().await? {}
+            let wal = wal.finish().await?;
 
             for i in 0u64..3 * n {
                 wal.append_log(WalEntry {
@@ -1468,7 +1526,9 @@ mod tests {
         }
 
         let mut i = 0;
-        let wal = recover::<TokioRuntime>(dir.path(), |_, entry| {
+
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {
             if i < 3 * n {
                 assert_eq!(
                     WalKind::Begin {
@@ -1487,9 +1547,9 @@ mod tests {
                 );
             }
             i += 1;
-            Ok(())
-        })
-        .await?;
+        }
+        let wal = wal.finish().await?;
+
         assert_eq!(3 * n + 1, i);
         wal.shutdown().await?;
 
@@ -1508,13 +1568,14 @@ mod tests {
         for _ in 0..100 {
             let mut checkpoint_consumed = false;
 
-            let wal = recover::<TokioRuntime>(dir.path(), |lsn, entry| {
+            let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+            while let Some((lsn, entry)) = wal.next().await? {
                 assert!(lsn >= last_lsn);
                 last_lsn = lsn;
                 assert!(entry.clr.is_none());
 
                 if matches!(entry.kind, WalKind::End { .. }) {
-                    return Ok(());
+                    continue;
                 }
 
                 if !checkpoint_consumed {
@@ -1541,10 +1602,8 @@ mod tests {
                         panic!("the entry should be a leaf init");
                     };
                 }
-
-                Ok(())
-            })
-            .await?;
+            }
+            let wal = wal.finish().await?;
 
             for _ in 0..r.gen_range(1..=8000) {
                 wal.append_log(WalEntry {
@@ -1652,7 +1711,10 @@ mod tests {
 
         let mut entries = vec![];
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {}
+        let wal = wal.finish().await?;
+
         for i in 1..=5 {
             let entry = dummy_entry(i);
             let lsn = wal.append_log(entry.clone()).await?;
@@ -1719,7 +1781,10 @@ mod tests {
 
         let mut entries = vec![];
 
-        let wal = recover::<TokioRuntime>(dir.path(), |_, _| Ok(())).await?;
+        let mut wal = recover::<TokioRuntime>(dir.path()).await?;
+        while let Some(_) = wal.next().await? {}
+        let wal = wal.finish().await?;
+
         for i in 1..=5 {
             let entry = dummy_entry(i);
             let lsn = wal.append_log(entry.clone()).await?;
